@@ -16,7 +16,14 @@ jobs:
         run: |
           curl -fsSL https://app.atlan.com/registry/cli/install.sh | sh
           ~/.registry/bin/registry adapter install atlan@0.1.13
-      - run: registry publish '.claude/skills/*' --dry-run
+      - name: validate every skill                # the validator a registry runs, on a throwaway registry, no token
+        run: |
+          set -euo pipefail
+          reg="$RUNNER_TEMP/registry"
+          registry marketplace init "$reg" > /dev/null
+          registry marketplace add "$reg" --as scratch > /dev/null
+          registry publish '.claude/skills/*' --to scratch/check --yes
+          registry marketplace validate "$reg"
 
   sync:                                           # main: upload what changed
     if: github.event_name == 'push'
