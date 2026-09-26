@@ -1,0 +1,39 @@
+name: skills
+on:
+  pull_request: { paths: ['.claude/skills/**'] }
+  push: { branches: [main], paths: ['.claude/skills/**'] }
+permissions: { contents: read }
+jobs:
+  check:                                          # pull requests: validate only, no token
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: token is absent here
+        run: '[ -z "$T" ] && echo "no token in check: ok" || { echo "token visible in check"; exit 1; }'
+        env: { T: '${{ secrets.REGISTRY_TOKEN }}' }
+      - name: install the CLI and the Atlan adapter
+        run: |
+          curl -fsSL https://app.atlan.com/registry/cli/install.sh | sh
+          ~/.registry/bin/registry adapter install atlan@0.1.13
+      - run: registry publish '.claude/skills/*' --dry-run
+
+  sync:                                           # main: upload what changed
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: registry                         # its token is released to main only
+    concurrency: { group: skills-sync, cancel-in-progress: false }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { fetch-depth: 0, filter: 'blob:none' }
+      - name: token arrived
+        run: '[ -n "$T" ] && echo "token present on main (length ${#T})" || { echo "no token on main"; exit 1; }'
+        env: { T: '${{ secrets.REGISTRY_TOKEN }}' }
+      - name: history is available
+        run: git log --oneline -- .claude/skills | head -5
+      - name: install the CLI and the Atlan adapter
+        run: |
+          curl -fsSL https://app.atlan.com/registry/cli/install.sh | sh
+          ~/.registry/bin/registry adapter install atlan@0.1.13
+      - run: registry publish '.claude/skills/*' --yes
+        env: { REGISTRY_TOKEN_REGISTRY_CLI_TEST: '${{ secrets.REGISTRY_TOKEN }}' }
