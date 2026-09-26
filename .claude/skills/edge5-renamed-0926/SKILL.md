@@ -1,5 +1,5 @@
 ---
-name: edge5-newname-0927
+name: edge5-restored-0927
 description: Edge test 5, the frontmatter name differs from the folder name. Safe to delete.
 ---
 body
