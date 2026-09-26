@@ -23,7 +23,7 @@ jobs:
           registry marketplace init "$reg" > /dev/null
           registry marketplace add "$reg" --as scratch > /dev/null
           registry publish '.claude/skills/*' --to scratch/check --yes
-          registry marketplace validate "$reg"
+          GITHUB_BASE_REF= registry marketplace validate "$reg"   # nothing released to compare with
 
   sync:                                           # main: upload what changed
     if: github.event_name == 'push'
