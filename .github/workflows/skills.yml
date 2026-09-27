@@ -24,9 +24,9 @@ jobs:
     runs-on: ubuntu-latest
     environment: registry                   # its token is released to main only
     concurrency: { group: skills-publish, cancel-in-progress: false }
+    env: { REGISTRY_TOKEN_REGISTRY_CLI_TEST: "${{ secrets.REGISTRY_TOKEN }}" }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: curl -fsSL https://app.atlan.com/registry/cli/install.sh | sh
       - run: registry adapter install atlan@0.1.13
       - run: registry publish '.claude/skills/*' --yes
-        env: { REGISTRY_TOKEN_REGISTRY_CLI_TEST: "${{ secrets.REGISTRY_TOKEN }}" }
