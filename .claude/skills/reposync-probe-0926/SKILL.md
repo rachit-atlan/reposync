@@ -5,3 +5,5 @@ description: Throwaway skill from the GitHub workflow test on 2026-09-26. Safe t
 fourth version
 
 Edited in the repo after case 19, so these bytes are new.
+
+Edited to test the registry-publish skill workflow.
