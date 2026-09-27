@@ -9,3 +9,5 @@ Edited in the repo after case 19, so these bytes are new.
 Edited to test the registry-publish skill workflow.
 
 Edited to test the registry-publish skill, second version.
+
+Edited to test the job-level token.
