@@ -9,13 +9,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: install the registry CLI
-        env: { VERSION: "0.1.24", SHA256: "f046c22b3b54c57349f108f49f19cc26c33185fde6bab99d901fd9221175d446" }
-        run: |
-          curl -fsSL -o "$RUNNER_TEMP/registry" "https://app.atlan.com/registry/cli/artifacts/v$VERSION/registry-linux-amd64"
-          echo "$SHA256  $RUNNER_TEMP/registry" | sha256sum -c -
-          install -m 755 "$RUNNER_TEMP/registry" /usr/local/bin/registry
-          registry adapter install atlan@0.1.13
+      - run: curl -fsSL https://app.atlan.com/registry/cli/install.sh | sh
+      - run: registry adapter install atlan@0.1.13
       - name: validate every skill          # the registry validator, on a throwaway registry
         run: |
           reg="$RUNNER_TEMP/registry-check"
@@ -31,12 +26,7 @@ jobs:
     concurrency: { group: skills-publish, cancel-in-progress: false }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: install the registry CLI
-        env: { VERSION: "0.1.24", SHA256: "f046c22b3b54c57349f108f49f19cc26c33185fde6bab99d901fd9221175d446" }
-        run: |
-          curl -fsSL -o "$RUNNER_TEMP/registry" "https://app.atlan.com/registry/cli/artifacts/v$VERSION/registry-linux-amd64"
-          echo "$SHA256  $RUNNER_TEMP/registry" | sha256sum -c -
-          install -m 755 "$RUNNER_TEMP/registry" /usr/local/bin/registry
-          registry adapter install atlan@0.1.13
+      - run: curl -fsSL https://app.atlan.com/registry/cli/install.sh | sh
+      - run: registry adapter install atlan@0.1.13
       - run: registry publish '.claude/skills/*' --yes
         env: { REGISTRY_TOKEN_REGISTRY_CLI_TEST: "${{ secrets.REGISTRY_TOKEN }}" }
