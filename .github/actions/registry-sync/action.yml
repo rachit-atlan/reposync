@@ -1,0 +1,55 @@
+name: Registry Sync
+description: Preview and publish Git-managed skills to Atlan Agent Registry.
+author: Atlan
+
+branding:
+  icon: upload-cloud
+  color: purple
+
+inputs:
+  workspace:
+    description: Atlan workspace ID that skills publish to and preflight compares with.
+    required: true
+  kinds:
+    description: "Folders to sync, one line per kind, for example `skill: skills, .claude/skills`. Every skill inside a listed folder is included."
+    required: true
+  preflight:
+    description: Check skills before they publish. On a pull request it validates and compares with the Registry; on the default branch it validates the checkout before publishing.
+    required: false
+    default: "true"
+  allow-pr-commenting:
+    description: Post the preflight result as one pull request comment. A pull request that touches no listed folder gets no comment.
+    required: false
+    default: "true"
+  fail-on-conflict:
+    description: Fail preflight after commenting when a confirmed Registry conflict exists.
+    required: false
+    default: "true"
+  github-token:
+    description: GitHub token preflight uses to read the pull request and write its comment.
+    required: false
+    default: ${{ github.token }}
+  working-directory:
+    description: Repository directory the kinds folders are relative to.
+    required: false
+    default: .
+  prune:
+    description: Not supported with the Registry CLI yet; publish fails unless it is "false".
+    required: false
+    default: "false"
+
+outputs:
+  status:
+    description: success when the selected mode completes without a confirmed conflict; conflict when preflight reports one.
+  cli-version:
+    description: The CLI version installed and executed by this Action.
+  comment-id:
+    description: GitHub comment ID created or updated by preflight.
+  conflict-count:
+    description: Number of confirmed workspace-level Registry conflicts found by preflight.
+  rejected-count:
+    description: Number of changed skills whose SKILL.md the Registry would reject on publish (HTTP 422).
+
+runs:
+  using: node24
+  main: dist/index.mjs
