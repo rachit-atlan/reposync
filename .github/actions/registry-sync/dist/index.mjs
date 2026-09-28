@@ -38604,7 +38604,11 @@ async function runPreflight({ environment = process.env, request = githubRequest
   });
   report.failOnConflict = failOnConflict;
   // A pull request that touches no listed folder gets no comment, unless an earlier run already left one.
-  const untouched = Boolean(inputs) && report.available && report.eligible.length === 0 && !existing;
+  // A run that could not read the trees says so rather than passing quietly.
+  const untouched = Boolean(inputs) && report.available && report.config?.valid && report.eligible.length === 0 && !existing;
+  if (inputs && !report.config?.valid) {
+    process.stdout.write(`::warning title=Atlan Agent Registry preflight::${report.config?.reason || "the pull request could not be checked"}\n`);
+  }
   if (commenting && !untouched) {
     const comment = await writeMarkerComment({
       token, request: budgetedRequest, owner: context.owner, repo: context.repo,
@@ -38847,9 +38851,10 @@ function trackedFiles(cwd) {
 }
 
 // An agent is a tracked Markdown file with `name` and `description` front matter, so a README is skipped.
+// A SKILL.md never is: the CLI would publish its whole folder, and at the root that is the checkout.
 function agentFiles(cwd, files, globs = []) {
   const patterns = globs.map(globPattern);
-  return files.filter(file => file.endsWith(".md") && !file.endsWith("/SKILL.md") &&
+  return files.filter(file => file.endsWith(".md") && external_node_path_namespaceObject.posix.basename(file) !== "SKILL.md" &&
     patterns.some(pattern => pattern.test(file)) && hasFrontMatter(external_node_path_namespaceObject.join(cwd, file))).sort();
 }
 
