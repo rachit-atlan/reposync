@@ -37371,30 +37371,100 @@ const external_node_stream_promises_namespaceObject = __WEBPACK_EXTERNAL_createR
 
 
 const KINDS = new Set(["skill", "agent"]);
+const WORKSPACE = /^[A-Za-z0-9_.-]{1,128}$/;
+const MAX_GLOBS = 100;
 
-// `kinds` lists folders, one line per kind: `skill: skills, .claude/skills`. Every artifact
-// inside a listed folder is picked up, so adding one never changes the workflow.
-function parseRegistryInputs(environment = process.env) {
-  const workspace = common_getInput("workspace", environment);
-  if (!workspace) throw new Error("workspace is required: the Atlan workspace ID skills publish to");
-  const kinds = {};
-  for (const raw of common_getInput("kinds", environment).split("\n")) {
-    const line = raw.trim();
-    if (!line || line.startsWith("#")) continue;
-    const match = /^([a-z]+)\s*:\s*(.+)$/.exec(line);
-    if (!match || !KINDS.has(match[1])) {
-      throw new Error("each kinds line names skill or agent and its folders, as in `skill: skills, .claude/skills`");
-    }
-    if (kinds[match[1]]) throw new Error(`kinds lists ${match[1]} twice; put its folders on one line`);
-    kinds[match[1]] = match[2].split(",").map(item => item.trim().replace(/\/+$/, "")).filter(Boolean);
-  }
-  if (!kinds.skill?.length) throw new Error("kinds must list at least one skill folder, as in `skill: skills`");
-  return { workspace, kinds };
+function safeGlob(value) {
+  return typeof value === "string" && value.length > 0 && value.length <= 200 && !value.startsWith("/") &&
+    !/[\\\0\r\n]/.test(value) && !value.split("/").some(part => part === "..");
 }
 
-// Preflight's contract checks already validate this shape, so the inputs are held to the same limits.
-function skillSyncConfig({ workspace, kinds }) {
-  return JSON.stringify({ publishConfig: { workspaces: [workspace], skills: { paths: kinds.skill } } });
+function globList(raw) {
+  let value;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    value = raw.replace(/^["']|["']$/g, "");
+  }
+  return Array.isArray(value) ? value : [value];
+}
+
+// `artifacts` maps a kind to globs, one line each: `skill: ["skills/**", "team-b/skills/**"]`
+// or `agent: "agents/**"`. A `- glob` list under the kind reads too.
+function parseRegistryInputs(environment = process.env) {
+  const workspace = common_getInput("workspace", environment);
+  if (!WORKSPACE.test(workspace)) throw new Error("workspace must be the Atlan workspace ID artifacts publish to");
+  const artifacts = {};
+  let current;
+  for (const raw of common_getInput("artifacts", environment).split("\n")) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const item = /^-\s*(.+)$/.exec(line);
+    if (item && current) {
+      artifacts[current].push(...globList(item[1].trim()));
+      continue;
+    }
+    const match = /^([a-z]+)\s*:\s*(.*)$/.exec(line);
+    if (!match || !KINDS.has(match[1]) || artifacts[match[1]]) {
+      throw new Error("each artifacts line names skill or agent once, as in `skill: [\"skills/**\"]`");
+    }
+    current = match[1];
+    artifacts[current] = match[2] ? globList(match[2]) : [];
+  }
+  const globs = Object.values(artifacts).flat();
+  if (globs.length === 0 || globs.length > MAX_GLOBS || !globs.every(safeGlob)) {
+    throw new Error(`artifacts must list 1-${MAX_GLOBS} repository-relative globs`);
+  }
+  return { workspace, artifacts };
+}
+
+// `**` crosses folders; `*` and `?` stay inside one.
+function globPattern(glob) {
+  let pattern = "";
+  for (let index = 0; index < glob.length; index += 1) {
+    const char = glob[index];
+    if (char === "*" && glob[index + 1] === "*") {
+      index += 1;
+      if (glob[index + 1] === "/") {
+        index += 1;
+        pattern += "(?:.*/)?";
+      } else {
+        pattern += ".*";
+      }
+    } else if (char === "*") {
+      pattern += "[^/]*";
+    } else if (char === "?") {
+      pattern += "[^/]";
+    } else {
+      pattern += char.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+    }
+  }
+  return new RegExp(`^${pattern}$`);
+}
+
+// A skill is a folder holding SKILL.md, counted when the folder or its SKILL.md matches.
+function skillFolders(files, globs = []) {
+  const patterns = globs.map(globPattern);
+  const folders = new Set();
+  for (const file of files) {
+    if (!file.endsWith("/SKILL.md")) continue;
+    const folder = file.slice(0, -"/SKILL.md".length);
+    if (patterns.some(pattern => pattern.test(folder) || pattern.test(file))) folders.add(folder);
+  }
+  return [...folders].sort();
+}
+
+// Preflight's view of the inputs: the skill folders, found in the pull request's trees.
+function preflightConfig({ workspace, artifacts }, files) {
+  const folders = skillFolders(files, artifacts.skill);
+  return {
+    valid: true,
+    paths: artifacts.skill ?? [],
+    folders: new Set(folders),
+    exclude: new Set(),
+    workspaces: new Set([workspace]),
+    workspaceCount: 1
+  };
 }
 
 ;// CONCATENATED MODULE: ./src/skill-digest.js
@@ -37572,6 +37642,13 @@ function parseSkillSyncConfig(raw, source = "base") {
 
 function classifySkillFile(filename, config) {
   if (!config?.valid || typeof filename !== "string") return { kind: "unknown" };
+  if (config.folders) {
+    const directory = [...config.folders].filter(folder => filename.startsWith(`${folder}/`))
+      .reduce((deepest, folder) => (folder.length > (deepest?.length ?? 0) ? folder : deepest), undefined);
+    if (!directory) return { kind: "outside" };
+    const manifest = `${directory}/SKILL.md`;
+    return { kind: "eligible", skill: directory.split("/").at(-1), directory, manifest, definition: filename === manifest };
+  }
   for (const root of config.paths) {
     if (!filename.startsWith(`${root}/`)) continue;
     const relative = filename.slice(root.length + 1);
@@ -38003,7 +38080,7 @@ function eligibleChanges(files, config) {
   return { eligible, excluded };
 }
 
-async function buildPreflightReport({ token, context, request, registryToken, registry = registryRequest, config: given }) {
+async function buildPreflightReport({ token, context, request, registryToken, registry = registryRequest, inputs }) {
   let fileResult;
   try {
     fileResult = await listPullRequestFiles({ token, context, request });
@@ -38011,10 +38088,23 @@ async function buildPreflightReport({ token, context, request, registryToken, re
     return { available: false, reason: "GitHub could not provide the pull request file list" };
   }
 
-  let config = given;
+  let config;
+  let treeFiles;
   if (!context.baseSha || !context.headSha) {
     config = { valid: false, reason: "GitHub did not provide both pull request commit IDs" };
-  } else if (!config) {
+  } else if (inputs) {
+    // Globs reach any depth, so the skill folders come from the trees, not from a path's shape.
+    try {
+      const [baseTree, headTree] = await Promise.all([
+        readRepositoryTree({ token, context, request, ref: context.baseSha }),
+        readRepositoryTree({ token, context, request })
+      ]);
+      treeFiles = headTree;
+      config = preflightConfig(inputs, [...baseTree.keys(), ...headTree.keys()]);
+    } catch {
+      config = { valid: false, reason: "GitHub could not provide the pull request's file trees" };
+    }
+  } else {
     try {
       config = parseSkillSyncConfig(await readRepositoryFile({ token, context, request, filename: ".atlan/package.json", ref: context.baseSha, maxBytes: MAX_CONFIG_BYTES }));
     } catch {
@@ -38022,7 +38112,7 @@ async function buildPreflightReport({ token, context, request, registryToken, re
     }
   }
 
-  const configChanged = !given && fileResult.files.some(file => file.filename === ".atlan/package.json" ||
+  const configChanged = !inputs && fileResult.files.some(file => file.filename === ".atlan/package.json" ||
     file.previousFilename === ".atlan/package.json");
   let proposedConfig;
   if (configChanged && context.headSha) {
@@ -38035,9 +38125,8 @@ async function buildPreflightReport({ token, context, request, registryToken, re
 
   const changes = eligibleChanges(fileResult.files, config);
   const supportingOnly = changes.eligible.filter(file => !file.definitionChanged);
-  let treeFiles;
   let supportingAnalysisUnavailable = false;
-  if ((supportingOnly.length > 0 || proposedConfig?.valid) && context.headSha) {
+  if ((supportingOnly.length > 0 || proposedConfig?.valid) && context.headSha && !treeFiles) {
     try {
       treeFiles = await readRepositoryTree({ token, context, request });
     } catch {
@@ -38498,11 +38587,7 @@ async function runPreflight({ environment = process.env, request = githubRequest
   const failOnConflict = parseBoolean("fail-on-conflict", common_getInput("fail-on-conflict", environment) || "false");
   const commenting = parseBoolean("allow-pr-commenting", common_getInput("allow-pr-commenting", environment) || "true");
   // The workflow's own inputs decide what is checked; a pull request cannot change them under pull_request_target.
-  let config;
-  if (common_getInput("kinds", environment)) {
-    config = parseSkillSyncConfig(skillSyncConfig(parseRegistryInputs(environment)), "workflow");
-    if (!config.valid) throw new Error(`workspace and kinds are invalid: ${config.reason}`);
-  }
+  const inputs = common_getInput("artifacts", environment) ? parseRegistryInputs(environment) : undefined;
   const context = parsePullRequestContext(environment, eventPayload);
   const budgetedRequest = withRequestBudget(request);
   const existing = commenting ? await findMarkerComment({
@@ -38515,11 +38600,11 @@ async function runPreflight({ environment = process.env, request = githubRequest
     request: budgetedRequest,
     registryToken,
     registry,
-    config
+    inputs
   });
   report.failOnConflict = failOnConflict;
   // A pull request that touches no listed folder gets no comment, unless an earlier run already left one.
-  const untouched = Boolean(config) && report.available && report.eligible.length === 0 && !existing;
+  const untouched = Boolean(inputs) && report.available && report.eligible.length === 0 && !existing;
   if (commenting && !untouched) {
     const comment = await writeMarkerComment({
       token, request: budgetedRequest, owner: context.owner, repo: context.repo,
@@ -38580,7 +38665,6 @@ const MANIFEST = "registry.yml";
 const SELF_UPDATE_ARGUMENTS = Object.freeze(["self-update", "--json"]);
 const ADAPTER_ARGUMENTS = Object.freeze(["adapter", "install", ADAPTER]);
 const PUBLISH_ALIAS = "atlan";
-const PUBLISH_ARGUMENTS = Object.freeze(["publish", "--yes"]);
 const MAX_CLI_OUTPUT_BYTES = 64 * 1024;
 
 const CLI_OS = { linux: "linux", darwin: "darwin" };
@@ -38747,23 +38831,32 @@ function publisherEnvironment(environment, token, runtimeDirectory, aliases = []
   };
 }
 
-// The Action writes the CLI's config itself: one marketplace, at the fixed gateway, so the
-// token has nowhere else to go. Each listed folder is its own harness, targeted by name.
-function manifestFor({ namespace, kinds }) {
-  const harnesses = {};
-  for (const [kind, folders] of Object.entries(kinds)) {
-    folders.forEach((folder, index) => {
-      const shape = kind === "skill" ? "directory" : "file";
-      harnesses[`repo-${kind}-${index}`] = { projectRoot: ".", detect: "always", kinds: { [kind]: { subdir: folder, shape } } };
-    });
-  }
-  const manifest = {
-    targets: Object.keys(harnesses),
-    harnesses,
-    marketplaces: { [PUBLISH_ALIAS]: { source: PUBLISH_GATEWAY } },
-    publish: { to: `${PUBLISH_ALIAS}/${namespace}` }
-  };
-  return `${JSON.stringify(manifest, null, 2)}\n`;
+// The Action writes the CLI's config itself, so the token's only destination is the fixed gateway.
+function manifestFor() {
+  return `${JSON.stringify({ marketplaces: { [PUBLISH_ALIAS]: { source: PUBLISH_GATEWAY } } }, null, 2)}\n`;
+}
+
+// Only what the repository tracks can be an artifact, so a build output never publishes.
+function trackedFiles(cwd) {
+  const listed = (0,external_node_child_process_namespaceObject.spawnSync)("git", ["ls-files", "-z"], {
+    cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024,
+    env: { PATH: SYSTEM_PATH, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" }
+  });
+  if (listed.status !== 0) throw new Error("could not list the repository's files; check it out before this step");
+  return listed.stdout.split("\0").filter(Boolean);
+}
+
+// An agent is a tracked Markdown file with `name` and `description` front matter, so a README is skipped.
+function agentFiles(cwd, files, globs = []) {
+  const patterns = globs.map(globPattern);
+  return files.filter(file => file.endsWith(".md") && !file.endsWith("/SKILL.md") &&
+    patterns.some(pattern => pattern.test(file)) && hasFrontMatter(external_node_path_namespaceObject.join(cwd, file))).sort();
+}
+
+function hasFrontMatter(file) {
+  if (!external_node_fs_namespaceObject.lstatSync(file).isFile() || external_node_fs_namespaceObject.statSync(file).size > MAX_SKILL_BYTES) return false;
+  const head = /^---\r?\n([\s\S]*?)\r?\n---/.exec(external_node_fs_namespaceObject.readFileSync(file, "utf8"));
+  return Boolean(head && /^name:\s*\S/m.test(head[1]) && /^description:\s*\S/m.test(head[1]));
 }
 
 // The CLI compares with the Registry by workspace name, so the ID the workflow names is looked up once.
@@ -38779,15 +38872,10 @@ async function workspaceName(token, workspace, registry = registryRequest) {
 function checkoutRejections(cwd, folders) {
   const rejected = [];
   for (const folder of folders) {
-    const root = external_node_path_namespaceObject.join(cwd, folder);
-    if (!external_node_fs_namespaceObject.existsSync(root) || !external_node_fs_namespaceObject.lstatSync(root).isDirectory()) continue;
-    for (const entry of external_node_fs_namespaceObject.readdirSync(root, { withFileTypes: true })) {
-      if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
-      const file = external_node_path_namespaceObject.join(root, entry.name, "SKILL.md");
-      if (!external_node_fs_namespaceObject.existsSync(file) || !external_node_fs_namespaceObject.lstatSync(file).isFile() || external_node_fs_namespaceObject.statSync(file).size > MAX_SKILL_BYTES) continue;
-      const problems = skillRejections(external_node_fs_namespaceObject.readFileSync(file, "utf8"));
-      if (problems.length > 0) rejected.push(`${folder}/${entry.name}/SKILL.md: ${problems.map(item => item.problem).join("; ")}`);
-    }
+    const file = external_node_path_namespaceObject.join(cwd, folder, "SKILL.md");
+    if (!external_node_fs_namespaceObject.lstatSync(file).isFile() || external_node_fs_namespaceObject.statSync(file).size > MAX_SKILL_BYTES) continue;
+    const problems = skillRejections(external_node_fs_namespaceObject.readFileSync(file, "utf8"));
+    if (problems.length > 0) rejected.push(`${folder}/SKILL.md: ${problems.map(item => item.problem).join("; ")}`);
   }
   return rejected;
 }
@@ -38872,26 +38960,33 @@ async function runPublishAction({
   if (!token) throw new Error("ATLANAI_TOKEN must be supplied as a workflow secret");
   maskSecret(token, environment);
   const inputs = parseRegistryInputs(environment);
-  const config = parseSkillSyncConfig(skillSyncConfig(inputs), "workflow");
-  if (!config.valid) throw new Error(`workspace and kinds are invalid: ${config.reason}`);
-  if ((inputs.kinds.agent || []).some(folder => !safeRepositoryPath(folder))) {
-    throw new Error("agent folders must be safe repository-relative paths");
-  }
   const cwd = resolveWorkingDirectory(environment);
   if (parseBoolean("prune", common_getInput("prune", environment) || "false")) {
     throw new Error("prune is not supported with the Registry CLI yet; set prune to false");
   }
+  const files = trackedFiles(cwd);
+  const skills = skillFolders(files, inputs.artifacts.skill);
+  const paths = [...skills, ...agentFiles(cwd, files, inputs.artifacts.agent)];
+  // The CLI expands a path it is given, so one that reads as a glob is refused rather than widened.
+  const unsafe = paths.find(item => /[*?[\]{}]/.test(item));
+  if (unsafe) throw new Error(`${unsafe} contains glob characters, so it cannot be published as an exact path`);
   if (preflight) {
-    const rejected = checkoutRejections(cwd, inputs.kinds.skill);
+    const rejected = checkoutRejections(cwd, skills);
     if (rejected.length > 0) {
       throw new Error(`the Registry would reject ${rejected.length} skill(s), so nothing was published: ${rejected.slice(0, 5).join(" | ")}`);
     }
   }
+  if (paths.length === 0) {
+    process.stdout.write("::notice title=Registry Sync::no tracked file matches the artifacts globs, so nothing was published\n");
+    common_setOutput("status", "success", environment);
+    return;
+  }
   const namespace = await workspaceName(token, inputs.workspace, registry);
-  external_node_fs_namespaceObject.writeFileSync(external_node_path_namespaceObject.join(cwd, MANIFEST), manifestFor({ namespace, kinds: inputs.kinds }));
+  external_node_fs_namespaceObject.writeFileSync(external_node_path_namespaceObject.join(cwd, MANIFEST), manifestFor());
   const { binary, directory, version } = await install({ environment });
   try {
-    await execute(binary, PUBLISH_ARGUMENTS, cwd, publisherEnvironment(environment, token, directory, [PUBLISH_ALIAS]));
+    const args = ["publish", ...paths.map(item => `./${item}`), "--to", `${PUBLISH_ALIAS}/${namespace}`, "--yes"];
+    await execute(binary, args, cwd, publisherEnvironment(environment, token, directory, [PUBLISH_ALIAS]));
     common_setOutput("status", "success", environment);
     common_setOutput("cli-version", version, environment);
   } finally {

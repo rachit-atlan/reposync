@@ -8,10 +8,10 @@ branding:
 
 inputs:
   workspace:
-    description: Atlan workspace ID that skills publish to and preflight compares with.
+    description: Atlan workspace ID that artifacts publish to and preflight compares with.
     required: true
-  kinds:
-    description: "Folders to sync, one line per kind, for example `skill: skills, .claude/skills`. Every skill inside a listed folder is included."
+  artifacts:
+    description: "Globs per kind, one line each, for example `skill: [\"skills/**\", \"team-b/skills/**\"]` and `agent: \"agents/**\"`. Only tracked files match."
     required: true
   preflight:
     description: Check skills before they publish. On a pull request it validates and compares with the Registry; on the default branch it validates the checkout before publishing.
@@ -30,7 +30,7 @@ inputs:
     required: false
     default: ${{ github.token }}
   working-directory:
-    description: Repository directory the kinds folders are relative to.
+    description: Repository directory the artifacts globs are relative to.
     required: false
     default: .
   prune:

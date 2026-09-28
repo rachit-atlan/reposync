@@ -5,3 +5,5 @@ description: Edge test 5, the frontmatter name differs from the folder name. Saf
 body
 
 Edited after the skill was archived in the app.
+
+Edited elsewhere, outside the repo.

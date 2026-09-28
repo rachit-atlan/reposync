@@ -31,8 +31,8 @@ jobs:
       - uses: ./.github/actions/registry-sync
         with:
           workspace: workspace_01m36rz0zdfc1ttjvtj0h9b87j
-          kinds: |
-            skill: .claude/skills, skills
+          artifacts: |
+            skill: [".claude/skills/**", "skills/**"]
           preflight: true
           allow-pr-commenting: true
           fail-on-conflict: true
