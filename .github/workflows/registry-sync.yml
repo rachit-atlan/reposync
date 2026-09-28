@@ -1,0 +1,40 @@
+name: Registry Sync
+
+on:
+  pull_request_target:                  # PRs: preflight only; pull-request code is never checked out
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+  workflow_dispatch:                    # manual run on main = publish everything
+
+permissions: {}
+
+concurrency:
+  group: registry-sync-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}   # never cancel a publish
+
+jobs:
+  registry-sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: registry               # its token is released to main only
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      # Test harness only: the Action is vendored here, so the base branch is checked out to reach it.
+      # A consumer uses atlanai/agent-registry-action@<version> and checks out only on main.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/registry-sync
+        with:
+          workspace: workspace_01m36rz0zdfc1ttjvtj0h9b87j
+          kinds: |
+            skill: .claude/skills
+          preflight: true
+          allow-pr-commenting: true
+          fail-on-conflict: true
+        env:
+          ATLANAI_TOKEN: ${{ secrets.REGISTRY_TOKEN }}

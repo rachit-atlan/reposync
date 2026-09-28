@@ -1,9 +1,0 @@
-targets:
-  - claude
-marketplaces:
-  registry-cli-test:
-    source: https://api.atlan.com
-    config:
-      organisation: org_S2b73Gxp0TIfVlUraka44
-publish:
-  to: registry-cli-test/registry-cli-test
