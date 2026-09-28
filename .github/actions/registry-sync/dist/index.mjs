@@ -38538,6 +38538,10 @@ async function runPreflight({ environment = process.env, request = githubRequest
   if (shouldBlockConflicts(report.conflictCount, failOnConflict)) {
     throw new Error(`${plural(report.conflictCount, "Registry conflict")} must be resolved before this check can pass`);
   }
+  // Publishing would stop on these on main, so the pull request stops first.
+  if (report.rejections?.length > 0) {
+    throw new Error(`${plural(report.rejections.length, "skill")} the Registry would reject must be fixed before this check can pass`);
+  }
 }
 
 ;// CONCATENATED MODULE: ./src/cli.js
