@@ -37376,17 +37376,21 @@ const MAX_GLOBS = 100;
 
 function safeGlob(value) {
   return typeof value === "string" && value.length > 0 && value.length <= 200 && !value.startsWith("/") &&
-    !/[\\\0\r\n]/.test(value) && !value.split("/").some(part => part === "..");
+    !value.endsWith("/") && !/[\\\0\r\n[\]{}]/.test(value) && !value.split("/").some(part => part === "..");
 }
 
+// JSON, an unquoted list such as `[skills/**, agents/**]`, or one glob; a trailing `# comment` is dropped.
 function globList(raw) {
+  const text = raw.replace(/\s+#.*$/, "").trim();
   let value;
   try {
-    value = JSON.parse(raw);
+    value = JSON.parse(text);
   } catch {
-    value = raw.replace(/^["']|["']$/g, "");
+    value = /^\[.*\]$/.test(text) ? text.slice(1, -1).split(",") : text;
   }
-  return Array.isArray(value) ? value : [value];
+  return (Array.isArray(value) ? value : [value])
+    .map(item => (typeof item === "string" ? item.trim().replace(/^["']|["']$/g, "") : item))
+    .filter(item => item !== "");
 }
 
 // `artifacts` maps a kind to globs, one line each: `skill: ["skills/**", "team-b/skills/**"]`
@@ -37413,7 +37417,7 @@ function parseRegistryInputs(environment = process.env) {
   }
   const globs = Object.values(artifacts).flat();
   if (globs.length === 0 || globs.length > MAX_GLOBS || !globs.every(safeGlob)) {
-    throw new Error(`artifacts must list 1-${MAX_GLOBS} repository-relative globs`);
+    throw new Error(`artifacts must list 1-${MAX_GLOBS} repository-relative globs such as "skills/**"; brackets, braces and a trailing / are not supported`);
   }
   return { workspace, artifacts };
 }
@@ -37442,7 +37446,8 @@ function globPattern(glob) {
   return new RegExp(`^${pattern}$`);
 }
 
-// A skill is a folder holding SKILL.md, counted when the folder or its SKILL.md matches.
+// A skill is a folder holding SKILL.md, counted when the folder or its SKILL.md matches. One inside
+// another is part of that skill, since the CLI publishes a folder with everything below it.
 function skillFolders(files, globs = []) {
   const patterns = globs.map(globPattern);
   const folders = new Set();
@@ -37451,7 +37456,8 @@ function skillFolders(files, globs = []) {
     const folder = file.slice(0, -"/SKILL.md".length);
     if (patterns.some(pattern => pattern.test(folder) || pattern.test(file))) folders.add(folder);
   }
-  return [...folders].sort();
+  const sorted = [...folders].sort();
+  return sorted.filter(folder => !sorted.some(outer => folder.startsWith(`${outer}/`)));
 }
 
 // Preflight's view of the inputs: the skill folders, found in the pull request's trees.
@@ -38859,7 +38865,7 @@ function agentFiles(cwd, files, globs = []) {
 }
 
 function hasFrontMatter(file) {
-  if (!external_node_fs_namespaceObject.lstatSync(file).isFile() || external_node_fs_namespaceObject.statSync(file).size > MAX_SKILL_BYTES) return false;
+  if (!external_node_fs_namespaceObject.existsSync(file) || !external_node_fs_namespaceObject.lstatSync(file).isFile() || external_node_fs_namespaceObject.statSync(file).size > MAX_SKILL_BYTES) return false;
   const head = /^---\r?\n([\s\S]*?)\r?\n---/.exec(external_node_fs_namespaceObject.readFileSync(file, "utf8"));
   return Boolean(head && /^name:\s*\S/m.test(head[1]) && /^description:\s*\S/m.test(head[1]));
 }
@@ -38921,7 +38927,8 @@ function runCli(binary, args, cwd, environment, capture = false) {
       else child.kill();
     });
     child.on("error", reject);
-    child.on("exit", code => {
+    // "close" waits for stdout to drain; "exit" can fire first and lose the tail of it.
+    child.on("close", code => {
       if (size > MAX_CLI_OUTPUT_BYTES) return reject(new Error("Registry CLI output exceeds the size limit"));
       if (code !== 0) return reject(new Error(`Registry CLI ${args[0]} exited with status ${code}`));
       resolve(Buffer.concat(chunks).toString("utf8"));
@@ -38970,10 +38977,11 @@ async function runPublishAction({
     throw new Error("prune is not supported with the Registry CLI yet; set prune to false");
   }
   const files = trackedFiles(cwd);
-  const skills = skillFolders(files, inputs.artifacts.skill);
+  // A tracked file can be missing from the checkout, as in a sparse checkout; it cannot publish.
+  const skills = skillFolders(files, inputs.artifacts.skill).filter(folder => external_node_fs_namespaceObject.existsSync(external_node_path_namespaceObject.join(cwd, folder, "SKILL.md")));
   const paths = [...skills, ...agentFiles(cwd, files, inputs.artifacts.agent)];
   // The CLI expands a path it is given, so one that reads as a glob is refused rather than widened.
-  const unsafe = paths.find(item => /[*?[\]{}]/.test(item));
+  const unsafe = paths.find(item => /[*?[\]{}\\]|[+@!]\(/.test(item));
   if (unsafe) throw new Error(`${unsafe} contains glob characters, so it cannot be published as an exact path`);
   if (preflight) {
     const rejected = checkoutRejections(cwd, skills);
