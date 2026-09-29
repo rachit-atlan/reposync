@@ -32,9 +32,18 @@ jobs:
         with:
           workspace: workspace_01m36rz0zdfc1ttjvtj0h9b87j
           artifacts: |
-            skill: [.claude/skills/**, skills/**]  # both folders
+            skill: [.claude/skills/**]
           preflight: true
           allow-pr-commenting: true
           fail-on-conflict: true
+        env:
+          ATLANAI_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+      # A second workspace, checked on pull requests only, to test one comment per workspace.
+      - uses: ./.github/actions/registry-sync
+        if: github.event_name == 'pull_request_target'
+        with:
+          workspace: workspace_01m36xfdz9ejgrcm05npbvjrtz
+          artifacts: |
+            skill: [skills/**]
         env:
           ATLANAI_TOKEN: ${{ secrets.REGISTRY_TOKEN }}

@@ -38437,6 +38437,7 @@ function tableCell(value) {
 }
 
 function formatPreflightComment(report, compact = false) {
+  const marker = report.marker ?? PREFLIGHT_MARKER;
   const state = commentState(report);
   const conflicts = conflictRows(report);
   const conflictedSkills = new Set(conflicts.map(({ comparison }) => comparison.file.filename)).size;
@@ -38457,7 +38458,7 @@ function formatPreflightComment(report, compact = false) {
   const resolutionActions = resolutionPrompt
     ? `${actionBadge({ href: codexHandoffUrl(resolutionPrompt), light: CODEX_BADGE_URL, dark: CODEX_BADGE_DARK_URL, alt: "Fix in Codex" })} ${actionBadge({ href: claudeHandoffUrl(report, resolutionPrompt), light: CLAUDE_BADGE_URL, dark: CLAUDE_BADGE_DARK_URL, alt: "Fix in Claude Code" })} **[Fix in Claude.ai](${claudeWebHandoffUrl(report, resolutionPrompt)})**`
     : "";
-  const lines = [PREFLIGHT_MARKER, `### ${verdict}`, ""];
+  const lines = [marker, `### ${verdict}`, ""];
   if (state === "unconfigured") {
     lines.push("No Atlan API key is available in `ATLANAI_TOKEN`, so this pull request was not compared with Atlan and conflicts were not checked. Expose the existing secret as `ATLANAI_TOKEN` on the SkillSync step to enable it.", "");
   }
@@ -38566,7 +38567,7 @@ function formatPreflightComment(report, compact = false) {
   }
   if (compact && Buffer.byteLength(comment, "utf8") > MAX_GITHUB_COMMENT_BYTES) {
     const minimal = [
-      PREFLIGHT_MARKER,
+      marker,
       `### ${verdict}`,
       "",
       "Detailed findings were omitted to keep this GitHub comment within its size limit; inspect the changed skill files and rerun preflight.",
@@ -38574,7 +38575,7 @@ function formatPreflightComment(report, compact = false) {
     ].join("\n");
     return Buffer.byteLength(minimal, "utf8") <= MAX_GITHUB_COMMENT_BYTES
       ? minimal
-      : [PREFLIGHT_MARKER, `### ${verdict}`, "", "Detailed findings were omitted to keep this GitHub comment within its size limit."].join("\n");
+      : [marker, `### ${verdict}`, "", "Detailed findings were omitted to keep this GitHub comment within its size limit."].join("\n");
   }
   return comment;
 }
@@ -38596,10 +38597,14 @@ async function runPreflight({ environment = process.env, request = githubRequest
   const inputs = common_getInput("artifacts", environment) ? parseRegistryInputs(environment) : undefined;
   const context = parsePullRequestContext(environment, eventPayload);
   const budgetedRequest = withRequestBudget(request);
-  const existing = commenting ? await findMarkerComment({
+  // One comment per workspace, so steps that publish to different workspaces keep their own. A comment
+  // from before the key existed is taken over rather than left beside a new one.
+  const marker = inputs ? `<!-- atlan-skillsync-preflight:${inputs.workspace} -->` : PREFLIGHT_MARKER;
+  const find = key => findMarkerComment({
     token, request: budgetedRequest, owner: context.owner, repo: context.repo,
-    issueNumber: context.pullNumber, marker: PREFLIGHT_MARKER
-  }) : undefined;
+    issueNumber: context.pullNumber, marker: key
+  });
+  const existing = commenting ? (await find(marker)) ?? (inputs ? await find(PREFLIGHT_MARKER) : undefined) : undefined;
   const report = await buildPreflightReport({
     token,
     context,
@@ -38609,6 +38614,7 @@ async function runPreflight({ environment = process.env, request = githubRequest
     inputs
   });
   report.failOnConflict = failOnConflict;
+  report.marker = marker;
   // A pull request that touches no listed folder gets no comment, unless an earlier run already left one.
   // A run that could not read the trees says so rather than passing quietly.
   const untouched = Boolean(inputs) && report.available && report.config?.valid && report.eligible.length === 0 && !existing;
@@ -39044,12 +39050,39 @@ function formatCost(usd) {
   return `$${usd.toFixed(2)}`;
 }
 
-function escapeCell(value) {
-  return String(value).replaceAll("|", "&#124;").replace(/[\r\n]+/g, " ");
+// GitHub links @mentions, #refs and bare URLs after Markdown rendering, so escaping cannot stop them; an
+// invisible word joiner (U+2060) after the trigger breaks each pattern and leaves the text unchanged to a reader.
+function breakGithubLinks(text) {
+  return text.replace(/[@#]|:\/\/|\bwww(?=\.)/gi, match => `${match}\u2060`);
+}
+
+// Names, models, branches, record IDs and reasons come from the eval command and from Atlan, so they may hold
+// Markdown or HTML. As text, the characters that open inline syntax (links, emphasis, code, HTML, entities,
+// table cells) are backslash-escaped, GitHub's own links are broken, and newlines collapse so the value cannot
+// start a new block.
+function escapeText(value) {
+  return breakGithubLinks(String(value).replace(/[\r\n]+/g, " ").replace(/[\\`*_[\]<>!&|~]/g, "\\$&"));
+}
+
+// Inside <details>, the line is raw HTML: Markdown escapes do not apply there, so HTML entities are used instead.
+function escapeHtml(value) {
+  // Links are broken before encoding: the # of an entity such as &#60; must stay intact.
+  return breakGithubLinks(String(value).replace(/[\r\n]+/g, " ")).replace(/[&<>"']/g, char => `&#${char.charCodeAt(0)};`);
+}
+
+// As a code span, nothing inside is parsed, so only the fence can break out: it is made longer than any run of
+// backticks in the value. In a table, a pipe still ends the cell even inside code, so it is escaped as GFM allows.
+function codeSpan(value, { table = false } = {}) {
+  let text = String(value).replace(/[\r\n]+/g, " ");
+  if (table) text = text.replaceAll("|", "\\|");
+  const longest = Math.max(0, ...(text.match(/`+/g) || []).map(run => run.length));
+  const fence = "`".repeat(longest + 1);
+  const pad = text.startsWith("`") || text.endsWith("`") ? " " : "";
+  return `${fence}${pad}${text}${pad}${fence}`;
 }
 
 function scorerRow(scorer) {
-  const name = scorer.off ? `${escapeCell(scorer.name)} *(info)*` : escapeCell(scorer.name);
+  const name = scorer.off ? `${escapeText(scorer.name)} *(info)*` : escapeText(scorer.name);
   const baseline = formatPercent(scorer.baselineMean);
   const pr = formatPercent(scorer.prMean);
   let delta = formatPp(scorer.delta);
@@ -39073,7 +39106,7 @@ function prOnlyScoreTable(prScores) {
   return [
     "| Scorer | This PR | Cases scored |",
     "| :--- | ---: | ---: |",
-    ...prScores.map(score => `| ${escapeCell(score.name)} | ${formatPercent(score.prMean)} | ${score.count} |`)
+    ...prScores.map(score => `| ${escapeText(score.name)} | ${formatPercent(score.prMean)} | ${score.count} |`)
   ];
 }
 
@@ -39151,16 +39184,16 @@ function formatRatioDelta(baselineTotal, prTotal, baselineCases, prCases, casesD
 }
 
 function experimentHeader(experiment) {
-  const nameLink = experiment.url ? `[${escapeCell(experiment.name)}](${experiment.url})` : `\`${escapeCell(experiment.name)}\``;
-  const model = experiment.model ? ` · \`${escapeCell(experiment.model)}\`` : "";
+  const nameLink = experiment.url ? `[${escapeText(experiment.name)}](${experiment.url})` : codeSpan(experiment.name);
+  const model = experiment.model ? ` · ${codeSpan(experiment.model)}` : "";
   if (!experiment.baseline) {
     return `**${nameLink}**${model}`;
   }
   const baseline = experiment.baseline;
   const baselineLabel = baseline.url
-    ? `[\`${escapeCell(baseline.branch)}\` @ \`${escapeCell(baseline.shortSha)}\`](${baseline.url})`
-    : `\`${escapeCell(baseline.branch)}\` @ \`${escapeCell(baseline.shortSha)}\``;
-  const modelNote = baseline.model && experiment.model && baseline.model !== experiment.model ? ` (\`${escapeCell(baseline.model)}\`)` : "";
+    ? `[${codeSpan(baseline.branch)} @ ${codeSpan(baseline.shortSha)}](${baseline.url})`
+    : `${codeSpan(baseline.branch)} @ ${codeSpan(baseline.shortSha)}`;
+  const modelNote = baseline.model && experiment.model && baseline.model !== experiment.model ? ` (${codeSpan(baseline.model)})` : "";
   return `**${nameLink}**${model} vs baseline ${baselineLabel}${modelNote}`;
 }
 
@@ -39169,7 +39202,7 @@ function regressionSummaryLine(experiment) {
   if (regressed.length === 0) return "";
   const [first, ...rest] = regressed;
   const extra = rest.length > 0 ? ` and ${rest.length} more scorer${rest.length === 1 ? "" : "s"}` : "";
-  return `**${regressed.length} regression${regressed.length === 1 ? "" : "s"}.** \`${escapeCell(first.name)}\` dropped **${Math.abs(first.delta * 100).toFixed(1)}pp** across ${first.regressedCount} case${first.regressedCount === 1 ? "" : "s"} (threshold ${(first.threshold * 100).toFixed(1)}pp)${extra}. This check fails.`;
+  return `**${regressed.length} regression${regressed.length === 1 ? "" : "s"}.** ${codeSpan(first.name)} dropped **${Math.abs(first.delta * 100).toFixed(1)}pp** across ${first.regressedCount} case${first.regressedCount === 1 ? "" : "s"} (threshold ${(first.threshold * 100).toFixed(1)}pp)${extra}. This check fails.`;
 }
 
 function alertBlock(kind, lines) {
@@ -39188,12 +39221,12 @@ function experimentDetails(experiment) {
     if (!scorer.regressed || !scorer.regressedRecords || scorer.regressedRecords.length === 0) continue;
     blocks.push(
       "<details>",
-      `<summary>${regressedCasesLabel(scorer)} on ${escapeCell(scorer.name)}</summary>`,
+      `<summary>${regressedCasesLabel(scorer)} on ${escapeHtml(scorer.name)}</summary>`,
       "",
       "| Record | Baseline | This PR |",
       "| :--- | ---: | ---: |",
       ...scorer.regressedRecords.map(record =>
-        `| \`${escapeCell(record.id)}\` | ${formatPercent(record.baseline)} | ${formatPercent(record.pr)} |`),
+        `| ${codeSpan(record.id, { table: true })} | ${formatPercent(record.baseline)} | ${formatPercent(record.pr)} |`),
       "",
       "</details>"
     );
@@ -39214,16 +39247,16 @@ function renderExperiment(experiment, { compact = false, summary = false } = {})
   const lines = [];
   lines.push(experimentHeader(experiment), "");
   if (experiment.status === "invalid") {
-    lines.push(`_${escapeCell(experiment.invalidReason || "invalid run")}._`, "");
+    lines.push(`_${escapeText(experiment.invalidReason || "invalid run")}._`, "");
     if (!compact) lines.push(...invalidDetails(experiment), "");
     return lines;
   }
   if (experiment.status === "no-baseline") {
-    lines.push(escapeCell(experiment.noBaselineReason || "No baseline yet — merge to the default branch or run this workflow there once."), "");
+    lines.push(escapeText(experiment.noBaselineReason || "No baseline yet — merge to the default branch or run this workflow there once."), "");
   }
-  if (summary && experiment.registryNote) lines.push(`_${escapeCell(experiment.registryNote)}_`, "");
+  if (summary && experiment.registryNote) lines.push(`_${escapeText(experiment.registryNote)}_`, "");
   if (experiment.modelNote) {
-    lines.push(`_${escapeCell(experiment.modelNote)}_`, "");
+    lines.push(`_${escapeText(experiment.modelNote)}_`, "");
   }
   if (experiment.datasetHashWarning) {
     lines.push("_The dataset content changed since the baseline run; the comparison still uses only shared cases._", "");
@@ -39258,7 +39291,7 @@ function overallVerdictAlert(report, { compact = false } = {}) {
   }
   if (report.overallStatus === "invalid") {
     const primary = report.experiments.find(experiment => experiment.status === "invalid");
-    return alertBlock("CAUTION", [`**Invalid eval run.** ${escapeCell(primary?.invalidReason || "the eval command did not produce a usable result")}. This check fails.`]);
+    return alertBlock("CAUTION", [`**Invalid eval run.** ${escapeText(primary?.invalidReason || "the eval command did not produce a usable result")}. This check fails.`]);
   }
   if (report.overallStatus === "no-baseline") {
     return alertBlock("WARNING", ["**No baseline yet.** The first run on the default branch creates it. This check passes."]);
@@ -39408,15 +39441,22 @@ function readResultsFile(filePath, { max = MAX_EXPERIMENTS, maxBytes = MAX_EVAL_
     return [];
   }
   const entries = [];
-  for (const line of raw.split("\n")) {
+  const lines = raw.split("\n");
+  for (const [index, line] of lines.entries()) {
     const trimmed = line.trim();
     if (!trimmed) continue;
+    // A bad line may be the experiment that failed (a truncated final write, say), so it makes the run
+    // invalid rather than being skipped: partial output must never become a green check.
+    let parsed;
     try {
-      const parsed = JSON.parse(trimmed);
-      if (parsed && typeof parsed.experiment_id === "string") entries.push(parsed);
+      parsed = JSON.parse(trimmed);
     } catch {
-      // A malformed JSONL line is skipped, not fatal: the rest of the run is still worth reporting.
+      throw new EvalInvalidError(`line ${index + 1} of ATLAN_EVAL_RESULTS_FILE is not valid JSON`);
     }
+    if (!parsed || typeof parsed.experiment_id !== "string" || !parsed.experiment_id) {
+      throw new EvalInvalidError(`line ${index + 1} of ATLAN_EVAL_RESULTS_FILE has no experiment_id`);
+    }
+    entries.push(parsed);
   }
   if (entries.length > max) throw new EvalInvalidError(`the eval command wrote ${entries.length} experiments (limit ${max})`);
   return entries;
@@ -39596,8 +39636,14 @@ function checkProvenance({ experiment, gitSha, gitPr }) {
   const git = experiment?.config?.git;
   if (!git?.sha) return { valid: false, reason: "the experiment has no git provenance (config.git.sha); use atlanai 0.3.4 or later and do not set config.git yourself" };
   if (git.sha !== gitSha) return { valid: false, reason: "the experiment was not produced by this commit (config.git.sha does not match)" };
-  if (gitPr && git.pr !== undefined && git.pr !== null && git.pr !== "" && String(git.pr) !== String(gitPr)) {
-    return { valid: false, reason: "the experiment was not produced by this pull request (config.git.pr does not match)" };
+  if (gitPr) {
+    // A matching SHA alone does not bind the run to this PR: the same commit can be evaluated elsewhere.
+    if (git.pr === undefined || git.pr === null || git.pr === "") {
+      return { valid: false, reason: "the experiment has no pull request provenance (config.git.pr); use atlanai 0.3.4 or later and do not set config.git yourself" };
+    }
+    if (String(git.pr) !== String(gitPr)) {
+      return { valid: false, reason: "the experiment was not produced by this pull request (config.git.pr does not match)" };
+    }
   }
   return { valid: true };
 }
@@ -39660,8 +39706,15 @@ async function findBaselineExperiment({ registry, token, workspaceId, prExperime
     const exhausted = items.length < EVAL_BASELINE_LIST_PAGE_SIZE || (total !== undefined && seen >= total);
     if (exhausted) return anyModel ? { experiment: anyModel, matchedBy: "any-model" } : undefined;
   }
-  if (anyModel) return { experiment: anyModel, matchedBy: "any-model" };
-  throw new EvalInvalidError(`no baseline in the newest ${seen} runs on ${baselineBranch}; older runs were not searched`);
+  // The page limit was reached with runs left unread, so a same-model baseline may still exist further back:
+  // report the search as incomplete instead of settling for a different model.
+  const unread = total !== undefined ? ` of ${total}` : "";
+  if (anyModel) {
+    throw new EvalInvalidError(
+      `baseline search incomplete: no run with this model in the newest ${seen}${unread} runs on ${baselineBranch}; pin one with baseline: <experiment id>`
+    );
+  }
+  throw new EvalInvalidError(`no baseline in the newest ${seen}${unread} runs on ${baselineBranch}; older runs were not searched`);
 }
 
 // ---- comparison ---------------------------------------------------------------
@@ -39762,7 +39815,9 @@ function overallStatus(statuses) {
 // ---- rendering helpers ------------------------------------------------------
 
 function experimentUrl(orgSlug, id) {
-  return orgSlug ? `https://app.atlan.com/orgs/${encodeURIComponent(orgSlug)}/evals/experiments/${encodeURIComponent(id)}` : undefined;
+  // encodeURIComponent leaves ( and ) alone, and a ) would end the Markdown link target early.
+  const segment = value => encodeURIComponent(value).replace(/[()]/g, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+  return orgSlug ? `https://app.atlan.com/orgs/${segment(orgSlug)}/evals/experiments/${segment(id)}` : undefined;
 }
 
 function datasetVersionLabel(snapshot) {
@@ -39990,6 +40045,15 @@ async function runEval({
         experimentReports.push({
           ...base, ...prOnly, status: "invalid",
           invalidReason: invalidReasonOf(error, "the baseline's results could not be read from Atlan")
+        });
+        continue;
+      }
+      // The baseline was chosen by its summary; its rows get the same check as this run's before any comparison.
+      const baselineValidation = validateExperiment({ experiment: baselineMatch.experiment, results: baselineResults, maxErrorRate });
+      if (!baselineValidation.valid) {
+        experimentReports.push({
+          ...base, ...prOnly, status: "invalid",
+          invalidReason: `the baseline ${baselineMatch.experiment.id} is not a valid run: ${baselineValidation.reason}`
         });
         continue;
       }
