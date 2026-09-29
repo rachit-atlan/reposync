@@ -9,3 +9,4 @@ Regression: edited in a PR.
 changed-since test.
 
 Per-skill publish test, 2026-09-29.
+Per-skill publish test via PR, 2026-09-29.
