@@ -29323,16 +29323,17 @@ const MAX_CONFIG_BYTES = 256 * 1024;
 const MAX_SKILL_ROOTS = 500;
 const MAX_EXCLUDED_SKILLS = 500;
 const MAX_ANALYZED_SKILLS = 5;
-// SKILL.md files validated against the Registry's front-matter contract per pull request (one read each).
-const MAX_VALIDATED_SKILLS = 20;
+// Changed SKILL.md files read per GraphQL query, and the file bytes one query may return (JSON can double them).
+const MAX_DEFINITIONS_PER_QUERY = 50;
+const MAX_DEFINITION_BATCH_BYTES = 4 * 1024 * 1024;
 // The prompt appears in three encoded handoff URLs. These caps leave room for tables and fixed guidance under
 // GitHub's 65,536-character comment limit, even when all validated skills are rejected.
 const MAX_RENDERED_FINDINGS_CHARS = 8_000;
 const MAX_RESOLUTION_PROMPT_CHARS = 3_000;
 const MAX_ENCODED_RESOLUTION_PROMPT_CHARS = 5_000;
 const MAX_GITHUB_COMMENT_BYTES = 65_000;
-// A SKILL.md is read whole from the GitHub contents API, which serves files up to 1 MiB; the Registry accepts
-// instructions up to 500,000 characters, so the bound sits above the largest skill it would accept.
+// A larger SKILL.md is rejected without reading it: the Registry accepts instructions up to 500,000 characters,
+// so the bound sits above the largest skill it would accept.
 const MAX_SKILL_BYTES = 1024 * 1024;
 // The Registry's SKILL.md contract (agent-gateway extensions/skill validate_skill_md). A skill outside these limits is
 // rejected with HTTP 422 on publish, so preflight reports it before merge. Lengths are in characters.
@@ -29346,7 +29347,8 @@ const MAX_DIGEST_BLOBS = 20;
 const MAX_DIGEST_BYTES = 4 * 1024 * 1024;
 const MAX_DISPLAYED_ROOTS = 10;
 // One identity read, up to MAX_COMMENT_PAGES comment pages, MAX_PR_FILE_PAGES file pages, two configuration reads,
-// two tree reads, MAX_DIGEST_BLOBS blob reads, MAX_VALIDATED_SKILLS SKILL.md reads, and one comment write.
+// two tree reads, MAX_DIGEST_BLOBS blob reads, and one comment write. SKILL.md validation is outside it: it reads
+// every changed file, a batch per query, so its cost is bounded by the pull request, not by a fixed count.
 const MAX_PREFLIGHT_REQUESTS = 80;
 const MAX_REGISTRY_REQUESTS = 24;
 const MAX_REGISTRY_RESPONSE_BYTES = 2 * 1024 * 1024;
@@ -38133,12 +38135,15 @@ function fileStatus(status) {
 
 function withRequestBudget(request) {
   let remaining = MAX_PREFLIGHT_REQUESTS;
-  return async options => {
+  const budgeted = async options => {
     const isWrite = options?.method === "POST" || options?.method === "PATCH";
     if (remaining < 1 || (!isWrite && remaining < 2)) throw new Error("preflight request budget exhausted");
     remaining -= 1;
     return request(options);
   };
+  // Validation reads every changed SKILL.md, so the pull request bounds it, not this count.
+  budgeted.unbudgeted = request;
+  return budgeted;
 }
 
 function plural(count, singular, pluralForm = singular.endsWith("y") ? `${singular.slice(0, -1)}ies` : `${singular}s`) {
@@ -38213,6 +38218,75 @@ async function readRepositoryBlob({ token, context, request, sha, maxBytes }) {
     maxResponseBytes: Math.ceil(maxBytes * 4 / 3) + 4096
   });
   return decodeBase64Bytes(response, maxBytes);
+}
+
+function definitionBatches(files, tree) {
+  const batches = [];
+  let batch = [];
+  let bytes = 0;
+  for (const file of files) {
+    const size = Math.min(tree?.get(file)?.size ?? MAX_SKILL_BYTES, MAX_SKILL_BYTES);
+    if (batch.length >= MAX_DEFINITIONS_PER_QUERY || (batch.length > 0 && bytes + size > MAX_DEFINITION_BATCH_BYTES)) {
+      batches.push(batch);
+      batch = [];
+      bytes = 0;
+    }
+    batch.push(file);
+    bytes += size;
+  }
+  if (batch.length > 0) batches.push(batch);
+  return batches;
+}
+
+// Every changed SKILL.md at the head commit, a batch per GraphQL query, so validation has no fixed cap and costs
+// the repository's shared API budget a few points. A file GraphQL truncates is read whole by its blob ID; one
+// GitHub does not return makes the read fail, never a skipped file. An oversized file maps to null.
+async function readDefinitions({ token, context, request, files, tree }) {
+  const read = new Map();
+  for (const batch of definitionBatches(files, tree)) {
+    const variables = { owner: context.owner, name: context.repo };
+    batch.forEach((file, index) => { variables[`e${index}`] = `${context.headSha}:${file}`; });
+    const parameters = ["$owner: String!", "$name: String!", ...batch.map((_, index) => `$e${index}: String!`)].join(", ");
+    const fields = batch.map((_, index) => `f${index}: object(expression: $e${index}) { ... on Blob { oid byteSize isTruncated text } }`).join(" ");
+    const response = await request({
+      token,
+      method: "POST",
+      requestPath: "/graphql",
+      body: { query: `query(${parameters}) { repository(owner: $owner, name: $name) { ${fields} } }`, variables },
+      expectedStatus: 200
+    });
+    if (Array.isArray(response?.errors) && response.errors.length > 0) throw new Error("GitHub could not return the changed SKILL.md files");
+    for (const [index, file] of batch.entries()) {
+      const blob = response?.data?.repository?.[`f${index}`];
+      if (!blob || !Number.isSafeInteger(blob.byteSize)) throw new Error("GitHub did not return every changed SKILL.md");
+      if (blob.byteSize > MAX_SKILL_BYTES) read.set(file, null);
+      else if (typeof blob.text === "string" && blob.isTruncated === false) read.set(file, blob.text);
+      else read.set(file, (await readRepositoryBlob({ token, context, request, sha: blob.oid, maxBytes: MAX_SKILL_BYTES })).toString("utf8"));
+    }
+  }
+  return read;
+}
+
+// The skills a pull request changes, from its two trees, however many files it touches. Past GitHub's file-list
+// pages this is the whole answer; it has no line counts or rename pairs, which only the file list carries.
+function treeChanges(baseTree, headTree, config) {
+  const affected = new Map();
+  for (const file of new Set([...baseTree.keys(), ...headTree.keys()])) {
+    if (baseTree.get(file)?.sha === headTree.get(file)?.sha) continue;
+    const found = classifySkillFile(file, config);
+    if (found.kind !== "eligible") continue;
+    const entry = affected.get(found.manifest) || {
+      filename: found.manifest, skill: found.skill, directory: found.directory,
+      additions: 0, deletions: 0, definitionChanged: false, supportingChanges: 0
+    };
+    if (found.definition) entry.definitionChanged = true;
+    else entry.supportingChanges += 1;
+    affected.set(found.manifest, entry);
+  }
+  return [...affected.values()].map(entry => ({
+    ...entry,
+    status: !baseTree.has(entry.filename) ? "added" : !headTree.has(entry.filename) ? "removed" : "modified"
+  }));
 }
 
 function entriesForSkill(tree, directory) {
@@ -38450,22 +38524,26 @@ async function buildPreflightReport({ token, context, request, registryToken, re
   try {
     fileResult = await listPullRequestFiles({ token, context, request });
   } catch {
-    return { available: false, reason: "GitHub could not provide the pull request file list" };
+    // With artifacts the trees still name every changed skill, so validation does not depend on this list.
+    if (!inputs) return { available: false, reason: "GitHub could not provide the pull request file list" };
+    fileResult = { files: [], limited: true };
   }
 
   let config;
+  let baseTree;
   let treeFiles;
   if (!context.baseSha || !context.headSha) {
     config = { valid: false, reason: "GitHub did not provide both pull request commit IDs" };
   } else if (inputs) {
     // Globs reach any depth, so the skill folders come from the trees, not from a path's shape.
     try {
-      const [baseTree, headTree] = await Promise.all([
+      const [base, head] = await Promise.all([
         readRepositoryTree({ token, context, request, ref: context.baseSha }),
         readRepositoryTree({ token, context, request })
       ]);
-      treeFiles = headTree;
-      config = preflightConfig(inputs, [...baseTree.keys(), ...headTree.keys()]);
+      baseTree = base;
+      treeFiles = head;
+      config = preflightConfig(inputs, [...base.keys(), ...head.keys()]);
     } catch {
       config = { valid: false, reason: "GitHub could not provide the pull request's file trees" };
     }
@@ -38488,7 +38566,12 @@ async function buildPreflightReport({ token, context, request, registryToken, re
     }
   }
 
-  const changes = eligibleChanges(fileResult.files, config);
+  let changes = eligibleChanges(fileResult.files, config);
+  let limited = fileResult.limited;
+  if (limited && baseTree && treeFiles && config.valid) {
+    changes = { eligible: treeChanges(baseTree, treeFiles, config), excluded: 0 };
+    limited = false;
+  }
   const supportingOnly = changes.eligible.filter(file => !file.definitionChanged);
   let supportingAnalysisUnavailable = false;
   if ((supportingOnly.length > 0 || proposedConfig?.valid) && context.headSha && !treeFiles) {
@@ -38505,18 +38588,26 @@ async function buildPreflightReport({ token, context, request, registryToken, re
   const supporting = eligible.reduce((count, file) => count + file.supportingChanges, 0);
   // The Registry's front-matter contract, checked before merge. Independent of the Registry comparison: it needs
   // no token, and a skill that will be answered with HTTP 422 on publish is worth saying whatever else is known.
+  // Validation is the gate before publishing: every changed skill is checked, and one that cannot be read makes the
+  // run unchecked rather than passing it.
   const rejections = [];
   const present = eligible.filter(file => file.status !== "removed");
-  const unvalidated = Math.max(0, present.length - MAX_VALIDATED_SKILLS);
-  if (context.headSha) {
-    for (const file of present.slice(0, MAX_VALIDATED_SKILLS)) {
-      try {
-        const content = await readRepositoryFile({ token, context, request, filename: file.filename, ref: context.headSha, maxBytes: MAX_SKILL_BYTES });
-        const problems = skillRejections(content);
+  let unchecked = inputs && !config.valid ? config.reason : undefined;
+  if (!unchecked && present.length > 0) {
+    try {
+      if (!context.headSha) throw new Error("GitHub did not provide the pull request's head commit");
+      const definitions = await readDefinitions({
+        token, context, request: request.unbudgeted ?? request, files: present.map(file => file.filename), tree: treeFiles
+      });
+      for (const file of present) {
+        const content = definitions.get(file.filename);
+        const problems = content === null
+          ? [{ problem: `\`SKILL.md\` is over ${MAX_SKILL_BYTES / 1024 / 1024} MiB`, fix: "move reference material into files beside SKILL.md and link to them" }]
+          : skillRejections(content);
         if (problems.length > 0) rejections.push({ file, problems });
-      } catch {
-        // A SKILL.md that cannot be read within preflight limits is not a verdict; Atlan validates it on publish.
       }
+    } catch (error) {
+      unchecked = error instanceof Error ? error.message : "the changed SKILL.md files could not be read";
     }
   }
   const registryState = {
@@ -38583,7 +38674,7 @@ async function buildPreflightReport({ token, context, request, registryToken, re
     proposedConfig,
     proposedSkillCount,
     files: fileResult.files,
-    limited: fileResult.limited,
+    limited,
     changedFiles: context.changedFiles,
     eligible,
     excluded: changes.excluded,
@@ -38593,7 +38684,7 @@ async function buildPreflightReport({ token, context, request, registryToken, re
     registry: registryState,
     conflictCount,
     rejections,
-    unvalidated
+    unchecked
   };
 }
 
@@ -38808,7 +38899,7 @@ function formatPreflightComment(report, compact = false) {
     : notComparedSkills(report).filter(file => !rejectionFor(report, file));
   const verdict = rejected.length > 0
     ? `⛔ ${plural(rejected.length, "skill")} will be rejected by the Registry`
-    : report.unvalidated > 0 ? "⛔ Too many changed skills to check"
+    : report.unchecked ? "⛔ Preflight could not check this pull request"
     : state === "conflict"
       ? `❗ ${plural(conflictedSkills, "conflict")} found`
       : state === "unavailable" ? "ℹ️ Registry check unavailable"
@@ -38821,8 +38912,8 @@ function formatPreflightComment(report, compact = false) {
     ? `${actionBadge({ href: codexHandoffUrl(resolutionPrompt), light: CODEX_BADGE_URL, dark: CODEX_BADGE_DARK_URL, alt: "Fix in Codex" })} ${actionBadge({ href: claudeHandoffUrl(report, resolutionPrompt), light: CLAUDE_BADGE_URL, dark: CLAUDE_BADGE_DARK_URL, alt: "Fix in Claude Code" })} **[Fix in Claude.ai](${claudeWebHandoffUrl(report, resolutionPrompt)})**`
     : "";
   const lines = [PREFLIGHT_MARKER, `### ${verdict}`, ""];
-  if (report.unvalidated > 0) {
-    lines.push(`This pull request changes ${plural(MAX_VALIDATED_SKILLS + report.unvalidated, "skill")}, and preflight checks ${MAX_VALIDATED_SKILLS}, so the check fails rather than let the rest merge unchecked. Split it into pull requests of at most ${MAX_VALIDATED_SKILLS} skills each.`, "");
+  if (report.unchecked) {
+    lines.push(`${tableCell(report.unchecked)}, so the check fails rather than let unchecked skills merge. Rerun it; if it fails again, check the workflow's access to this repository.`, "");
   }
   if (state === "unconfigured") {
     lines.push("No Atlan API key is available in `ATLANAI_TOKEN`, so this pull request was not compared with Atlan and conflicts were not checked. Expose the existing secret as `ATLANAI_TOKEN` on the Registry Sync step to enable it.", "");
@@ -38910,7 +39001,7 @@ function formatPreflightComment(report, compact = false) {
     );
   }
 
-  if (state === "unavailable") {
+  if (state === "unavailable" && !report.unchecked) {
     lines.push("We couldn't compare this PR with Atlan. Check the Registry token or workflow configuration, then retry.");
   } else if (state !== "conflict") {
     const tail = [];
@@ -39003,10 +39094,7 @@ async function runPreflight({ environment = process.env, request = githubRequest
   if (report.rejections?.length > 0) {
     throw new Error(`${plural(report.rejections.length, "skill")} the Registry would reject must be fixed before this check can pass`);
   }
-  // Preflight is the gate before publishing, so a skill it could not read is not a pass.
-  if (report.unvalidated > 0) {
-    throw new Error(`this pull request changes ${plural(report.unvalidated, "more skill")} than preflight checks (${MAX_VALIDATED_SKILLS}); split it so each pull request changes at most ${MAX_VALIDATED_SKILLS}`);
-  }
+  if (report.unchecked) throw new Error(`preflight could not check every changed skill: ${report.unchecked}`);
 }
 
 ;// CONCATENATED MODULE: ./src/publish-failure.js
