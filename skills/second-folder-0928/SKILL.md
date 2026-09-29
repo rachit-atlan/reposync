@@ -7,3 +7,4 @@ Lives in skills/, not .claude/skills.
 Regression: edited in a PR.
 
 Two-workspace test.
+Second push.
