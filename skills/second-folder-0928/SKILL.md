@@ -7,3 +7,5 @@ Lives in skills/, not .claude/skills.
 Regression: edited in a PR.
 
 changed-since test.
+
+Per-skill publish test, 2026-09-29.
