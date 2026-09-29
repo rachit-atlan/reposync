@@ -38437,7 +38437,6 @@ function tableCell(value) {
 }
 
 function formatPreflightComment(report, compact = false) {
-  const marker = report.marker ?? PREFLIGHT_MARKER;
   const state = commentState(report);
   const conflicts = conflictRows(report);
   const conflictedSkills = new Set(conflicts.map(({ comparison }) => comparison.file.filename)).size;
@@ -38458,7 +38457,7 @@ function formatPreflightComment(report, compact = false) {
   const resolutionActions = resolutionPrompt
     ? `${actionBadge({ href: codexHandoffUrl(resolutionPrompt), light: CODEX_BADGE_URL, dark: CODEX_BADGE_DARK_URL, alt: "Fix in Codex" })} ${actionBadge({ href: claudeHandoffUrl(report, resolutionPrompt), light: CLAUDE_BADGE_URL, dark: CLAUDE_BADGE_DARK_URL, alt: "Fix in Claude Code" })} **[Fix in Claude.ai](${claudeWebHandoffUrl(report, resolutionPrompt)})**`
     : "";
-  const lines = [marker, `### ${verdict}`, ""];
+  const lines = [PREFLIGHT_MARKER, `### ${verdict}`, ""];
   if (state === "unconfigured") {
     lines.push("No Atlan API key is available in `ATLANAI_TOKEN`, so this pull request was not compared with Atlan and conflicts were not checked. Expose the existing secret as `ATLANAI_TOKEN` on the SkillSync step to enable it.", "");
   }
@@ -38567,7 +38566,7 @@ function formatPreflightComment(report, compact = false) {
   }
   if (compact && Buffer.byteLength(comment, "utf8") > MAX_GITHUB_COMMENT_BYTES) {
     const minimal = [
-      marker,
+      PREFLIGHT_MARKER,
       `### ${verdict}`,
       "",
       "Detailed findings were omitted to keep this GitHub comment within its size limit; inspect the changed skill files and rerun preflight.",
@@ -38575,7 +38574,7 @@ function formatPreflightComment(report, compact = false) {
     ].join("\n");
     return Buffer.byteLength(minimal, "utf8") <= MAX_GITHUB_COMMENT_BYTES
       ? minimal
-      : [marker, `### ${verdict}`, "", "Detailed findings were omitted to keep this GitHub comment within its size limit."].join("\n");
+      : [PREFLIGHT_MARKER, `### ${verdict}`, "", "Detailed findings were omitted to keep this GitHub comment within its size limit."].join("\n");
   }
   return comment;
 }
@@ -38597,14 +38596,10 @@ async function runPreflight({ environment = process.env, request = githubRequest
   const inputs = common_getInput("artifacts", environment) ? parseRegistryInputs(environment) : undefined;
   const context = parsePullRequestContext(environment, eventPayload);
   const budgetedRequest = withRequestBudget(request);
-  // One comment per workspace, so steps that publish to different workspaces keep their own. A comment
-  // from before the key existed is taken over rather than left beside a new one.
-  const marker = inputs ? `<!-- atlan-skillsync-preflight:${inputs.workspace} -->` : PREFLIGHT_MARKER;
-  const find = key => findMarkerComment({
+  const existing = commenting ? await findMarkerComment({
     token, request: budgetedRequest, owner: context.owner, repo: context.repo,
-    issueNumber: context.pullNumber, marker: key
-  });
-  const existing = commenting ? (await find(marker)) ?? (inputs ? await find(PREFLIGHT_MARKER) : undefined) : undefined;
+    issueNumber: context.pullNumber, marker: PREFLIGHT_MARKER
+  }) : undefined;
   const report = await buildPreflightReport({
     token,
     context,
@@ -38614,7 +38609,6 @@ async function runPreflight({ environment = process.env, request = githubRequest
     inputs
   });
   report.failOnConflict = failOnConflict;
-  report.marker = marker;
   // A pull request that touches no listed folder gets no comment, unless an earlier run already left one.
   // A run that could not read the trees says so rather than passing quietly.
   const untouched = Boolean(inputs) && report.available && report.config?.valid && report.eligible.length === 0 && !existing;
@@ -38897,6 +38891,15 @@ function checkoutRejections(cwd, folders) {
   return rejected;
 }
 
+// A push publishes only what it changed. A manual run or a new branch has no parent to compare
+// with, so it publishes everything; so does a CLI older than the flag.
+function changedSinceArguments(eventPayload, version) {
+  const before = eventPayload?.before;
+  if (typeof before !== "string" || !COMMIT_SHA.test(before) || /^0+$/.test(before)) return [];
+  const [major, minor, patch] = version.split(/[.-]/).map(Number);
+  return major > 0 || minor > 1 || (minor === 1 && patch >= 25) ? ["--changed-since", before] : [];
+}
+
 function parseCliVersion(raw) {
   const match = /^v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\s*$/.exec(raw.split("\n")[0] ?? "");
   if (!match) throw new Error("installed Registry CLI did not return a valid version");
@@ -38972,7 +38975,8 @@ async function runPublishAction({
   install = installCli,
   execute = runCli,
   registry = registryRequest,
-  preflight = true
+  preflight = true,
+  eventPayload
 } = {}) {
   const token = environment.ATLANAI_TOKEN;
   if (!token) throw new Error("ATLANAI_TOKEN must be supplied as a workflow secret");
@@ -39004,7 +39008,7 @@ async function runPublishAction({
   external_node_fs_namespaceObject.writeFileSync(external_node_path_namespaceObject.join(cwd, MANIFEST), manifestFor());
   const { binary, directory, version } = await install({ environment });
   try {
-    const args = ["publish", ...paths.map(item => `./${item}`), "--to", `${PUBLISH_ALIAS}/${namespace}`, "--yes"];
+    const args = ["publish", ...paths.map(item => `./${item}`), "--to", `${PUBLISH_ALIAS}/${namespace}`, "--yes", ...changedSinceArguments(eventPayload, version)];
     await execute(binary, args, cwd, publisherEnvironment(environment, token, directory, [PUBLISH_ALIAS]));
     common_setOutput("status", "success", environment);
     common_setOutput("cli-version", version, environment);
@@ -40217,8 +40221,9 @@ async function runAction({
     return;
   }
   if (event === "push" || event === "workflow_dispatch") {
-    assertDefaultBranch(environment, eventPayload ?? readEventPayload(environment));
-    return publish({ environment, preflight });
+    const payload = eventPayload ?? readEventPayload(environment);
+    assertDefaultBranch(environment, payload);
+    return publish({ environment, preflight, eventPayload: payload });
   }
   throw new Error(`Registry Sync runs on pull_request_target, push and workflow_dispatch, not ${event || "an unknown event"}`);
 }
