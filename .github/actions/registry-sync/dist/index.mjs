@@ -39129,11 +39129,17 @@ async function reportPublishFailure({ environment, payload, error, request = git
   maskSecret(token, environment);
   const [owner, repo] = repository.split("/");
   try {
+    // The pinned API version omits merge_commit_sha, so the pull request is the one merged into the default branch.
     const pulls = await request({ token, method: "GET", requestPath: `/repos/${owner}/${repo}/commits/${sha}/pulls`, expectedStatus: 200 });
-    const merged = Array.isArray(pulls) ? pulls.find(pull => pull?.merge_commit_sha === sha && Number.isSafeInteger(pull.number)) : undefined;
-    if (!merged) return;
+    const merged = (Array.isArray(pulls) ? pulls : []).filter(pull => typeof pull?.merged_at === "string" &&
+      pull.base?.ref === payload?.repository?.default_branch && Number.isSafeInteger(pull.number));
+    if (merged.length !== 1) {
+      process.stdout.write("::notice title=Registry Sync::no single merged pull request introduced this commit, so the failed run is the report\n");
+      return;
+    }
+    const [pull] = merged;
     await upsertMarkerComment({
-      token, request, owner, repo, issueNumber: merged.number, marker: PUBLISH_FAILURE_MARKER,
+      token, request, owner, repo, issueNumber: pull.number, marker: PUBLISH_FAILURE_MARKER,
       body: publishFailureComment(environment, sha, error)
     });
   } catch {
