@@ -37476,7 +37476,48 @@ function preflightConfig({ workspace, artifacts }, files) {
   };
 }
 
+;// CONCATENATED MODULE: ./src/publish-baseline.js
+
+
+
+
+const RUN_PAGE_SIZE = 30;
+
+function isAncestor(cwd, sha) {
+  return (0,external_node_child_process_namespaceObject.spawnSync)("git", ["merge-base", "--is-ancestor", sha, "HEAD"], {
+    cwd, env: { PATH: "/usr/bin:/bin", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" }
+  }).status === 0;
+}
+
+// The commit a push publishes changes since: the last run that finished publishing, not the push's parent. GitHub
+// cancels a run still waiting in the concurrency group when a newer one arrives, so its changes would otherwise
+// never publish. A failed run is not retried here: its pull request is told, and a rerun publishes it.
+// Without `actions: read`, or with no earlier run, the push's parent stands in.
+async function publishBaseline({ environment, eventPayload, cwd, request = githubRequest, ancestor = isAncestor }) {
+  const before = eventPayload?.before;
+  const parent = typeof before === "string" && COMMIT_SHA.test(before) && !/^0+$/.test(before) ? before : undefined;
+  const token = common_getInput("github-token", environment);
+  const repository = environment.GITHUB_REPOSITORY || "";
+  const branch = eventPayload?.repository?.default_branch;
+  if (!parent || !token || !/^\d{1,20}$/.test(environment.GITHUB_RUN_ID || "") ||
+      !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository) || typeof branch !== "string") return parent;
+  try {
+    const run = await request({ token, method: "GET", requestPath: `/repos/${repository}/actions/runs/${environment.GITHUB_RUN_ID}`, expectedStatus: 200 });
+    if (!Number.isSafeInteger(run?.workflow_id)) return parent;
+    const query = new URLSearchParams({ branch, status: "completed", per_page: String(RUN_PAGE_SIZE) });
+    const listed = await request({ token, method: "GET", requestPath: `/repos/${repository}/actions/workflows/${run.workflow_id}/runs?${query}`, expectedStatus: 200 });
+    const finished = (Array.isArray(listed?.workflow_runs) ? listed.workflow_runs : []).find(candidate =>
+      ["success", "failure"].includes(candidate?.conclusion) && ["push", "workflow_dispatch"].includes(candidate.event) &&
+      typeof candidate.head_sha === "string" && COMMIT_SHA.test(candidate.head_sha) && ancestor(cwd, candidate.head_sha));
+    return finished?.head_sha ?? parent;
+  } catch {
+    process.stdout.write("::notice title=Registry Sync::earlier runs could not be read, so this push publishes only its own changes; grant the job actions: read\n");
+    return parent;
+  }
+}
+
 ;// CONCATENATED MODULE: ./src/cli.js
+
 
 
 
@@ -37715,13 +37756,12 @@ async function workspaceName(token, workspace, registry = registryRequest) {
   return found.name;
 }
 
-// A push publishes only what it changed. A manual run or a new branch has no parent to compare
-// with, so it publishes everything; so does a CLI older than the flag.
-function changedSinceArguments(eventPayload, version) {
-  const before = eventPayload?.before;
-  if (typeof before !== "string" || !COMMIT_SHA.test(before) || /^0+$/.test(before)) return [];
+// A push publishes only what changed since its baseline. A manual run or a new branch has none,
+// so it publishes everything; so does a CLI older than the flag.
+function changedSinceArguments(baseline, version) {
+  if (typeof baseline !== "string" || !COMMIT_SHA.test(baseline)) return [];
   const [major, minor, patch] = version.split(/[.-]/).map(Number);
-  return major > 0 || minor > 1 || (minor === 1 && patch >= 25) ? ["--changed-since", before] : [];
+  return major > 0 || minor > 1 || (minor === 1 && patch >= 25) ? ["--changed-since", baseline] : [];
 }
 
 function parseCliVersion(raw) {
@@ -37799,6 +37839,8 @@ async function runPublishAction({
   install = installCli,
   execute = runCli,
   registry = registryRequest,
+  request,
+  ancestor,
   eventPayload
 } = {}) {
   const token = environment.ATLANAI_TOKEN;
@@ -37823,9 +37865,10 @@ async function runPublishAction({
   }
   const namespace = await workspaceName(token, inputs.workspace, registry);
   external_node_fs_namespaceObject.writeFileSync(external_node_path_namespaceObject.join(cwd, MANIFEST), manifestFor());
+  const baseline = await publishBaseline({ environment, eventPayload, cwd, request, ancestor });
   const { binary, directory, version } = await install({ environment });
   try {
-    const args = ["publish", ...paths.map(item => `./${item}`), "--to", `${PUBLISH_ALIAS}/${namespace}`, "--yes", ...changedSinceArguments(eventPayload, version)];
+    const args = ["publish", ...paths.map(item => `./${item}`), "--to", `${PUBLISH_ALIAS}/${namespace}`, "--yes", ...changedSinceArguments(baseline, version)];
     await execute(binary, args, cwd, publisherEnvironment(environment, token, directory, [PUBLISH_ALIAS]));
     common_setOutput("status", "success", environment);
     common_setOutput("cli-version", version, environment);
@@ -40355,7 +40398,7 @@ async function runAction({
     const payload = eventPayload ?? readEventPayload(environment);
     assertDefaultBranch(environment, payload);
     try {
-      return await publish({ environment, eventPayload: payload });
+      return await publish({ environment, eventPayload: payload, request });
     } catch (error) {
       if (event === "push") await reportPublishFailure({ environment, payload, error, request });
       throw error;

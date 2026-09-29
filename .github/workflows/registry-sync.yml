@@ -19,6 +19,7 @@ jobs:
     timeout-minutes: 15
     environment: registry               # its token is released to main only
     permissions:
+      actions: read
       contents: read
       pull-requests: write
     steps:
