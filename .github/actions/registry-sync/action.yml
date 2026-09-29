@@ -14,7 +14,7 @@ inputs:
     description: "Globs per kind, one line each, for example `skill: [\"skills/**\", \"team-b/skills/**\"]` and `agent: \"agents/**\"`. Only tracked files match."
     required: true
   preflight:
-    description: Check skills before they publish. On a pull request it validates and compares with the Registry; on the default branch it validates the checkout before publishing.
+    description: Check pull requests before they merge. Preflight validates each changed skill and compares it with the Registry; publishing leaves validation to the Registry.
     required: false
     default: "true"
   allow-pr-commenting:
@@ -26,7 +26,7 @@ inputs:
     required: false
     default: "true"
   github-token:
-    description: GitHub token preflight uses to read the pull request and write its comment.
+    description: GitHub token that reads pull requests, writes the preflight comment, and reports a failed publish on the merged pull request.
     required: false
     default: ${{ github.token }}
   working-directory:

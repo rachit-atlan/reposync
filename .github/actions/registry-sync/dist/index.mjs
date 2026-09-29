@@ -29357,7 +29357,7 @@ const COMMIT_SHA = /^[a-f0-9]{40}$/i;
 const RELEASE_VERSION = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
 const SAFE_PATH = /^(?=.{1,240}$)(?!\/)(?!.*\/$)(?!.*\/\/)(?!.*(?:^|\/)\.{1,2}(?:\/|$))[^`|\\\u0000-\u001F\u007F]+$/u;
 
-// SkillSync has one approved Registry endpoint. Keep it Action-owned so a
+// Registry Sync has one approved Registry endpoint. Keep it Action-owned so a
 // consumer workflow cannot redirect its scoped publish credential elsewhere.
 const PUBLISH_GATEWAY = "https://api.atlan.com";
 // One reviewed, version-addressed Registry CLI release, pinned by SHA-256. It only
@@ -29377,6 +29377,7 @@ const ADAPTER = "atlan";
 const GITHUB_API_BASE_URL = "https://api.github.com";
 const GITHUB_API_VERSION = "2026-03-10";
 const PREFLIGHT_MARKER = "<!-- atlan-skillsync-preflight -->";
+const PUBLISH_FAILURE_MARKER = "<!-- registry-sync-publish-failure -->";
 const EVAL_MARKER = "<!-- atlan-eval-report -->";
 const MAX_EXPERIMENTS = 10;
 const MAX_RESULTS_PER_EXPERIMENT = 10_000;
@@ -37473,6 +37474,364 @@ function preflightConfig({ workspace, artifacts }, files) {
   };
 }
 
+;// CONCATENATED MODULE: ./src/cli.js
+
+
+
+
+
+
+
+
+
+
+
+
+
+const INSTALL_ENVIRONMENT_KEYS = [
+  "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL",
+  "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY",
+  "https_proxy", "http_proxy", "all_proxy", "no_proxy",
+  "SSL_CERT_FILE", "SSL_CERT_DIR", "RUNNER_OS", "RUNNER_ARCH"
+];
+
+const PUBLISH_ENVIRONMENT_KEYS = [
+  "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL",
+  "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY",
+  "https_proxy", "http_proxy", "all_proxy", "no_proxy",
+  "RUNNER_OS", "RUNNER_ARCH", "CI", "GITHUB_ACTIONS", "GITHUB_ACTOR", "GITHUB_JOB",
+  "GITHUB_REF", "GITHUB_REF_NAME", "GITHUB_REF_TYPE", "GITHUB_REPOSITORY",
+  "GITHUB_RUN_ATTEMPT", "GITHUB_RUN_ID", "GITHUB_SHA", "GITHUB_WORKFLOW"
+];
+
+const SYSTEM_PATH = "/usr/bin:/bin";
+const MANIFEST = "registry.yml";
+const SELF_UPDATE_ARGUMENTS = Object.freeze(["self-update", "--json"]);
+const ADAPTER_ARGUMENTS = Object.freeze(["adapter", "install", ADAPTER]);
+const PUBLISH_ALIAS = "atlan";
+const MAX_CLI_OUTPUT_BYTES = 64 * 1024;
+
+const CLI_OS = { linux: "linux", darwin: "darwin" };
+const CLI_ARCH = { x64: "amd64", arm64: "arm64" };
+
+function assertSupportedPublishPlatform(platform = process.platform) {
+  if (!Object.hasOwn(CLI_OS, platform)) {
+    throw new Error("publish mode supports Linux and macOS runners; use ubuntu-latest or macos-latest");
+  }
+}
+
+// Maps the Node runtime platform onto the pinned CLI artifact name.
+function resolveCliPlatform(platform = process.platform, arch = process.arch) {
+  assertSupportedPublishPlatform(platform);
+  if (!Object.hasOwn(CLI_ARCH, arch)) {
+    throw new Error("publish mode supports amd64 and arm64 runners only");
+  }
+  const target = `${CLI_OS[platform]}-${CLI_ARCH[arch]}`;
+  if (!Object.hasOwn(CLI_SHA256, target)) {
+    throw new Error(`the Action does not pin a Registry CLI for ${target}`);
+  }
+  return target;
+}
+
+function assertNoSymlinks(root, candidate) {
+  const relative = external_node_path_namespaceObject.relative(root, candidate);
+  let current = root;
+  for (const part of relative ? relative.split(external_node_path_namespaceObject.sep) : []) {
+    current = external_node_path_namespaceObject.join(current, part);
+    if (external_node_fs_namespaceObject.lstatSync(current).isSymbolicLink()) throw new Error("working-directory cannot contain symbolic links");
+  }
+}
+
+function resolveWorkingDirectory(environment = process.env) {
+  const workspaceInput = external_node_path_namespaceObject.resolve(environment.GITHUB_WORKSPACE || process.cwd());
+  const workspace = external_node_fs_namespaceObject.realpathSync(workspaceInput);
+  const requested = external_node_path_namespaceObject.resolve(common_getInput("working-directory", environment) || workspaceInput);
+  const lexicalRoot = isWithin(workspaceInput, requested) ? workspaceInput : workspace;
+  if (!isWithin(lexicalRoot, requested) || !external_node_fs_namespaceObject.existsSync(requested)) {
+    throw new Error("working-directory must be an existing directory inside GITHUB_WORKSPACE");
+  }
+  assertNoSymlinks(lexicalRoot, requested);
+  const resolved = external_node_fs_namespaceObject.realpathSync(requested);
+  if (!isWithin(workspace, resolved)) {
+    throw new Error("working-directory must be an existing directory inside GITHUB_WORKSPACE");
+  }
+  if (!external_node_fs_namespaceObject.statSync(resolved).isDirectory()) {
+    throw new Error("working-directory must be an existing directory inside GITHUB_WORKSPACE");
+  }
+  return resolved;
+}
+
+function writeBoundedCli(response, destination, createDestination = external_node_fs_namespaceObject.createWriteStream) {
+  let received = 0;
+  const limiter = new external_node_stream_.Transform({
+    transform(chunk, _encoding, callback) {
+      received += chunk.length;
+      callback(received > MAX_CLI_BYTES
+        ? new Error("Registry CLI download exceeds the size limit")
+        : null, chunk);
+    }
+  });
+  return (0,external_node_stream_promises_namespaceObject.pipeline)(response, limiter, createDestination(destination, { mode: 0o700 }));
+}
+
+async function verifyCliDigest(binary, expectedDigest) {
+  if (typeof expectedDigest !== "string" || !SHA256.test(expectedDigest)) {
+    throw new Error("Action-pinned CLI digest is invalid");
+  }
+  const metadata = await promises_namespaceObject.lstat(binary);
+  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > MAX_CLI_BYTES) {
+    throw new Error("Registry CLI is not a bounded regular file");
+  }
+  const hash = (0,external_node_crypto_.createHash)("sha256");
+  for await (const chunk of external_node_fs_namespaceObject.createReadStream(binary)) hash.update(chunk);
+  if (!(0,external_node_crypto_.timingSafeEqual)(hash.digest(), Buffer.from(expectedDigest, "hex"))) {
+    throw new Error("Registry CLI digest does not match the Action-pinned digest");
+  }
+}
+
+function cliArtifactURL(target, version = CLI_VERSION) {
+  if (!Object.hasOwn(CLI_SHA256, target)) throw new Error("Registry CLI platform is not pinned");
+  if (!RELEASE_VERSION.test(version)) throw new Error("Action-pinned CLI version is invalid");
+  return `${CLI_ORIGIN}${CLI_ARTIFACT_PATH}${version}/registry-${target}`;
+}
+
+const CLI_URL_PATHNAME = new RegExp(
+  `^${CLI_ARTIFACT_PATH}(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)/registry-(?:darwin|linux)-(?:amd64|arm64)$`
+);
+
+function validateCliURL(cliURL) {
+  let url;
+  try {
+    url = new URL(cliURL);
+  } catch {
+    throw new Error("Registry CLI URL must be valid HTTPS");
+  }
+  if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash || !CLI_URL_PATHNAME.test(url.pathname)) {
+    throw new Error("Registry CLI URL must be a clean HTTPS version-addressed artifact URL");
+  }
+  if (url.origin !== CLI_ORIGIN) {
+    throw new Error("Registry CLI host is not approved");
+  }
+}
+
+function downloadCli(url, destination) {
+  validateCliURL(url);
+  return new Promise((resolve, reject) => {
+    const request = external_node_https_namespaceObject.get(url, {
+      timeout: 60_000,
+      headers: { "User-Agent": "atlan-agent-registry-action" }
+    }, response => {
+      if (response.statusCode >= 300 && response.statusCode < 400) {
+        response.resume();
+        reject(new Error("Registry CLI download redirected; refusing an unapproved source"));
+        return;
+      }
+      if (response.statusCode !== 200) {
+        response.resume();
+        reject(new Error(`Registry CLI download failed with HTTP ${response.statusCode}`));
+        return;
+      }
+      const declaredSize = Number(response.headers["content-length"] || 0);
+      if (declaredSize > MAX_CLI_BYTES) {
+        response.resume();
+        reject(new Error("Registry CLI download exceeds the size limit"));
+        return;
+      }
+      void writeBoundedCli(response, destination).then(resolve, reject);
+    });
+    request.on("timeout", () => request.destroy(new Error("Registry CLI download timed out")));
+    request.on("error", reject);
+  });
+}
+
+function runtimeEnvironment(environment, keys, runtimeDirectory) {
+  if (!external_node_path_namespaceObject.isAbsolute(runtimeDirectory)) throw new Error("Action-owned CLI home must be an absolute path");
+  const allowed = Object.fromEntries(keys
+    .filter(key => environment[key] !== undefined)
+    .map(key => [key, environment[key]]));
+  return {
+    ...allowed,
+    HOME: runtimeDirectory,
+    REGISTRY_HOME: external_node_path_namespaceObject.join(runtimeDirectory, ".registry"),
+    PATH: SYSTEM_PATH
+  };
+}
+
+function installEnvironment(environment, runtimeDirectory) {
+  return runtimeEnvironment(environment, INSTALL_ENVIRONMENT_KEYS, runtimeDirectory);
+}
+
+// Mirrors the CLI's own per-marketplace variable name, so the token reaches that marketplace alone.
+function tokenVariable(alias) {
+  return `REGISTRY_TOKEN_${alias.toUpperCase().replaceAll(/[^A-Z0-9]/g, "_")}`;
+}
+
+function publisherEnvironment(environment, token, runtimeDirectory, aliases = []) {
+  return {
+    ...runtimeEnvironment(environment, PUBLISH_ENVIRONMENT_KEYS, runtimeDirectory),
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    ...Object.fromEntries(aliases.map(alias => [tokenVariable(alias), token]))
+  };
+}
+
+// The Action writes the CLI's config itself, so the token's only destination is the fixed gateway.
+function manifestFor() {
+  return `${JSON.stringify({ marketplaces: { [PUBLISH_ALIAS]: { source: PUBLISH_GATEWAY } } }, null, 2)}\n`;
+}
+
+// Only what the repository tracks can be an artifact, so a build output never publishes.
+function trackedFiles(cwd) {
+  const listed = (0,external_node_child_process_namespaceObject.spawnSync)("git", ["ls-files", "-z"], {
+    cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024,
+    env: { PATH: SYSTEM_PATH, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" }
+  });
+  if (listed.status !== 0) throw new Error("could not list the repository's files; check it out before this step");
+  return listed.stdout.split("\0").filter(Boolean);
+}
+
+// An agent is a tracked Markdown file with `name` and `description` front matter, so a README is skipped.
+// A SKILL.md never is: the CLI would publish its whole folder, and at the root that is the checkout.
+function agentFiles(cwd, files, globs = []) {
+  const patterns = globs.map(globPattern);
+  return files.filter(file => file.endsWith(".md") && external_node_path_namespaceObject.posix.basename(file) !== "SKILL.md" &&
+    patterns.some(pattern => pattern.test(file)) && hasFrontMatter(external_node_path_namespaceObject.join(cwd, file))).sort();
+}
+
+function hasFrontMatter(file) {
+  if (!external_node_fs_namespaceObject.existsSync(file) || !external_node_fs_namespaceObject.lstatSync(file).isFile() || external_node_fs_namespaceObject.statSync(file).size > MAX_SKILL_BYTES) return false;
+  const head = /^---\r?\n([\s\S]*?)\r?\n---/.exec(external_node_fs_namespaceObject.readFileSync(file, "utf8"));
+  return Boolean(head && /^name:\s*\S/m.test(head[1]) && /^description:\s*\S/m.test(head[1]));
+}
+
+// The CLI compares with the Registry by workspace name, so the ID the workflow names is looked up once.
+async function workspaceName(token, workspace, registry = registryRequest) {
+  const found = await registry({ token, requestPath: `/registry/v1/workspaces/${encodeURIComponent(workspace)}` });
+  if (typeof found?.name !== "string" || !/^[A-Za-z0-9_.-]{1,128}$/.test(found.name)) {
+    throw new Error(`workspace ${workspace} was not found, or its name cannot be read`);
+  }
+  return found.name;
+}
+
+// A push publishes only what it changed. A manual run or a new branch has no parent to compare
+// with, so it publishes everything; so does a CLI older than the flag.
+function changedSinceArguments(eventPayload, version) {
+  const before = eventPayload?.before;
+  if (typeof before !== "string" || !COMMIT_SHA.test(before) || /^0+$/.test(before)) return [];
+  const [major, minor, patch] = version.split(/[.-]/).map(Number);
+  return major > 0 || minor > 1 || (minor === 1 && patch >= 25) ? ["--changed-since", before] : [];
+}
+
+function parseCliVersion(raw) {
+  const match = /^v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\s*$/.exec(raw.split("\n")[0] ?? "");
+  if (!match) throw new Error("installed Registry CLI did not return a valid version");
+  return match[1];
+}
+
+// self-update writes the newest release to REGISTRY_HOME/cli/<version>, or keeps this one.
+function updatedCli(raw, binary, directory) {
+  let data;
+  try {
+    data = JSON.parse(raw)?.data;
+  } catch {
+    data = undefined;
+  }
+  if (data?.action === "already-latest") return binary;
+  if (data?.action !== "updated") throw new Error("the Registry CLI returned an unreadable self-update result");
+  return external_node_path_namespaceObject.join(directory, ".registry", "cli", parseCliVersion(String(data.current)), "registry");
+}
+
+// Runs the verified CLI directly, without a shell; captures bounded stdout when asked.
+function runCli(binary, args, cwd, environment, capture = false) {
+  return new Promise((resolve, reject) => {
+    const child = (0,external_node_child_process_namespaceObject.spawn)(binary, [...args], {
+      cwd,
+      env: environment,
+      shell: false,
+      stdio: capture ? ["ignore", "pipe", "inherit"] : "inherit"
+    });
+    const chunks = [];
+    let size = 0;
+    child.stdout?.on("data", chunk => {
+      size += chunk.length;
+      if (size <= MAX_CLI_OUTPUT_BYTES) chunks.push(chunk);
+      else child.kill();
+    });
+    child.on("error", reject);
+    // "close" waits for stdout to drain; "exit" can fire first and lose the tail of it.
+    child.on("close", code => {
+      if (size > MAX_CLI_OUTPUT_BYTES) return reject(new Error("Registry CLI output exceeds the size limit"));
+      if (code !== 0) return reject(new Error(`Registry CLI ${args[0]} exited with status ${code}`));
+      resolve(Buffer.concat(chunks).toString("utf8"));
+    });
+  });
+}
+
+async function installCli({
+  environment = process.env,
+  download = downloadCli,
+  verifyCli = verifyCliDigest,
+  execute = runCli
+} = {}) {
+  const target = resolveCliPlatform();
+  const directory = await promises_namespaceObject.mkdtemp(external_node_path_namespaceObject.join(external_node_os_namespaceObject.tmpdir(), "registry-skill-sync-"));
+  const binary = external_node_path_namespaceObject.join(directory, "registry");
+  try {
+    await download(cliArtifactURL(target), binary);
+    await verifyCli(binary, CLI_SHA256[target]);
+    await promises_namespaceObject.chmod(binary, 0o700);
+    const safeEnvironment = installEnvironment(environment, directory);
+    const updated = await execute(binary, SELF_UPDATE_ARGUMENTS, directory, safeEnvironment, true);
+    const newest = updatedCli(updated, binary, directory);
+    const version = parseCliVersion(await execute(newest, ["--version"], directory, safeEnvironment, true));
+    await execute(newest, ADAPTER_ARGUMENTS, directory, safeEnvironment);
+    return { binary: newest, directory, version };
+  } catch (error) {
+    await promises_namespaceObject.rm(directory, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+async function runPublishAction({
+  environment = process.env,
+  install = installCli,
+  execute = runCli,
+  registry = registryRequest,
+  eventPayload
+} = {}) {
+  const token = environment.ATLANAI_TOKEN;
+  if (!token) throw new Error("ATLANAI_TOKEN must be supplied as a workflow secret");
+  maskSecret(token, environment);
+  const inputs = parseRegistryInputs(environment);
+  const cwd = resolveWorkingDirectory(environment);
+  if (parseBoolean("prune", common_getInput("prune", environment) || "false")) {
+    throw new Error("prune is not supported with the Registry CLI yet; set prune to false");
+  }
+  const files = trackedFiles(cwd);
+  // A tracked file can be missing from the checkout, as in a sparse checkout; it cannot publish.
+  const skills = skillFolders(files, inputs.artifacts.skill).filter(folder => external_node_fs_namespaceObject.existsSync(external_node_path_namespaceObject.join(cwd, folder, "SKILL.md")));
+  const paths = [...skills, ...agentFiles(cwd, files, inputs.artifacts.agent)];
+  // The CLI expands a path it is given, so one that reads as a glob is refused rather than widened.
+  const unsafe = paths.find(item => /[*?[\]{}\\]|[+@!]\(/.test(item));
+  if (unsafe) throw new Error(`${unsafe} contains glob characters, so it cannot be published as an exact path`);
+  if (paths.length === 0) {
+    process.stdout.write("::notice title=Registry Sync::no tracked file matches the artifacts globs, so nothing was published\n");
+    common_setOutput("status", "success", environment);
+    return;
+  }
+  const namespace = await workspaceName(token, inputs.workspace, registry);
+  external_node_fs_namespaceObject.writeFileSync(external_node_path_namespaceObject.join(cwd, MANIFEST), manifestFor());
+  const { binary, directory, version } = await install({ environment });
+  try {
+    const args = ["publish", ...paths.map(item => `./${item}`), "--to", `${PUBLISH_ALIAS}/${namespace}`, "--yes", ...changedSinceArguments(eventPayload, version)];
+    await execute(binary, args, cwd, publisherEnvironment(environment, token, directory, [PUBLISH_ALIAS]));
+    common_setOutput("status", "success", environment);
+    common_setOutput("cli-version", version, environment);
+  } finally {
+    await promises_namespaceObject.rm(directory, { recursive: true, force: true });
+  }
+}
+
 ;// CONCATENATED MODULE: ./src/skill-digest.js
 
 
@@ -38147,14 +38506,16 @@ async function buildPreflightReport({ token, context, request, registryToken, re
   // The Registry's front-matter contract, checked before merge. Independent of the Registry comparison: it needs
   // no token, and a skill that will be answered with HTTP 422 on publish is worth saying whatever else is known.
   const rejections = [];
+  const present = eligible.filter(file => file.status !== "removed");
+  const unvalidated = Math.max(0, present.length - MAX_VALIDATED_SKILLS);
   if (context.headSha) {
-    for (const file of eligible.filter(file => file.status !== "removed").slice(0, MAX_VALIDATED_SKILLS)) {
+    for (const file of present.slice(0, MAX_VALIDATED_SKILLS)) {
       try {
         const content = await readRepositoryFile({ token, context, request, filename: file.filename, ref: context.headSha, maxBytes: MAX_SKILL_BYTES });
         const problems = skillRejections(content);
         if (problems.length > 0) rejections.push({ file, problems });
       } catch {
-        // A SKILL.md that cannot be read within preflight limits is not a verdict; publishing validates it again.
+        // A SKILL.md that cannot be read within preflight limits is not a verdict; Atlan validates it on publish.
       }
     }
   }
@@ -38231,7 +38592,8 @@ async function buildPreflightReport({ token, context, request, registryToken, re
     detailLimitReached: eligible.length > MAX_ANALYZED_SKILLS,
     registry: registryState,
     conflictCount,
-    rejections
+    rejections,
+    unvalidated
   };
 }
 
@@ -38380,7 +38742,7 @@ function buildResolutionPrompt(report) {
   const render = () => [
     ...prefix,
     ...(rejections.length > 0 ? [
-      "", "Fix the Atlan SkillSync validation failures in this pull request.", "", "Skills rejected by the Registry:",
+      "", "Fix the Registry Sync validation failures in this pull request.", "", "Skills rejected by the Registry:",
       "<BEGIN_VALIDATION_FINDINGS>",
       ...rejectionEntries,
       ...(omittedRejectionFindings > 0 ? [`- ${plural(omittedRejectionFindings, "additional validation finding")} listed in the preflight comment`] : []),
@@ -38388,7 +38750,7 @@ function buildResolutionPrompt(report) {
       "", "Edit the affected skill definitions so every listed validation failure is resolved while preserving each skill's intent. Do not remove useful instructions merely to satisfy a limit."
     ] : []),
     ...(rows.length > 0 ? [
-      "", "Resolve the confirmed Atlan SkillSync conflicts in this pull request.", "", "Skills updated in Atlan:",
+      "", "Resolve the confirmed Registry Sync conflicts in this pull request.", "", "Skills updated in Atlan:",
       "<BEGIN_CONFLICT_PATHS>",
       ...conflictEntries,
       ...(omittedConflicts > 0 ? [`- ${plural(omittedConflicts, "additional conflict")} listed in the preflight comment`] : []),
@@ -38446,6 +38808,7 @@ function formatPreflightComment(report, compact = false) {
     : notComparedSkills(report).filter(file => !rejectionFor(report, file));
   const verdict = rejected.length > 0
     ? `⛔ ${plural(rejected.length, "skill")} will be rejected by the Registry`
+    : report.unvalidated > 0 ? "⛔ Too many changed skills to check"
     : state === "conflict"
       ? `❗ ${plural(conflictedSkills, "conflict")} found`
       : state === "unavailable" ? "ℹ️ Registry check unavailable"
@@ -38458,8 +38821,11 @@ function formatPreflightComment(report, compact = false) {
     ? `${actionBadge({ href: codexHandoffUrl(resolutionPrompt), light: CODEX_BADGE_URL, dark: CODEX_BADGE_DARK_URL, alt: "Fix in Codex" })} ${actionBadge({ href: claudeHandoffUrl(report, resolutionPrompt), light: CLAUDE_BADGE_URL, dark: CLAUDE_BADGE_DARK_URL, alt: "Fix in Claude Code" })} **[Fix in Claude.ai](${claudeWebHandoffUrl(report, resolutionPrompt)})**`
     : "";
   const lines = [PREFLIGHT_MARKER, `### ${verdict}`, ""];
+  if (report.unvalidated > 0) {
+    lines.push(`This pull request changes ${plural(MAX_VALIDATED_SKILLS + report.unvalidated, "skill")}, and preflight checks ${MAX_VALIDATED_SKILLS}, so the check fails rather than let the rest merge unchecked. Split it into pull requests of at most ${MAX_VALIDATED_SKILLS} skills each.`, "");
+  }
   if (state === "unconfigured") {
-    lines.push("No Atlan API key is available in `ATLANAI_TOKEN`, so this pull request was not compared with Atlan and conflicts were not checked. Expose the existing secret as `ATLANAI_TOKEN` on the SkillSync step to enable it.", "");
+    lines.push("No Atlan API key is available in `ATLANAI_TOKEN`, so this pull request was not compared with Atlan and conflicts were not checked. Expose the existing secret as `ATLANAI_TOKEN` on the Registry Sync step to enable it.", "");
   }
 
   if (state !== "unavailable" && report.config?.valid) {
@@ -38539,7 +38905,7 @@ function formatPreflightComment(report, compact = false) {
     lines.push(
       resolutionActions,
       "",
-      "Commit and push the fix; SkillSync preflight runs again automatically.",
+      "Commit and push the fix; Registry Sync preflight runs again automatically.",
       ""
     );
   }
@@ -38570,7 +38936,7 @@ function formatPreflightComment(report, compact = false) {
       `### ${verdict}`,
       "",
       "Detailed findings were omitted to keep this GitHub comment within its size limit; inspect the changed skill files and rerun preflight.",
-      ...(resolutionActions ? ["", resolutionActions, "", "Commit and push the fix; SkillSync preflight runs again automatically."] : [])
+      ...(resolutionActions ? ["", resolutionActions, "", "Commit and push the fix; Registry Sync preflight runs again automatically."] : [])
     ].join("\n");
     return Buffer.byteLength(minimal, "utf8") <= MAX_GITHUB_COMMENT_BYTES
       ? minimal
@@ -38633,387 +38999,57 @@ async function runPreflight({ environment = process.env, request = githubRequest
   if (shouldBlockConflicts(report.conflictCount, failOnConflict)) {
     throw new Error(`${plural(report.conflictCount, "Registry conflict")} must be resolved before this check can pass`);
   }
-  // Publishing would stop on these on main, so the pull request stops first.
+  // Atlan would refuse these on main, so the pull request stops first.
   if (report.rejections?.length > 0) {
     throw new Error(`${plural(report.rejections.length, "skill")} the Registry would reject must be fixed before this check can pass`);
   }
-}
-
-;// CONCATENATED MODULE: ./src/cli.js
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-const INSTALL_ENVIRONMENT_KEYS = [
-  "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL",
-  "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY",
-  "https_proxy", "http_proxy", "all_proxy", "no_proxy",
-  "SSL_CERT_FILE", "SSL_CERT_DIR", "RUNNER_OS", "RUNNER_ARCH"
-];
-
-const PUBLISH_ENVIRONMENT_KEYS = [
-  "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL",
-  "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY",
-  "https_proxy", "http_proxy", "all_proxy", "no_proxy",
-  "RUNNER_OS", "RUNNER_ARCH", "CI", "GITHUB_ACTIONS", "GITHUB_ACTOR", "GITHUB_JOB",
-  "GITHUB_REF", "GITHUB_REF_NAME", "GITHUB_REF_TYPE", "GITHUB_REPOSITORY",
-  "GITHUB_RUN_ATTEMPT", "GITHUB_RUN_ID", "GITHUB_SHA", "GITHUB_WORKFLOW"
-];
-
-const SYSTEM_PATH = "/usr/bin:/bin";
-const MANIFEST = "registry.yml";
-const SELF_UPDATE_ARGUMENTS = Object.freeze(["self-update", "--json"]);
-const ADAPTER_ARGUMENTS = Object.freeze(["adapter", "install", ADAPTER]);
-const PUBLISH_ALIAS = "atlan";
-const MAX_CLI_OUTPUT_BYTES = 64 * 1024;
-
-const CLI_OS = { linux: "linux", darwin: "darwin" };
-const CLI_ARCH = { x64: "amd64", arm64: "arm64" };
-
-function assertSupportedPublishPlatform(platform = process.platform) {
-  if (!Object.hasOwn(CLI_OS, platform)) {
-    throw new Error("publish mode supports Linux and macOS runners; use ubuntu-latest or macos-latest");
+  // Preflight is the gate before publishing, so a skill it could not read is not a pass.
+  if (report.unvalidated > 0) {
+    throw new Error(`this pull request changes ${plural(report.unvalidated, "more skill")} than preflight checks (${MAX_VALIDATED_SKILLS}); split it so each pull request changes at most ${MAX_VALIDATED_SKILLS}`);
   }
 }
 
-// Maps the Node runtime platform onto the pinned CLI artifact name.
-function resolveCliPlatform(platform = process.platform, arch = process.arch) {
-  assertSupportedPublishPlatform(platform);
-  if (!Object.hasOwn(CLI_ARCH, arch)) {
-    throw new Error("publish mode supports amd64 and arm64 runners only");
-  }
-  const target = `${CLI_OS[platform]}-${CLI_ARCH[arch]}`;
-  if (!Object.hasOwn(CLI_SHA256, target)) {
-    throw new Error(`the Action does not pin a Registry CLI for ${target}`);
-  }
-  return target;
+;// CONCATENATED MODULE: ./src/publish-failure.js
+
+
+
+function runLink(environment) {
+  const server = /^https:\/\/[A-Za-z0-9.-]+$/.test(environment.GITHUB_SERVER_URL || "") ? environment.GITHUB_SERVER_URL : "https://github.com";
+  const runId = /^\d{1,20}$/.test(environment.GITHUB_RUN_ID || "") ? environment.GITHUB_RUN_ID : undefined;
+  return runId ? `[The run log](${server}/${environment.GITHUB_REPOSITORY}/actions/runs/${runId})` : "The run log";
 }
 
-function assertNoSymlinks(root, candidate) {
-  const relative = external_node_path_namespaceObject.relative(root, candidate);
-  let current = root;
-  for (const part of relative ? relative.split(external_node_path_namespaceObject.sep) : []) {
-    current = external_node_path_namespaceObject.join(current, part);
-    if (external_node_fs_namespaceObject.lstatSync(current).isSymbolicLink()) throw new Error("working-directory cannot contain symbolic links");
-  }
+function publishFailureComment(environment, sha, error) {
+  const message = (error instanceof Error ? error.message : "publishing failed").replace(/[\r\n`]/g, " ").slice(0, 500);
+  return [
+    PUBLISH_FAILURE_MARKER,
+    "### Registry Sync could not publish this merge",
+    "",
+    `Publishing \`${sha.slice(0, 7)}\` to Atlan failed: \`${message}\`.`,
+    "",
+    `${runLink(environment)} names what failed. Fix a refused skill in a new pull request, where preflight checks it before it merges; if nothing was refused, rerun the workflow.`
+  ].join("\n");
 }
 
-function resolveWorkingDirectory(environment = process.env) {
-  const workspaceInput = external_node_path_namespaceObject.resolve(environment.GITHUB_WORKSPACE || process.cwd());
-  const workspace = external_node_fs_namespaceObject.realpathSync(workspaceInput);
-  const requested = external_node_path_namespaceObject.resolve(common_getInput("working-directory", environment) || workspaceInput);
-  const lexicalRoot = isWithin(workspaceInput, requested) ? workspaceInput : workspace;
-  if (!isWithin(lexicalRoot, requested) || !external_node_fs_namespaceObject.existsSync(requested)) {
-    throw new Error("working-directory must be an existing directory inside GITHUB_WORKSPACE");
-  }
-  assertNoSymlinks(lexicalRoot, requested);
-  const resolved = external_node_fs_namespaceObject.realpathSync(requested);
-  if (!isWithin(workspace, resolved)) {
-    throw new Error("working-directory must be an existing directory inside GITHUB_WORKSPACE");
-  }
-  if (!external_node_fs_namespaceObject.statSync(resolved).isDirectory()) {
-    throw new Error("working-directory must be an existing directory inside GITHUB_WORKSPACE");
-  }
-  return resolved;
-}
-
-function writeBoundedCli(response, destination, createDestination = external_node_fs_namespaceObject.createWriteStream) {
-  let received = 0;
-  const limiter = new external_node_stream_.Transform({
-    transform(chunk, _encoding, callback) {
-      received += chunk.length;
-      callback(received > MAX_CLI_BYTES
-        ? new Error("Registry CLI download exceeds the size limit")
-        : null, chunk);
-    }
-  });
-  return (0,external_node_stream_promises_namespaceObject.pipeline)(response, limiter, createDestination(destination, { mode: 0o700 }));
-}
-
-async function verifyCliDigest(binary, expectedDigest) {
-  if (typeof expectedDigest !== "string" || !SHA256.test(expectedDigest)) {
-    throw new Error("Action-pinned CLI digest is invalid");
-  }
-  const metadata = await promises_namespaceObject.lstat(binary);
-  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > MAX_CLI_BYTES) {
-    throw new Error("Registry CLI is not a bounded regular file");
-  }
-  const hash = (0,external_node_crypto_.createHash)("sha256");
-  for await (const chunk of external_node_fs_namespaceObject.createReadStream(binary)) hash.update(chunk);
-  if (!(0,external_node_crypto_.timingSafeEqual)(hash.digest(), Buffer.from(expectedDigest, "hex"))) {
-    throw new Error("Registry CLI digest does not match the Action-pinned digest");
-  }
-}
-
-function cliArtifactURL(target, version = CLI_VERSION) {
-  if (!Object.hasOwn(CLI_SHA256, target)) throw new Error("Registry CLI platform is not pinned");
-  if (!RELEASE_VERSION.test(version)) throw new Error("Action-pinned CLI version is invalid");
-  return `${CLI_ORIGIN}${CLI_ARTIFACT_PATH}${version}/registry-${target}`;
-}
-
-const CLI_URL_PATHNAME = new RegExp(
-  `^${CLI_ARTIFACT_PATH}(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)/registry-(?:darwin|linux)-(?:amd64|arm64)$`
-);
-
-function validateCliURL(cliURL) {
-  let url;
-  try {
-    url = new URL(cliURL);
-  } catch {
-    throw new Error("Registry CLI URL must be valid HTTPS");
-  }
-  if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash || !CLI_URL_PATHNAME.test(url.pathname)) {
-    throw new Error("Registry CLI URL must be a clean HTTPS version-addressed artifact URL");
-  }
-  if (url.origin !== CLI_ORIGIN) {
-    throw new Error("Registry CLI host is not approved");
-  }
-}
-
-function downloadCli(url, destination) {
-  validateCliURL(url);
-  return new Promise((resolve, reject) => {
-    const request = external_node_https_namespaceObject.get(url, {
-      timeout: 60_000,
-      headers: { "User-Agent": "atlan-agent-registry-action" }
-    }, response => {
-      if (response.statusCode >= 300 && response.statusCode < 400) {
-        response.resume();
-        reject(new Error("Registry CLI download redirected; refusing an unapproved source"));
-        return;
-      }
-      if (response.statusCode !== 200) {
-        response.resume();
-        reject(new Error(`Registry CLI download failed with HTTP ${response.statusCode}`));
-        return;
-      }
-      const declaredSize = Number(response.headers["content-length"] || 0);
-      if (declaredSize > MAX_CLI_BYTES) {
-        response.resume();
-        reject(new Error("Registry CLI download exceeds the size limit"));
-        return;
-      }
-      void writeBoundedCli(response, destination).then(resolve, reject);
-    });
-    request.on("timeout", () => request.destroy(new Error("Registry CLI download timed out")));
-    request.on("error", reject);
-  });
-}
-
-function runtimeEnvironment(environment, keys, runtimeDirectory) {
-  if (!external_node_path_namespaceObject.isAbsolute(runtimeDirectory)) throw new Error("Action-owned CLI home must be an absolute path");
-  const allowed = Object.fromEntries(keys
-    .filter(key => environment[key] !== undefined)
-    .map(key => [key, environment[key]]));
-  return {
-    ...allowed,
-    HOME: runtimeDirectory,
-    REGISTRY_HOME: external_node_path_namespaceObject.join(runtimeDirectory, ".registry"),
-    PATH: SYSTEM_PATH
-  };
-}
-
-function installEnvironment(environment, runtimeDirectory) {
-  return runtimeEnvironment(environment, INSTALL_ENVIRONMENT_KEYS, runtimeDirectory);
-}
-
-// Mirrors the CLI's own per-marketplace variable name, so the token reaches that marketplace alone.
-function tokenVariable(alias) {
-  return `REGISTRY_TOKEN_${alias.toUpperCase().replaceAll(/[^A-Z0-9]/g, "_")}`;
-}
-
-function publisherEnvironment(environment, token, runtimeDirectory, aliases = []) {
-  return {
-    ...runtimeEnvironment(environment, PUBLISH_ENVIRONMENT_KEYS, runtimeDirectory),
-    GIT_CONFIG_NOSYSTEM: "1",
-    GIT_CONFIG_GLOBAL: "/dev/null",
-    ...Object.fromEntries(aliases.map(alias => [tokenVariable(alias), token]))
-  };
-}
-
-// The Action writes the CLI's config itself, so the token's only destination is the fixed gateway.
-function manifestFor() {
-  return `${JSON.stringify({ marketplaces: { [PUBLISH_ALIAS]: { source: PUBLISH_GATEWAY } } }, null, 2)}\n`;
-}
-
-// Only what the repository tracks can be an artifact, so a build output never publishes.
-function trackedFiles(cwd) {
-  const listed = (0,external_node_child_process_namespaceObject.spawnSync)("git", ["ls-files", "-z"], {
-    cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024,
-    env: { PATH: SYSTEM_PATH, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" }
-  });
-  if (listed.status !== 0) throw new Error("could not list the repository's files; check it out before this step");
-  return listed.stdout.split("\0").filter(Boolean);
-}
-
-// An agent is a tracked Markdown file with `name` and `description` front matter, so a README is skipped.
-// A SKILL.md never is: the CLI would publish its whole folder, and at the root that is the checkout.
-function agentFiles(cwd, files, globs = []) {
-  const patterns = globs.map(globPattern);
-  return files.filter(file => file.endsWith(".md") && external_node_path_namespaceObject.posix.basename(file) !== "SKILL.md" &&
-    patterns.some(pattern => pattern.test(file)) && hasFrontMatter(external_node_path_namespaceObject.join(cwd, file))).sort();
-}
-
-function hasFrontMatter(file) {
-  if (!external_node_fs_namespaceObject.existsSync(file) || !external_node_fs_namespaceObject.lstatSync(file).isFile() || external_node_fs_namespaceObject.statSync(file).size > MAX_SKILL_BYTES) return false;
-  const head = /^---\r?\n([\s\S]*?)\r?\n---/.exec(external_node_fs_namespaceObject.readFileSync(file, "utf8"));
-  return Boolean(head && /^name:\s*\S/m.test(head[1]) && /^description:\s*\S/m.test(head[1]));
-}
-
-// The CLI compares with the Registry by workspace name, so the ID the workflow names is looked up once.
-async function workspaceName(token, workspace, registry = registryRequest) {
-  const found = await registry({ token, requestPath: `/registry/v1/workspaces/${encodeURIComponent(workspace)}` });
-  if (typeof found?.name !== "string" || !/^[A-Za-z0-9_.-]{1,128}$/.test(found.name)) {
-    throw new Error(`workspace ${workspace} was not found, or its name cannot be read`);
-  }
-  return found.name;
-}
-
-// The pull-request check again, from the checkout, so a direct push to main meets the same contract.
-function checkoutRejections(cwd, folders) {
-  const rejected = [];
-  for (const folder of folders) {
-    const file = external_node_path_namespaceObject.join(cwd, folder, "SKILL.md");
-    if (!external_node_fs_namespaceObject.lstatSync(file).isFile() || external_node_fs_namespaceObject.statSync(file).size > MAX_SKILL_BYTES) continue;
-    const problems = skillRejections(external_node_fs_namespaceObject.readFileSync(file, "utf8"));
-    if (problems.length > 0) rejected.push(`${folder}/SKILL.md: ${problems.map(item => item.problem).join("; ")}`);
-  }
-  return rejected;
-}
-
-// A push publishes only what it changed. A manual run or a new branch has no parent to compare
-// with, so it publishes everything; so does a CLI older than the flag.
-function changedSinceArguments(eventPayload, version) {
-  const before = eventPayload?.before;
-  if (typeof before !== "string" || !COMMIT_SHA.test(before) || /^0+$/.test(before)) return [];
-  const [major, minor, patch] = version.split(/[.-]/).map(Number);
-  return major > 0 || minor > 1 || (minor === 1 && patch >= 25) ? ["--changed-since", before] : [];
-}
-
-function parseCliVersion(raw) {
-  const match = /^v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\s*$/.exec(raw.split("\n")[0] ?? "");
-  if (!match) throw new Error("installed Registry CLI did not return a valid version");
-  return match[1];
-}
-
-// self-update writes the newest release to REGISTRY_HOME/cli/<version>, or keeps this one.
-function updatedCli(raw, binary, directory) {
-  let data;
-  try {
-    data = JSON.parse(raw)?.data;
-  } catch {
-    data = undefined;
-  }
-  if (data?.action === "already-latest") return binary;
-  if (data?.action !== "updated") throw new Error("the Registry CLI returned an unreadable self-update result");
-  return external_node_path_namespaceObject.join(directory, ".registry", "cli", parseCliVersion(String(data.current)), "registry");
-}
-
-// Runs the verified CLI directly, without a shell; captures bounded stdout when asked.
-function runCli(binary, args, cwd, environment, capture = false) {
-  return new Promise((resolve, reject) => {
-    const child = (0,external_node_child_process_namespaceObject.spawn)(binary, [...args], {
-      cwd,
-      env: environment,
-      shell: false,
-      stdio: capture ? ["ignore", "pipe", "inherit"] : "inherit"
-    });
-    const chunks = [];
-    let size = 0;
-    child.stdout?.on("data", chunk => {
-      size += chunk.length;
-      if (size <= MAX_CLI_OUTPUT_BYTES) chunks.push(chunk);
-      else child.kill();
-    });
-    child.on("error", reject);
-    // "close" waits for stdout to drain; "exit" can fire first and lose the tail of it.
-    child.on("close", code => {
-      if (size > MAX_CLI_OUTPUT_BYTES) return reject(new Error("Registry CLI output exceeds the size limit"));
-      if (code !== 0) return reject(new Error(`Registry CLI ${args[0]} exited with status ${code}`));
-      resolve(Buffer.concat(chunks).toString("utf8"));
-    });
-  });
-}
-
-async function installCli({
-  environment = process.env,
-  download = downloadCli,
-  verifyCli = verifyCliDigest,
-  execute = runCli
-} = {}) {
-  const target = resolveCliPlatform();
-  const directory = await promises_namespaceObject.mkdtemp(external_node_path_namespaceObject.join(external_node_os_namespaceObject.tmpdir(), "registry-skill-sync-"));
-  const binary = external_node_path_namespaceObject.join(directory, "registry");
-  try {
-    await download(cliArtifactURL(target), binary);
-    await verifyCli(binary, CLI_SHA256[target]);
-    await promises_namespaceObject.chmod(binary, 0o700);
-    const safeEnvironment = installEnvironment(environment, directory);
-    const updated = await execute(binary, SELF_UPDATE_ARGUMENTS, directory, safeEnvironment, true);
-    const newest = updatedCli(updated, binary, directory);
-    const version = parseCliVersion(await execute(newest, ["--version"], directory, safeEnvironment, true));
-    await execute(newest, ADAPTER_ARGUMENTS, directory, safeEnvironment);
-    return { binary: newest, directory, version };
-  } catch (error) {
-    await promises_namespaceObject.rm(directory, { recursive: true, force: true });
-    throw error;
-  }
-}
-
-async function runPublishAction({
-  environment = process.env,
-  install = installCli,
-  execute = runCli,
-  registry = registryRequest,
-  preflight = true,
-  eventPayload
-} = {}) {
-  const token = environment.ATLANAI_TOKEN;
-  if (!token) throw new Error("ATLANAI_TOKEN must be supplied as a workflow secret");
+// A failed publish on main surfaces only as a failed run, so the merged pull request it came from is told.
+// A direct push has no pull request, and the run's own failure stays the report.
+async function reportPublishFailure({ environment, payload, error, request = githubRequest }) {
+  const token = common_getInput("github-token", environment);
+  const sha = payload?.after;
+  const repository = environment.GITHUB_REPOSITORY || "";
+  if (!token || typeof sha !== "string" || !COMMIT_SHA.test(sha) || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) return;
   maskSecret(token, environment);
-  const inputs = parseRegistryInputs(environment);
-  const cwd = resolveWorkingDirectory(environment);
-  if (parseBoolean("prune", common_getInput("prune", environment) || "false")) {
-    throw new Error("prune is not supported with the Registry CLI yet; set prune to false");
-  }
-  const files = trackedFiles(cwd);
-  // A tracked file can be missing from the checkout, as in a sparse checkout; it cannot publish.
-  const skills = skillFolders(files, inputs.artifacts.skill).filter(folder => external_node_fs_namespaceObject.existsSync(external_node_path_namespaceObject.join(cwd, folder, "SKILL.md")));
-  const paths = [...skills, ...agentFiles(cwd, files, inputs.artifacts.agent)];
-  // The CLI expands a path it is given, so one that reads as a glob is refused rather than widened.
-  const unsafe = paths.find(item => /[*?[\]{}\\]|[+@!]\(/.test(item));
-  if (unsafe) throw new Error(`${unsafe} contains glob characters, so it cannot be published as an exact path`);
-  if (preflight) {
-    const rejected = checkoutRejections(cwd, skills);
-    if (rejected.length > 0) {
-      throw new Error(`the Registry would reject ${rejected.length} skill(s), so nothing was published: ${rejected.slice(0, 5).join(" | ")}`);
-    }
-  }
-  if (paths.length === 0) {
-    process.stdout.write("::notice title=Registry Sync::no tracked file matches the artifacts globs, so nothing was published\n");
-    common_setOutput("status", "success", environment);
-    return;
-  }
-  const namespace = await workspaceName(token, inputs.workspace, registry);
-  external_node_fs_namespaceObject.writeFileSync(external_node_path_namespaceObject.join(cwd, MANIFEST), manifestFor());
-  const { binary, directory, version } = await install({ environment });
+  const [owner, repo] = repository.split("/");
   try {
-    const args = ["publish", ...paths.map(item => `./${item}`), "--to", `${PUBLISH_ALIAS}/${namespace}`, "--yes", ...changedSinceArguments(eventPayload, version)];
-    await execute(binary, args, cwd, publisherEnvironment(environment, token, directory, [PUBLISH_ALIAS]));
-    common_setOutput("status", "success", environment);
-    common_setOutput("cli-version", version, environment);
-  } finally {
-    await promises_namespaceObject.rm(directory, { recursive: true, force: true });
+    const pulls = await request({ token, method: "GET", requestPath: `/repos/${owner}/${repo}/commits/${sha}/pulls`, expectedStatus: 200 });
+    const merged = Array.isArray(pulls) ? pulls.find(pull => pull?.merge_commit_sha === sha && Number.isSafeInteger(pull.number)) : undefined;
+    if (!merged) return;
+    await upsertMarkerComment({
+      token, request, owner, repo, issueNumber: merged.number, marker: PUBLISH_FAILURE_MARKER,
+      body: publishFailureComment(environment, sha, error)
+    });
+  } catch {
+    process.stdout.write("::warning title=Registry Sync::the failed publish could not be reported on its pull request\n");
   }
 }
 
@@ -40204,6 +40240,7 @@ async function runEval({
 
 
 
+
 async function runAction({
   environment = process.env,
   request = githubRequest,
@@ -40223,7 +40260,12 @@ async function runAction({
   if (event === "push" || event === "workflow_dispatch") {
     const payload = eventPayload ?? readEventPayload(environment);
     assertDefaultBranch(environment, payload);
-    return publish({ environment, preflight, eventPayload: payload });
+    try {
+      return await publish({ environment, eventPayload: payload });
+    } catch (error) {
+      if (event === "push") await reportPublishFailure({ environment, payload, error, request });
+      throw error;
+    }
   }
   throw new Error(`Registry Sync runs on pull_request_target, push and workflow_dispatch, not ${event || "an unknown event"}`);
 }
