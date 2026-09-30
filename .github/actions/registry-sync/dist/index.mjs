@@ -29356,6 +29356,8 @@ const MAX_WORKSPACES = 20;
 const MAX_REMOTE_SKILLS = 500;
 const SHA256 = /^[a-f0-9]{64}$/;
 const COMMIT_SHA = /^[a-f0-9]{40}$/i;
+// git runs from the system path with no system or global config, so a runner's git settings cannot redirect it.
+const GIT_ENVIRONMENT = Object.freeze({ PATH: "/usr/bin:/bin", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" });
 const RELEASE_VERSION = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
 const SAFE_PATH = /^(?=.{1,240}$)(?!\/)(?!.*\/$)(?!.*\/\/)(?!.*(?:^|\/)\.{1,2}(?:\/|$))[^`|\\\u0000-\u001F\u007F]+$/u;
 
@@ -37484,35 +37486,55 @@ function preflightConfig({ workspace, artifacts }, files) {
 const RUN_PAGE_SIZE = 30;
 
 function isAncestor(cwd, sha) {
-  return (0,external_node_child_process_namespaceObject.spawnSync)("git", ["merge-base", "--is-ancestor", sha, "HEAD"], {
-    cwd, env: { PATH: "/usr/bin:/bin", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" }
-  }).status === 0;
+  return (0,external_node_child_process_namespaceObject.spawnSync)("git", ["merge-base", "--is-ancestor", sha, "HEAD"], { cwd, env: { ...GIT_ENVIRONMENT } }).status === 0;
+}
+
+// The workflow file names what publishes and where, so a change to it can cover skills whose files did not change.
+function workflowChanged(cwd, sha, environment) {
+  const ref = /^[^/]+\/[^/]+\/(.+)@/.exec(environment.GITHUB_WORKFLOW_REF || "")?.[1];
+  const listed = (0,external_node_child_process_namespaceObject.spawnSync)("git", ["diff", "--quiet", sha, "HEAD", "--", ref || ".github/workflows"], { cwd, env: { ...GIT_ENVIRONMENT } });
+  return listed.status !== 0;
+}
+
+// A rerun checks out its own, older commit, so it could publish old files over newer ones. A manual run from the
+// default branch publishes everything that differs, which is what a rerun would have been for.
+function assertFirstAttempt(environment) {
+  if (/^\d+$/.test(environment.GITHUB_RUN_ATTEMPT || "") && Number(environment.GITHUB_RUN_ATTEMPT) > 1) {
+    throw new Error("a rerun publishes this run's older commit and could overwrite newer skills; run Registry Sync manually from the default branch instead");
+  }
 }
 
 // The commit a push publishes changes since: the last run that finished publishing, not the push's parent. GitHub
 // cancels a run still waiting in the concurrency group when a newer one arrives, so its changes would otherwise
-// never publish. A failed run is not retried here: its pull request is told, and a rerun publishes it.
-// Without `actions: read`, or with no earlier run, the push's parent stands in.
-async function publishBaseline({ environment, eventPayload, cwd, request = githubRequest, ancestor = isAncestor }) {
+// never publish. A failed run is not retried here: its pull request is told to run Registry Sync manually.
+// Without `actions: read`, or with no earlier run, the push's parent stands in. When the workflow file changed,
+// there is no baseline, and everything that differs publishes.
+async function publishBaseline({
+  environment, eventPayload, cwd, request = githubRequest, ancestor = isAncestor, changed = workflowChanged
+}) {
   const before = eventPayload?.before;
   const parent = typeof before === "string" && COMMIT_SHA.test(before) && !/^0+$/.test(before) ? before : undefined;
+  const baseline = parent && (await lastFinishedRun({ environment, eventPayload, cwd, request, ancestor }) ?? parent);
+  return baseline && changed(cwd, baseline, environment) ? undefined : baseline;
+}
+
+async function lastFinishedRun({ environment, eventPayload, cwd, request, ancestor }) {
   const token = common_getInput("github-token", environment);
   const repository = environment.GITHUB_REPOSITORY || "";
   const branch = eventPayload?.repository?.default_branch;
-  if (!parent || !token || !/^\d{1,20}$/.test(environment.GITHUB_RUN_ID || "") ||
-      !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository) || typeof branch !== "string") return parent;
+  if (!token || !/^\d{1,20}$/.test(environment.GITHUB_RUN_ID || "") ||
+      !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository) || typeof branch !== "string") return undefined;
   try {
     const run = await request({ token, method: "GET", requestPath: `/repos/${repository}/actions/runs/${environment.GITHUB_RUN_ID}`, expectedStatus: 200 });
-    if (!Number.isSafeInteger(run?.workflow_id)) return parent;
+    if (!Number.isSafeInteger(run?.workflow_id)) return undefined;
     const query = new URLSearchParams({ branch, status: "completed", per_page: String(RUN_PAGE_SIZE) });
     const listed = await request({ token, method: "GET", requestPath: `/repos/${repository}/actions/workflows/${run.workflow_id}/runs?${query}`, expectedStatus: 200 });
-    const finished = (Array.isArray(listed?.workflow_runs) ? listed.workflow_runs : []).find(candidate =>
+    return (Array.isArray(listed?.workflow_runs) ? listed.workflow_runs : []).find(candidate =>
       ["success", "failure"].includes(candidate?.conclusion) && ["push", "workflow_dispatch"].includes(candidate.event) &&
-      typeof candidate.head_sha === "string" && COMMIT_SHA.test(candidate.head_sha) && ancestor(cwd, candidate.head_sha));
-    return finished?.head_sha ?? parent;
+      typeof candidate.head_sha === "string" && COMMIT_SHA.test(candidate.head_sha) && ancestor(cwd, candidate.head_sha))?.head_sha;
   } catch {
     process.stdout.write("::notice title=Registry Sync::earlier runs could not be read, so this push publishes only its own changes; grant the job actions: read\n");
-    return parent;
+    return undefined;
   }
 }
 
@@ -37727,7 +37749,7 @@ function manifestFor() {
 function trackedFiles(cwd) {
   const listed = (0,external_node_child_process_namespaceObject.spawnSync)("git", ["ls-files", "-z"], {
     cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024,
-    env: { PATH: SYSTEM_PATH, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" }
+    env: { ...GIT_ENVIRONMENT }
   });
   if (listed.status !== 0) throw new Error("could not list the repository's files; check it out before this step");
   return listed.stdout.split("\0").filter(Boolean);
@@ -37834,6 +37856,15 @@ async function installCli({
   }
 }
 
+// The CLI reads the nearest registry.yml, so the Action writes its own for the run and puts the repository's back.
+function claimManifest(file) {
+  const existing = external_node_fs_namespaceObject.lstatSync(file, { throwIfNoEntry: false });
+  if (existing && !existing.isFile()) throw new Error(`${MANIFEST} in the working directory must be a regular file`);
+  const original = existing ? external_node_fs_namespaceObject.readFileSync(file) : undefined;
+  external_node_fs_namespaceObject.writeFileSync(file, manifestFor());
+  return () => (original ? external_node_fs_namespaceObject.writeFileSync(file, original) : external_node_fs_namespaceObject.rmSync(file, { force: true }));
+}
+
 async function runPublishAction({
   environment = process.env,
   install = installCli,
@@ -37841,6 +37872,7 @@ async function runPublishAction({
   registry = registryRequest,
   request,
   ancestor,
+  changed,
   eventPayload
 } = {}) {
   const token = environment.ATLANAI_TOKEN;
@@ -37864,15 +37896,17 @@ async function runPublishAction({
     return;
   }
   const namespace = await workspaceName(token, inputs.workspace, registry);
-  external_node_fs_namespaceObject.writeFileSync(external_node_path_namespaceObject.join(cwd, MANIFEST), manifestFor());
-  const baseline = await publishBaseline({ environment, eventPayload, cwd, request, ancestor });
+  const baseline = await publishBaseline({ environment, eventPayload, cwd, request, ancestor, changed });
   const { binary, directory, version } = await install({ environment });
+  let restore;
   try {
+    restore = claimManifest(external_node_path_namespaceObject.join(cwd, MANIFEST));
     const args = ["publish", ...paths.map(item => `./${item}`), "--to", `${PUBLISH_ALIAS}/${namespace}`, "--yes", ...changedSinceArguments(baseline, version)];
     await execute(binary, args, cwd, publisherEnvironment(environment, token, directory, [PUBLISH_ALIAS]));
     common_setOutput("status", "success", environment);
     common_setOutput("cli-version", version, environment);
   } finally {
+    restore?.();
     await promises_namespaceObject.rm(directory, { recursive: true, force: true });
   }
 }
@@ -38053,8 +38087,10 @@ function parseSkillSyncConfig(raw, source = "base") {
 function classifySkillFile(filename, config) {
   if (!config?.valid || typeof filename !== "string") return { kind: "unknown" };
   if (config.folders) {
-    const directory = [...config.folders].filter(folder => filename.startsWith(`${folder}/`))
-      .reduce((deepest, folder) => (folder.length > (deepest?.length ?? 0) ? folder : deepest), undefined);
+    let directory;
+    for (let cut = filename.lastIndexOf("/"); cut > 0 && !directory; cut = filename.lastIndexOf("/", cut - 1)) {
+      if (config.folders.has(filename.slice(0, cut))) directory = filename.slice(0, cut);
+    }
     if (!directory) return { kind: "outside" };
     const manifest = `${directory}/SKILL.md`;
     return { kind: "eligible", skill: directory.split("/").at(-1), directory, manifest, definition: filename === manifest };
@@ -38261,6 +38297,19 @@ async function readRepositoryBlob({ token, context, request, sha, maxBytes }) {
     maxResponseBytes: Math.ceil(maxBytes * 4 / 3) + 4096
   });
   return decodeBase64Bytes(response, maxBytes);
+}
+
+// Where the pull request branched from its base, so a skill the base branch changed since is not counted as the PR's.
+async function forkPointTree({ token, context, request }) {
+  const compared = await request({
+    token,
+    method: "GET",
+    requestPath: `/repos/${encodeURIComponent(context.owner)}/${encodeURIComponent(context.repo)}/compare/${context.baseSha}...${context.headSha}?per_page=1`,
+    expectedStatus: 200
+  });
+  const sha = compared?.merge_base_commit?.sha;
+  if (typeof sha !== "string" || !/^[a-f0-9]{40}$/i.test(sha)) throw new Error("GitHub did not return the pull request's merge base");
+  return readRepositoryTree({ token, context, request, ref: sha });
 }
 
 function definitionBatches(files, tree) {
@@ -38612,8 +38661,12 @@ async function buildPreflightReport({ token, context, request, registryToken, re
   let changes = eligibleChanges(fileResult.files, config);
   let limited = fileResult.limited;
   if (limited && baseTree && treeFiles && config.valid) {
-    changes = { eligible: treeChanges(baseTree, treeFiles, config), excluded: 0 };
-    limited = false;
+    try {
+      changes = { eligible: treeChanges(await forkPointTree({ token, context, request }), treeFiles, config), excluded: 0 };
+      limited = false;
+    } catch {
+      // Left limited: validation below fails the check rather than pass skills it cannot name.
+    }
   }
   const supportingOnly = changes.eligible.filter(file => !file.definitionChanged);
   let supportingAnalysisUnavailable = false;
@@ -38635,7 +38688,8 @@ async function buildPreflightReport({ token, context, request, registryToken, re
   // run unchecked rather than passing it.
   const rejections = [];
   const present = eligible.filter(file => file.status !== "removed");
-  let unchecked = inputs && !config.valid ? config.reason : undefined;
+  let unchecked = inputs && !config.valid ? config.reason
+    : inputs && limited ? "GitHub could not say which skills this pull request changes" : undefined;
   if (!unchecked && present.length > 0) {
     try {
       if (!context.headSha) throw new Error("GitHub did not provide the pull request's head commit");
@@ -38665,7 +38719,7 @@ async function buildPreflightReport({ token, context, request, registryToken, re
       registryState.reason = undefined;
     } else if (context.baseSha && context.headSha) {
       try {
-        const baseTree = await readRepositoryTree({ token, context, request, ref: context.baseSha });
+        const comparedBase = baseTree || await readRepositoryTree({ token, context, request, ref: context.baseSha });
         const headTree = treeFiles || await readRepositoryTree({ token, context, request, ref: context.headSha });
         const readBlob = boundedBlobReader({ token, context, request });
         const inventory = await loadRegistryInventory({
@@ -38676,7 +38730,7 @@ async function buildPreflightReport({ token, context, request, registryToken, re
         });
         for (const file of eligible.slice(0, MAX_ANALYZED_SKILLS)) {
           try {
-            const base = file.status === "added" ? undefined : await digestTreeSkill(baseTree, file.directory, readBlob);
+            const base = file.status === "added" ? undefined : await digestTreeSkill(comparedBase, file.directory, readBlob);
             const head = file.status === "removed" ? undefined : await digestTreeSkill(headTree, file.directory, readBlob);
             if ((!base && file.status !== "added") || (!head && file.status !== "removed")) {
               throw new Error("GitHub did not provide a complete skill bundle");
@@ -39158,7 +39212,7 @@ function publishFailureComment(environment, sha, error) {
     "",
     `Publishing \`${sha.slice(0, 7)}\` to Atlan failed: \`${message}\`.`,
     "",
-    `${runLink(environment)} names what failed. Fix a refused skill in a new pull request, where preflight checks it before it merges; if nothing was refused, rerun the workflow.`
+    `${runLink(environment)} has Atlan's response. Fix a refused skill in a new pull request, where preflight checks it before it merges. If nothing was refused, run Registry Sync manually from the default branch (Actions, Registry Sync, Run workflow); it publishes everything that differs.`
   ].join("\n");
 }
 
@@ -40378,6 +40432,7 @@ async function runEval({
 
 
 
+
 async function runAction({
   environment = process.env,
   request = githubRequest,
@@ -40397,6 +40452,7 @@ async function runAction({
   if (event === "push" || event === "workflow_dispatch") {
     const payload = eventPayload ?? readEventPayload(environment);
     assertDefaultBranch(environment, payload);
+    assertFirstAttempt(environment);
     try {
       return await publish({ environment, eventPayload: payload, request });
     } catch (error) {
