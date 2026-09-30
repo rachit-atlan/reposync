@@ -4,3 +4,5 @@ description: Probe outside the first glob; it should publish once the workflow w
 ---
 
 Widened-glob probe.
+
+Tip-check test push B.
