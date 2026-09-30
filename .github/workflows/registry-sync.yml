@@ -33,7 +33,7 @@ jobs:
         with:
           workspace: workspace_01m36rz0zdfc1ttjvtj0h9b87j
           artifacts: |
-            skill: [.claude/skills/**, skills/**]  # both folders
+            skill: [.claude/skills/**, skills/**, team-b/skills/**]  # three folders
           preflight: true
           allow-pr-commenting: true
           fail-on-conflict: true
