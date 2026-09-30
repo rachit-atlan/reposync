@@ -37496,17 +37496,33 @@ function workflowChanged(cwd, sha, environment) {
   return listed.status !== 0;
 }
 
-// A rerun checks out its own, older commit, so it could publish old files over newer ones. A manual run from the
-// default branch publishes everything that differs, which is what a rerun would have been for.
-function assertFirstAttempt(environment) {
-  if (/^\d+$/.test(environment.GITHUB_RUN_ATTEMPT || "") && Number(environment.GITHUB_RUN_ATTEMPT) > 1) {
-    throw new Error("a rerun publishes this run's older commit and could overwrite newer skills; run Registry Sync manually from the default branch instead");
+// A rerun replays its own commit. Once the default branch has moved on, that would publish older skills over newer
+// ones and leave Atlan behind the repository, so only a rerun of the branch's latest commit goes ahead. Undoing a
+// change is a revert on the default branch, which preflight checks like any other.
+async function assertCurrentRerun({ environment, eventPayload, request = githubRequest }) {
+  if (!(Number(environment.GITHUB_RUN_ATTEMPT) > 1)) return;
+  const instead = "run Registry Sync manually from the default branch instead";
+  const token = common_getInput("github-token", environment);
+  const repository = environment.GITHUB_REPOSITORY || "";
+  const branch = eventPayload?.repository?.default_branch;
+  let tip;
+  if (token && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository) && typeof branch === "string") {
+    const ref = branch.split("/").map(encodeURIComponent).join("/");
+    tip = await request({ token, method: "GET", requestPath: `/repos/${repository}/git/ref/heads/${ref}`, expectedStatus: 200 })
+      .then(found => found?.object?.sha, () => undefined);
+  }
+  if (typeof tip !== "string" || !COMMIT_SHA.test(tip)) {
+    throw new Error(`this rerun could not confirm the default branch's latest commit, so it did not publish; ${instead}`);
+  }
+  const sha = environment.GITHUB_SHA || "";
+  if (tip.toLowerCase() !== sha.toLowerCase()) {
+    throw new Error(`this rerun is for ${sha.slice(0, 7)}, but ${branch} has moved on to ${tip.slice(0, 7)}, so publishing it would put older skills over newer ones; ${instead}`);
   }
 }
 
 // The commit a push publishes changes since: the last run that finished publishing, not the push's parent. GitHub
 // cancels a run still waiting in the concurrency group when a newer one arrives, so its changes would otherwise
-// never publish. A failed run is not retried here: its pull request is told to run Registry Sync manually.
+// never publish. A failed run is not retried here: its pull request is told how to publish it.
 // Without `actions: read`, or with no earlier run, the push's parent stands in. When the workflow file changed,
 // there is no baseline, and everything that differs publishes.
 async function publishBaseline({
@@ -37530,6 +37546,7 @@ async function lastFinishedRun({ environment, eventPayload, cwd, request, ancest
     const query = new URLSearchParams({ branch, status: "completed", per_page: String(RUN_PAGE_SIZE) });
     const listed = await request({ token, method: "GET", requestPath: `/repos/${repository}/actions/workflows/${run.workflow_id}/runs?${query}`, expectedStatus: 200 });
     return (Array.isArray(listed?.workflow_runs) ? listed.workflow_runs : []).find(candidate =>
+      candidate?.id !== Number(environment.GITHUB_RUN_ID) &&
       ["success", "failure"].includes(candidate?.conclusion) && ["push", "workflow_dispatch"].includes(candidate.event) &&
       typeof candidate.head_sha === "string" && COMMIT_SHA.test(candidate.head_sha) && ancestor(cwd, candidate.head_sha))?.head_sha;
   } catch {
@@ -38359,8 +38376,9 @@ async function readDefinitions({ token, context, request, files, tree }) {
   return read;
 }
 
-// The skills a pull request changes, from its two trees, however many files it touches. Past GitHub's file-list
-// pages this is the whole answer; it has no line counts or rename pairs, which only the file list carries.
+// The skills a pull request changes, from the tree it branched from and its head, however many files it touches.
+// Past GitHub's file-list pages this is the whole answer; it has no line counts or rename pairs, which only the
+// file list carries.
 function treeChanges(baseTree, headTree, config) {
   const affected = new Map();
   for (const file of new Set([...baseTree.keys(), ...headTree.keys()])) {
@@ -39212,7 +39230,7 @@ function publishFailureComment(environment, sha, error) {
     "",
     `Publishing \`${sha.slice(0, 7)}\` to Atlan failed: \`${message}\`.`,
     "",
-    `${runLink(environment)} has Atlan's response. Fix a refused skill in a new pull request, where preflight checks it before it merges. If nothing was refused, run Registry Sync manually from the default branch (Actions, Registry Sync, Run workflow); it publishes everything that differs.`
+    `${runLink(environment)} has Atlan's response. Fix a refused skill in a new pull request, where preflight checks it before it merges. If nothing was refused, rerun this run; if newer changes have merged since, run Registry Sync manually from the default branch instead.`
   ].join("\n");
 }
 
@@ -40452,7 +40470,7 @@ async function runAction({
   if (event === "push" || event === "workflow_dispatch") {
     const payload = eventPayload ?? readEventPayload(environment);
     assertDefaultBranch(environment, payload);
-    assertFirstAttempt(environment);
+    await assertCurrentRerun({ environment, eventPayload: payload, request });
     try {
       return await publish({ environment, eventPayload: payload, request });
     } catch (error) {
