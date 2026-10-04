@@ -1,6 +1,0 @@
-version: 1
-skills:
-  - .claude/skills/**
-  - skills/**
-  - team-b/skills/**
-  - extra/skills/**
