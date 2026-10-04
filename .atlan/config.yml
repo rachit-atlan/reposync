@@ -3,3 +3,5 @@ skills:
   - .claude/skills/**
   - skills/**
   - team-b/skills/**
+agents:
+  - path: .claude/agents/helper.md
