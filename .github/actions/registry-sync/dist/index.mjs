@@ -37375,7 +37375,7 @@ const MAX_CONFIG_BYTES = 64 * 1024;
 
 function safeGlob(value) {
   return typeof value === "string" && value.length > 0 && value.length <= 200 && !value.startsWith("/") &&
-    !value.endsWith("/") && !/[\\\0\r\n[\]{}]/.test(value) && !value.split("/").some(part => part === "..");
+    !value.endsWith("/") && !/[\\\0\r\n[\]{}`]/.test(value) && !value.split("/").some(part => part === "..");
 }
 
 // JSON, an unquoted list such as `[skills/**, agents/**]`, or one glob; a trailing `# comment` is dropped.
@@ -37422,7 +37422,7 @@ function parseConfig(text) {
     config[entry[1]] = entry[1] === "version" ? entry[2] : entry[2] ? globList(entry[2]) : [];
     list = entry[1] === "skills" && !entry[2] ? config.skills : undefined;
   }
-  if (config.version !== "1") throw new Error(`${CONFIG_PATH} must say \`version: 1\``);
+  if (!/^(["']?)1\1$/.test(config.version ?? "")) throw new Error(`${CONFIG_PATH} must say \`version: 1\``);
   assertGlobs(config.skills ?? [], `${CONFIG_PATH} \`skills\``);
   return { skills: config.skills };
 }
@@ -37463,6 +37463,16 @@ function skillFolders(files, globs = []) {
   }
   const sorted = [...folders].sort();
   return sorted.filter(folder => !sorted.some(outer => folder.startsWith(`${outer}/`)));
+}
+
+// A glob that matches no skill is almost always a typo, and the skills it was meant for would quietly stop syncing.
+function assertGlobsMatch(files, globs) {
+  const skills = files.filter(file => file.endsWith("/SKILL.md"));
+  const unmatched = globs.find(glob => {
+    const pattern = globPattern(glob);
+    return !skills.some(file => pattern.test(file) || pattern.test(file.slice(0, -"/SKILL.md".length)));
+  });
+  if (unmatched) throw new Error(`\`${unmatched}\` in ${CONFIG_PATH} matches no skill folder; fix the glob or remove it`);
 }
 
 // Preflight's view of the config: the skill folders, found in the pull request's trees.
@@ -37891,6 +37901,7 @@ async function runPublishAction({
   }
   const files = trackedFiles(cwd);
   const config = readConfig(cwd, files);
+  assertGlobsMatch(files, config.skills);
   // A tracked file can be missing from the checkout, as in a sparse checkout; it cannot publish.
   const paths = skillFolders(files, config.skills).filter(folder => external_node_fs_namespaceObject.existsSync(external_node_path_namespaceObject.join(cwd, folder, "SKILL.md")));
   // The CLI expands a path it is given, so one that reads as a glob is refused rather than widened.
@@ -38155,15 +38166,15 @@ async function readRepositoryBlob({ token, context, request, sha, maxBytes }) {
 }
 
 // The pull request's own config, since that is what publishes once it merges. Its blob is the one the head tree
-// names, so the file and the trees cannot disagree.
+// names, so the file and the trees cannot disagree. `inRepository` marks a problem a rerun cannot fix.
 async function readHeadConfig({ token, context, request, workspace, files, head }) {
   const entry = head.get(CONFIG_PATH);
   if (!entry) {
     const hint = head.has(".atlan/package.json") ? "; move the skill paths from `.atlan/package.json` into it" : "";
-    return { valid: false, reason: `\`${CONFIG_PATH}\` is missing, so there is no list of skills to check${hint}` };
+    return { valid: false, inRepository: true, reason: `\`${CONFIG_PATH}\` is missing, so there is no list of skills to check${hint}` };
   }
   if (!["100644", "100755"].includes(entry.mode) || !(entry.size <= MAX_CONFIG_BYTES)) {
-    return { valid: false, reason: `\`${CONFIG_PATH}\` must be a file of at most ${MAX_CONFIG_BYTES / 1024} KiB` };
+    return { valid: false, inRepository: true, reason: `\`${CONFIG_PATH}\` must be a file of at most ${MAX_CONFIG_BYTES / 1024} KiB` };
   }
   let text;
   try {
@@ -38172,9 +38183,11 @@ async function readHeadConfig({ token, context, request, workspace, files, head 
     return { valid: false, reason: `GitHub could not provide \`${CONFIG_PATH}\`` };
   }
   try {
-    return preflightConfig({ workspace, skills: parseConfig(text).skills }, files);
+    const { skills } = parseConfig(text);
+    assertGlobsMatch([...head.keys()], skills);
+    return preflightConfig({ workspace, skills }, files);
   } catch (error) {
-    return { valid: false, reason: error.message };
+    return { valid: false, inRepository: true, reason: error.message };
   }
 }
 
@@ -38631,7 +38644,8 @@ async function buildPreflightReport({ token, context, request, registryToken, re
     registry: registryState,
     conflictCount,
     rejections,
-    unchecked
+    unchecked,
+    uncheckedInRepository: Boolean(config.inRepository)
   };
 }
 
@@ -38847,7 +38861,10 @@ function formatPreflightComment(report, compact = false) {
     : "";
   const lines = [PREFLIGHT_MARKER, `### ${verdict}`, ""];
   if (report.unchecked) {
-    lines.push(`${tableCell(report.unchecked)}, so the check fails rather than let unchecked skills merge. Rerun it; if it fails again, check the workflow's access to this repository.`, "");
+    const next = report.uncheckedInRepository
+      ? `Commit a valid \`${CONFIG_PATH}\` to this pull request; preflight runs again on the next push.`
+      : "Rerun it; if it fails again, check the workflow's access to this repository.";
+    lines.push(`${tableCell(report.unchecked)}, so the check fails rather than let unchecked skills merge. ${next}`, "");
   }
   if (state === "unconfigured") {
     lines.push("No Atlan API key is available in `ATLANAI_TOKEN`, so this pull request was not compared with Atlan and conflicts were not checked. Expose the existing secret as `ATLANAI_TOKEN` on the Registry Sync step to enable it.", "");
