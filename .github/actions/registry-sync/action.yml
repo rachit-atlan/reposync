@@ -8,14 +8,14 @@ branding:
 
 inputs:
   workspace:
-    description: Atlan workspace ID that artifacts publish to and preflight compares with.
+    description: Atlan workspace ID that skills publish to and preflight compares with. `.atlan/config.yml` lists the skills.
     required: true
   preflight:
     description: Check pull requests before they merge. Preflight validates each changed skill and compares it with the Registry; publishing leaves validation to the Registry.
     required: false
     default: "true"
   allow-pr-commenting:
-    description: Post the preflight result as one pull request comment. A pull request that touches no listed folder gets no comment.
+    description: Post the preflight result as one pull request comment. A pull request that touches no listed skill gets no comment.
     required: false
     default: "true"
   fail-on-conflict:
