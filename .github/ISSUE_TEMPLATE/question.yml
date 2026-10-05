@@ -1,6 +1,6 @@
 name: Question
 description: Ask how to use brain, how to build a registry or what the file spec means.
-labels: ["question"]
+labels: ["question", "status:needs-triage"]
 body:
   - type: markdown
     attributes:
