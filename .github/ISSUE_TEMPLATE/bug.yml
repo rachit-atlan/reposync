@@ -28,7 +28,7 @@ body:
       label: What happened
       description: For brain, paste the command you ran and its full output. For the spec or the docs, link the section and quote the text that's wrong.
       placeholder: |
-        $ brain add acme/pr-review
+        $ brain add acme/engineering/pr-review
         ...
     validations:
       required: true
