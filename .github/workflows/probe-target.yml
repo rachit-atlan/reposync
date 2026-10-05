@@ -1,0 +1,8 @@
+name: Probe target
+on: pull_request_target
+permissions: {}
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "pull_request_target ran from a workflow the PR added"
