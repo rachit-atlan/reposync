@@ -45,7 +45,7 @@ body:
     id: steps
     attributes:
       label: Steps to reproduce
-      description: Needed for brain bugs. The smallest set of steps that shows the bug, from a clean start. Say where the registry lives (a local folder, a git repository, an HTTPS host, or a hosted registry brain reads through an adapter) and link to it or describe its layout. Use synthetic data.
+      description: Needed for brain bugs. The smallest set of steps that shows the bug, from a clean start. Say where the registry lives (a local folder, a git repository, or a hosted registry brain reads through an adapter) and link to it or describe its layout. Use synthetic data.
       placeholder: |
         1. mkdir demo && cd demo && git init
         2. brain registry add https://github.com/atlanai/agent-registry/tree/main/examples/acme-registry
