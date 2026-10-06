@@ -1,0 +1,23 @@
+# Groups the release notes that `gh release create --generate-notes` writes for each
+# brain release. Each pull request goes under the first category its labels match,
+# and the labels come from labeler.yml.
+
+changelog:
+  exclude:
+    labels:
+      - area:ci
+  categories:
+    - title: Breaking changes
+      labels: [breaking]
+    - title: brain CLI
+      labels: [area:cli]
+    - title: File spec
+      labels: [area:spec]
+    - title: Examples
+      labels: [area:examples]
+    - title: Spec checks
+      labels: [area:tools]
+    - title: Documentation
+      labels: [documentation]
+    - title: Other changes
+      labels: ["*"]

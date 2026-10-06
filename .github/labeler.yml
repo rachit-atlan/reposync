@@ -1,0 +1,28 @@
+# Labels each pull request by the paths it changes, for actions/labeler. The labels
+# route review and group the release notes (see release.yml).
+
+area:cli:
+  - changed-files:
+      - any-glob-to-any-file: 'cli/**'
+
+area:spec:
+  - changed-files:
+      - any-glob-to-any-file: 'spec/**'
+
+area:examples:
+  - changed-files:
+      - any-glob-to-any-file: 'examples/**'
+
+area:tools:
+  - changed-files:
+      - any-glob-to-any-file: 'tools/**'
+
+documentation:
+  - changed-files:
+      - any-glob-to-any-file: ['docs/**', '*.md', 'mkdocs.yml', 'LICENSE']
+
+# Only when every changed file is under .github, so a change that also touches
+# brain or the spec keeps its place in the release notes.
+area:ci:
+  - changed-files:
+      - all-globs-to-all-files: '.github/**'
