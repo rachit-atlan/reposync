@@ -1,0 +1,31 @@
+name: Pull request
+
+# Checks a pull request against CONTRIBUTING.md: a Conventional Commit title and
+# commits, and a description that fills in the template. It runs again when the
+# title or description is edited, which the CI workflow's triggers don't cover.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+    branches: [main, registry]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pull-request-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Title, commits and description
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The commits between the base and the head are read with git log.
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Reads the pull request from the event file, so its text never passes through the shell.
+      - run: python3 .github/scripts/check_pull_request.py "$GITHUB_EVENT_PATH"
