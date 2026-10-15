@@ -1,0 +1,62 @@
+name: version_label probe (temporary)
+
+# Checks whether Atlan's skill bulk create keeps a `version_label` it is sent.
+# Writes only to the registry-cli-test workspace; removed after the check.
+on: workflow_dispatch
+
+permissions: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: registry
+    permissions:
+      contents: read
+    steps:
+      - name: Probe version_label on bulk create
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          WS: workspace_01m36rz0zdfc1ttjvtj0h9b87j
+        run: |
+          set -euo pipefail
+          api=https://api.atlan.com/skill/v1
+          work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
+          get() { curl -sS -H "Authorization: Bearer $TOKEN" "$api$1"; }
+          show() { jq -c '{id, name, version_ordinal, version_label, source_type, source_id, source_version}'; }
+          line() { get "/skills?workspace_id=$WS&limit=200" | jq -c --arg n "$1" '[(.items // .data // .)[] | select(.name == $n)] | first'; }
+          upload() { # name label body [extra metadata JSON]
+            local name=$1 label=$2 body=$3 extra=${4:-'{}'}
+            mkdir -p "$work/$name"
+            printf -- '---\nname: %s\ndescription: Throwaway skill for a version_label check. Safe to delete.\n---\n%s\n' "$name" "$body" > "$work/$name/SKILL.md"
+            rm -f "$work/$name.zip"; (cd "$work/$name" && zip -q -X "$work/$name.zip" SKILL.md)
+            local items
+            items=$(jq -nc --arg n "$name" --arg w "$WS" --arg l "$label" --argjson x "$extra" \
+              '[{metadata: ({name: $n, workspace_id: $w, version_label: $l, source_type: "local"} + $x), body_part: "body_0"}]')
+            local code
+            code=$(curl -sS -o "$work/out.json" -w '%{http_code}' -X POST "$api/skills/bulk" \
+              -H "Authorization: Bearer $TOKEN" -F "items=$items" -F "body_0=@$work/$name.zip;type=application/zip")
+            echo "POST /skills/bulk $name label=$label -> HTTP $code"
+            jq -c '(.items // .results // .) | map({status: (.status // null), id: (.skill.id // .data.id // .id // null), version_label: (.skill.version_label // .data.version_label // .version_label // null), version_ordinal: (.skill.version_ordinal // .data.version_ordinal // .version_ordinal // null), problem: ((.problem // .error // {}) | {title, detail, status})})' "$work/out.json" 2>/dev/null \
+              || head -c 1500 "$work/out.json"
+          }
+
+          echo "== 1. The existing skill aireg published, before:"
+          existing=$(line aireg-migration-1015); echo "$existing" | show
+
+          echo "== 2. A new skill, version_label 0.1.0:"
+          upload version-label-probe-1015 0.1.0 "first"
+          probe=$(line version-label-probe-1015); echo "$probe" | show
+          id=$(echo "$probe" | jq -r '.id // empty')
+
+          echo "== 3. The same skill again, version_label 0.1.1:"
+          upload version-label-probe-1015 0.1.1 "second"
+          [ -n "$id" ] && get "/skills/$id" | show
+
+          echo "== 4. The existing ordinal-only skill, version_label 0.1.0, same source identity:"
+          ident=$(echo "$existing" | jq -c '{source_type, source_id, source_uri} | with_entries(select(.value != null))')
+          upload aireg-migration-1015 0.1.0 "Say that Registry Sync published this skill with aireg. Labelled." "$ident"
+          line aireg-migration-1015 | show
+
+          echo "== 5. Archive the probe skill:"
+          [ -n "$id" ] && curl -sS -o /dev/null -w 'POST archive -> HTTP %{http_code}\n' -X POST -H "Authorization: Bearer $TOKEN" "$api/skills/$id/archive"
