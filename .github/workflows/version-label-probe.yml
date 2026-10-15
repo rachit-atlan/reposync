@@ -41,22 +41,34 @@ jobs:
               || head -c 1500 "$work/out.json"
           }
 
-          echo "== 1. The existing skill aireg published, before:"
-          existing=$(line aireg-migration-1015); echo "$existing" | show
+          patch() { # id label
+            local code
+            code=$(curl -sS -o "$work/patch.json" -w '%{http_code}' -X PATCH "$api/skills/$1" \
+              -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d "$(jq -nc --arg l "$2" '{version_label: $l}')")
+            echo "PATCH /skills/$1 version_label=$2 -> HTTP $code"
+            jq -c '{version_ordinal, version_label, title, detail, status}' "$work/patch.json" 2>/dev/null || head -c 600 "$work/patch.json"
+          }
+          name=version-label-patch-1015
 
-          echo "== 2. A new skill, version_label 0.1.0:"
-          upload version-label-probe-1015 0.1.0 "first"
-          probe=$(line version-label-probe-1015); echo "$probe" | show
-          id=$(echo "$probe" | jq -r '.id // empty')
+          echo "== 1. Upload version 1, then PATCH version_label 0.1.0:"
+          upload $name 0.1.0 "first"
+          id=$(line $name | jq -r '.id // empty'); echo "id=$id"
+          patch "$id" 0.1.0
+          echo "   skill:     $(get "/skills/$id" | show)"
+          echo "   version 1: $(get "/skills/$id/versions/1" | show)"
+          echo "   list row:  $(line $name | show)"
 
-          echo "== 3. The same skill again, version_label 0.1.1:"
-          upload version-label-probe-1015 0.1.1 "second"
-          [ -n "$id" ] && get "/skills/$id" | show
+          echo "== 2. Upload version 2 (no PATCH yet):"
+          upload $name 0.1.1 "second"
+          echo "   skill:     $(get "/skills/$id" | show)"
+          echo "   list row:  $(line $name | show)"
 
-          echo "== 4. The existing ordinal-only skill, version_label 0.1.0, same source identity:"
-          ident=$(echo "$existing" | jq -c '{source_type, source_id, source_uri} | with_entries(select(.value != null))')
-          upload aireg-migration-1015 0.1.0 "Say that Registry Sync published this skill with aireg. Labelled." "$ident"
-          line aireg-migration-1015 | show
+          echo "== 3. PATCH version_label 0.1.1 on the new head:"
+          patch "$id" 0.1.1
+          echo "   skill:     $(get "/skills/$id" | show)"
+          echo "   version 1: $(get "/skills/$id/versions/1" | show)"
+          echo "   version 2: $(get "/skills/$id/versions/2" | show)"
+          echo "   list row:  $(line $name | show)"
 
-          echo "== 5. Archive the probe skill:"
+          echo "== 4. Archive the probe skill:"
           [ -n "$id" ] && curl -sS -o /dev/null -w 'POST archive -> HTTP %{http_code}\n' -X POST -H "Authorization: Bearer $TOKEN" "$api/skills/$id/archive"
