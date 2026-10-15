@@ -37374,6 +37374,8 @@ const external_node_stream_promises_namespaceObject = __WEBPACK_EXTERNAL_createR
 ;// CONCATENATED MODULE: ./src/inputs.js
 
 
+// Beside aireg's own manifest.yml, which refuses keys it does not know; aireg itself never reads this file.
+const CONFIG_FILE = ".registry/config.yml";
 const KINDS = new Set(["skill", "agent"]);
 const WORKSPACE = /^[A-Za-z0-9_.-]{1,128}$/;
 const MAX_GLOBS = 100;
@@ -37397,31 +37399,59 @@ function globList(raw) {
     .filter(item => item !== "");
 }
 
-// `artifacts` maps a kind to globs, one line each: `skill: ["skills/**", "team-b/skills/**"]`
-// or `agent: "agents/**"`. A `- glob` list under the kind reads too.
-function parseRegistryInputs(environment = process.env) {
-  const workspace = common_getInput("workspace", environment);
-  if (!WORKSPACE.test(workspace)) throw new Error("workspace must be the Atlan workspace ID artifacts publish to");
-  const artifacts = {};
+// Flat `key: value` lines, each optionally followed by `- value` lines; each key appears once.
+function keyedLists(text, keys, usage) {
+  const lists = {};
   let current;
-  for (const raw of common_getInput("artifacts", environment).split("\n")) {
+  for (const raw of text.split("\n")) {
     const line = raw.trim();
     if (!line || line.startsWith("#")) continue;
     const item = /^-\s*(.+)$/.exec(line);
     if (item && current) {
-      artifacts[current].push(...globList(item[1].trim()));
+      lists[current].push(...globList(item[1].trim()));
       continue;
     }
     const match = /^([a-z]+)\s*:\s*(.*)$/.exec(line);
-    if (!match || !KINDS.has(match[1]) || artifacts[match[1]]) {
-      throw new Error("each artifacts line names skill or agent once, as in `skill: [\"skills/**\"]`");
-    }
+    if (!match || !keys.has(match[1]) || lists[match[1]]) throw new Error(usage);
     current = match[1];
-    artifacts[current] = match[2] ? globList(match[2]) : [];
+    lists[current] = match[2] ? globList(match[2]) : [];
+  }
+  return lists;
+}
+
+// The repository's own config: `version: 1`, its one `workspace`, and `skills:` as a list of globs.
+// Agents join with agent sync.
+function configSettings(text) {
+  const lists = keyedLists(text, new Set(["version", "workspace", "skills"]),
+    `${CONFIG_FILE} takes \`version: 1\`, \`workspace\` and \`skills\`, a list of globs such as "skills/**"`);
+  if (lists.version?.length !== 1 || lists.version[0] !== 1) throw new Error(`${CONFIG_FILE} must set \`version: 1\``);
+  if (lists.workspace?.length !== 1) {
+    throw new Error(`${CONFIG_FILE} must name exactly one workspace: a repository syncs with one workspace`);
+  }
+  return { workspace: lists.workspace[0], artifacts: { skill: lists.skills ?? [] } };
+}
+
+// `config` is the text of the repository's CONFIG_FILE, read by the caller from the commit it trusts. Without
+// one, the `workspace` and `artifacts` inputs say the same: `artifacts` maps a kind to globs, one line each,
+// `skill: ["skills/**", "team-b/skills/**"]` or `agent: "agents/**"`, or as a `- glob` list under the kind.
+function parseRegistryInputs(environment = process.env, config) {
+  const input = common_getInput("artifacts", environment);
+  const named = common_getInput("workspace", environment);
+  if (config !== undefined && (input || named)) {
+    throw new Error(`${CONFIG_FILE} names the workspace and skills, so leave the workspace and artifacts inputs unset`);
+  }
+  if (config === undefined && !input) {
+    throw new Error(`add ${CONFIG_FILE} with your workspace and skill folders, or set the workspace and artifacts inputs`);
+  }
+  const { workspace, artifacts } = config === undefined
+    ? { workspace: named, artifacts: keyedLists(input, KINDS, "each artifacts line names skill or agent once, as in `skill: [\"skills/**\"]`") }
+    : configSettings(config);
+  if (typeof workspace !== "string" || !WORKSPACE.test(workspace)) {
+    throw new Error("workspace must be the Atlan workspace ID artifacts publish to");
   }
   const globs = Object.values(artifacts).flat();
   if (globs.length === 0 || globs.length > MAX_GLOBS || !globs.every(safeGlob)) {
-    throw new Error(`artifacts must list 1-${MAX_GLOBS} repository-relative globs such as "skills/**"; brackets, braces and a trailing / are not supported`);
+    throw new Error(`${input ? "artifacts" : CONFIG_FILE} must list 1-${MAX_GLOBS} repository-relative globs such as "skills/**"; brackets, braces and a trailing / are not supported`);
   }
   return { workspace, artifacts };
 }
@@ -37733,6 +37763,23 @@ function trackedFiles(cwd) {
   return listed.stdout.split("\0").filter(Boolean);
 }
 
+// The repository's CONFIG_FILE when it tracks one: a regular file only, so a link cannot pull in another.
+function syncConfig(cwd, files) {
+  if (!files.includes(CONFIG_FILE)) return undefined;
+  const found = external_node_fs_namespaceObject.lstatSync(external_node_path_namespaceObject.join(cwd, CONFIG_FILE), { throwIfNoEntry: false });
+  if (!found?.isFile() || found.size > MAX_CONFIG_BYTES) {
+    throw new Error(`${CONFIG_FILE} must be a regular file of at most ${MAX_CONFIG_BYTES} bytes`);
+  }
+  return external_node_fs_namespaceObject.readFileSync(external_node_path_namespaceObject.join(cwd, CONFIG_FILE), "utf8");
+}
+
+// A changed config can cover skills whose files did not change. git exits 1 for a difference alone.
+function configChanged(cwd, sha) {
+  return (0,external_node_child_process_namespaceObject.spawnSync)("git", ["diff", "--quiet", sha, "HEAD", "--", CONFIG_FILE], {
+    cwd, env: { PATH: SYSTEM_PATH, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" }
+  }).status === 1;
+}
+
 // An agent is a tracked Markdown file with `name` and `description` front matter, so a README is skipped.
 // A SKILL.md never is: the CLI would publish its whole folder, and at the root that is the checkout.
 function agentFiles(cwd, files, globs = []) {
@@ -37847,12 +37894,13 @@ async function runPublishAction({
   const token = environment.ATLANAI_TOKEN;
   if (!token) throw new Error("ATLANAI_TOKEN must be supplied as a workflow secret");
   maskSecret(token, environment);
-  const inputs = parseRegistryInputs(environment);
   const cwd = resolveWorkingDirectory(environment);
   if (parseBoolean("prune", common_getInput("prune", environment) || "false")) {
     throw new Error("prune is not supported with aireg yet; set prune to false");
   }
   const files = trackedFiles(cwd);
+  const config = syncConfig(cwd, files);
+  const inputs = parseRegistryInputs(environment, config);
   // A tracked file can be missing from the checkout, as in a sparse checkout; it cannot publish.
   const skills = skillFolders(files, inputs.artifacts.skill).filter(folder => external_node_fs_namespaceObject.existsSync(external_node_path_namespaceObject.join(cwd, folder, "SKILL.md")));
   const paths = [...skills, ...agentFiles(cwd, files, inputs.artifacts.agent)];
@@ -37860,12 +37908,14 @@ async function runPublishAction({
   const unsafe = paths.find(item => /[*?[\]{}\\]|[+@!]\(/.test(item));
   if (unsafe) throw new Error(`${unsafe} contains glob characters, so it cannot be published as an exact path`);
   if (paths.length === 0) {
-    process.stdout.write("::notice title=Registry Sync::no tracked file matches the artifacts globs, so nothing was published\n");
+    process.stdout.write("::notice title=Registry Sync::no tracked file matches the skill globs, so nothing was published\n");
     common_setOutput("status", "success", environment);
     return;
   }
   const namespace = await workspaceName(token, inputs.workspace, registry);
-  const baseline = await publishBaseline({ environment, eventPayload, cwd, request, ancestor });
+  const since = await publishBaseline({ environment, eventPayload, cwd, request, ancestor });
+  // With no baseline, everything the config covers that differs from Atlan publishes.
+  const baseline = since && config !== undefined && configChanged(cwd, since) ? undefined : since;
   const { binary, directory, version } = await install({ environment });
   try {
     const publisher = publisherEnvironment(environment, token, directory, [PUBLISH_ALIAS]);
@@ -38234,6 +38284,21 @@ async function readRepositoryFile({ token, context, request, filename, ref, maxB
   return decodeBase64Content(response, maxBytes);
 }
 
+// The repository's CONFIG_FILE at `ref`: undefined when that commit has none, else its settings or why they are invalid.
+async function readSyncConfig({ token, context, request, ref, environment, source }) {
+  let text;
+  try {
+    text = await readRepositoryFile({ token, context, request, filename: CONFIG_FILE, ref, maxBytes: MAX_CONFIG_BYTES });
+  } catch (error) {
+    return error?.status === 404 ? undefined : { error: `the ${source} ${CONFIG_FILE} could not be read` };
+  }
+  try {
+    return { inputs: parseRegistryInputs(environment, text) };
+  } catch (error) {
+    return { error: `in the ${source} commit, ${error instanceof Error ? error.message : "the config is invalid"}` };
+  }
+}
+
 async function readRepositoryTree({ token, context, request, ref = context.headSha }) {
   const response = await request({
     token,
@@ -38565,7 +38630,14 @@ function eligibleChanges(files, config) {
   return { eligible, excluded };
 }
 
-async function buildPreflightReport({ token, context, request, registryToken, registry = registryRequest, inputs }) {
+async function buildPreflightReport({ token, context, request, registryToken, registry = registryRequest, inputs, environment }) {
+  const fromInput = Boolean(inputs);
+  // Without the artifacts input, the base commit's CONFIG_FILE says what is checked; a pull request cannot change it.
+  const baseConfig = !fromInput && environment && context.baseSha
+    ? await readSyncConfig({ token, context, request, ref: context.baseSha, environment, source: "base" })
+    : undefined;
+  if (baseConfig?.inputs) inputs = baseConfig.inputs;
+  let configError = baseConfig?.error;
   let fileResult;
   try {
     fileResult = await listPullRequestFiles({ token, context, request });
@@ -38575,11 +38647,15 @@ async function buildPreflightReport({ token, context, request, registryToken, re
     fileResult = { files: [], limited: true };
   }
 
+  const touches = name => fileResult.files.some(file => file.filename === name || file.previousFilename === name);
+  const syncFile = !fromInput && (baseConfig !== undefined || touches(CONFIG_FILE));
   let config;
   let baseTree;
   let treeFiles;
   if (!context.baseSha || !context.headSha) {
     config = { valid: false, reason: "GitHub did not provide both pull request commit IDs" };
+  } else if (configError) {
+    config = { valid: false, reason: configError };
   } else if (inputs) {
     // Globs reach any depth, so the skill folders come from the trees, not from a path's shape.
     try {
@@ -38590,9 +38666,15 @@ async function buildPreflightReport({ token, context, request, registryToken, re
       baseTree = base;
       treeFiles = head;
       config = preflightConfig(inputs, [...base.keys(), ...head.keys()]);
+      if (fromInput && base.has(CONFIG_FILE)) {
+        configError = `${CONFIG_FILE} names the workspace and skills, so leave the workspace and artifacts inputs unset`;
+        config = { valid: false, reason: configError };
+      }
     } catch {
       config = { valid: false, reason: "GitHub could not provide the pull request's file trees" };
     }
+  } else if (syncFile) {
+    config = { valid: false, reason: `${CONFIG_FILE} is new in this pull request` };
   } else {
     try {
       config = parseSkillSyncConfig(await readRepositoryFile({ token, context, request, filename: ".atlan/package.json", ref: context.baseSha, maxBytes: MAX_CONFIG_BYTES }));
@@ -38601,10 +38683,15 @@ async function buildPreflightReport({ token, context, request, registryToken, re
     }
   }
 
-  const configChanged = !inputs && fileResult.files.some(file => file.filename === ".atlan/package.json" ||
-    file.previousFilename === ".atlan/package.json");
+  const configChanged = !fromInput && touches(syncFile ? CONFIG_FILE : ".atlan/package.json");
   let proposedConfig;
-  if (configChanged && context.headSha) {
+  if (configChanged && context.headSha && syncFile) {
+    const proposed = await readSyncConfig({ token, context, request, ref: context.headSha, environment, source: "proposed" });
+    proposedConfig = proposed?.inputs
+      ? preflightConfig(proposed.inputs, [])
+      : { valid: false, reason: proposed?.error ?? `this pull request removes ${CONFIG_FILE}, which names the workspace and skills` };
+    if (!proposedConfig.valid) configError ??= proposedConfig.reason;
+  } else if (configChanged && context.headSha) {
     try {
       proposedConfig = parseSkillSyncConfig(await readRepositoryFile({ token, context, request, filename: ".atlan/package.json", ref: context.headSha, maxBytes: MAX_CONFIG_BYTES }), "proposed");
     } catch {
@@ -38627,9 +38714,9 @@ async function buildPreflightReport({ token, context, request, registryToken, re
       supportingAnalysisUnavailable = supportingOnly.length > 0;
     }
   }
-  const proposedSkillCount = proposedConfig?.valid && treeFiles
-    ? declaredSkillCount(treeFiles.keys(), proposedConfig)
-    : undefined;
+  const proposedSkillCount = !proposedConfig?.valid || !treeFiles ? undefined
+    : syncFile ? skillFolders([...treeFiles.keys()], proposedConfig.paths).length
+      : declaredSkillCount(treeFiles.keys(), proposedConfig);
   const eligible = changes.eligible.filter(file => file.definitionChanged || treeFiles?.has(file.filename));
   const supporting = eligible.reduce((count, file) => count + file.supportingChanges, 0);
   // The Registry's front-matter contract, checked before merge. Independent of the Registry comparison: it needs
@@ -38638,7 +38725,7 @@ async function buildPreflightReport({ token, context, request, registryToken, re
   // run unchecked rather than passing it.
   const rejections = [];
   const present = eligible.filter(file => file.status !== "removed");
-  let unchecked = inputs && !config.valid ? config.reason : undefined;
+  let unchecked = !configError && inputs && !config.valid ? config.reason : undefined;
   if (!unchecked && present.length > 0) {
     try {
       if (!context.headSha) throw new Error("GitHub did not provide the pull request's head commit");
@@ -38715,6 +38802,9 @@ async function buildPreflightReport({ token, context, request, registryToken, re
   return {
     context,
     available: true,
+    configured: Boolean(inputs),
+    configError,
+    setup: syncFile && !baseConfig && !configError,
     config,
     configChanged,
     proposedConfig,
@@ -38943,7 +39033,9 @@ function formatPreflightComment(report, compact = false) {
   const notCompared = state === "unavailable" || state === "unconfigured"
     ? []
     : notComparedSkills(report).filter(file => !rejectionFor(report, file));
-  const verdict = rejected.length > 0
+  const verdict = report.configError ? `⛔ Fix \`${CONFIG_FILE}\``
+    : report.setup ? `✅ \`${CONFIG_FILE}\` is ready`
+    : rejected.length > 0
     ? `⛔ ${plural(rejected.length, "skill")} will be rejected by the Registry`
     : report.unchecked ? "⛔ Preflight could not check this pull request"
     : state === "conflict"
@@ -38958,6 +39050,11 @@ function formatPreflightComment(report, compact = false) {
     ? `${actionBadge({ href: codexHandoffUrl(resolutionPrompt), light: CODEX_BADGE_URL, dark: CODEX_BADGE_DARK_URL, alt: "Fix in Codex" })} ${actionBadge({ href: claudeHandoffUrl(report, resolutionPrompt), light: CLAUDE_BADGE_URL, dark: CLAUDE_BADGE_DARK_URL, alt: "Fix in Claude Code" })} **[Fix in Claude.ai](${claudeWebHandoffUrl(report, resolutionPrompt)})**`
     : "";
   const lines = [PREFLIGHT_MARKER, `### ${verdict}`, ""];
+  if (report.configError) {
+    lines.push(`${tableCell(report.configError)}. The check fails until the config is fixed.`, "");
+  } else if (report.setup) {
+    lines.push(`Registry Sync checks and publishes the skills it lists once this merges${Number.isSafeInteger(report.proposedSkillCount) ? `: ${plural(report.proposedSkillCount, "skill")} today` : ""}.`, "");
+  }
   if (report.unchecked) {
     lines.push(`${tableCell(report.unchecked)}, so the check fails rather than let unchecked skills merge. Rerun it; if it fails again, check the workflow's access to this repository.`, "");
   }
@@ -39047,7 +39144,7 @@ function formatPreflightComment(report, compact = false) {
     );
   }
 
-  if (state === "unavailable" && !report.unchecked) {
+  if (state === "unavailable" && !report.unchecked && !report.configError && !report.setup) {
     lines.push("We couldn't compare this PR with Atlan. Check the Registry token or workflow configuration, then retry.");
   } else if (state !== "conflict") {
     const tail = [];
@@ -39109,13 +39206,15 @@ async function runPreflight({ environment = process.env, request = githubRequest
     request: budgetedRequest,
     registryToken,
     registry,
-    inputs
+    inputs,
+    environment
   });
   report.failOnConflict = failOnConflict;
-  // A pull request that touches no listed folder gets no comment, unless an earlier run already left one.
-  // A run that could not read the trees says so rather than passing quietly.
-  const untouched = Boolean(inputs) && report.available && report.config?.valid && report.eligible.length === 0 && !existing;
-  if (inputs && !report.config?.valid) {
+  // A pull request that touches no listed folder and not the config gets no comment, unless an earlier run already
+  // left one. A run that could not read the trees says so rather than passing quietly.
+  const untouched = Boolean(report.configured) && report.available && report.config?.valid && report.eligible.length === 0 &&
+    !report.configChanged && !report.configError && !existing;
+  if (report.configured && !report.config?.valid) {
     process.stdout.write(`::warning title=Atlan Agent Registry preflight::${report.config?.reason || "the pull request could not be checked"}\n`);
   }
   if (commenting && !untouched) {
@@ -39136,6 +39235,7 @@ async function runPreflight({ environment = process.env, request = githubRequest
   if (shouldBlockConflicts(report.conflictCount, failOnConflict)) {
     throw new Error(`${plural(report.conflictCount, "Registry conflict")} must be resolved before this check can pass`);
   }
+  if (report.configError) throw new Error(report.configError);
   // Atlan would refuse these on main, so the pull request stops first.
   if (report.rejections?.length > 0) {
     throw new Error(`${plural(report.rejections.length, "skill")} the Registry would reject must be fixed before this check can pass`);

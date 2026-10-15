@@ -8,11 +8,11 @@ branding:
 
 inputs:
   workspace:
-    description: Atlan workspace ID that artifacts publish to and preflight compares with.
-    required: true
+    description: Atlan workspace ID that artifacts publish to and preflight compares with. Leave it unset when the repository's `.registry/config.yml` names the workspace.
+    required: false
   artifacts:
-    description: "Globs per kind, one line each, for example `skill: [\"skills/**\", \"team-b/skills/**\"]` and `agent: \"agents/**\"`. Only tracked files match."
-    required: true
+    description: "Globs per kind, one line each, for example `skill: [\"skills/**\", \"team-b/skills/**\"]` and `agent: \"agents/**\"`. Only tracked files match. Leave it unset when the repository's `.registry/config.yml` lists the skills; setting both is an error."
+    required: false
   preflight:
     description: Check pull requests before they merge. Preflight validates each changed skill and compares it with the Registry; publishing leaves validation to the Registry.
     required: false
