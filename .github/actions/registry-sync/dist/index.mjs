@@ -38290,12 +38290,12 @@ async function readSyncConfig({ token, context, request, ref, environment, sourc
   try {
     text = await readRepositoryFile({ token, context, request, filename: CONFIG_FILE, ref, maxBytes: MAX_CONFIG_BYTES });
   } catch (error) {
-    return error?.status === 404 ? undefined : { error: `the ${source} ${CONFIG_FILE} could not be read` };
+    return error?.status === 404 ? undefined : { error: `The ${source} ${CONFIG_FILE} could not be read` };
   }
   try {
     return { inputs: parseRegistryInputs(environment, text) };
   } catch (error) {
-    return { error: `in the ${source} commit, ${error instanceof Error ? error.message : "the config is invalid"}` };
+    return { error: `In the ${source} commit, ${error instanceof Error ? error.message : "the config is invalid"}` };
   }
 }
 
@@ -38689,7 +38689,7 @@ async function buildPreflightReport({ token, context, request, registryToken, re
     const proposed = await readSyncConfig({ token, context, request, ref: context.headSha, environment, source: "proposed" });
     proposedConfig = proposed?.inputs
       ? preflightConfig(proposed.inputs, [])
-      : { valid: false, reason: proposed?.error ?? `this pull request removes ${CONFIG_FILE}, which names the workspace and skills` };
+      : { valid: false, reason: proposed?.error ?? `This pull request removes ${CONFIG_FILE}, which names the workspace and skills` };
     if (!proposedConfig.valid) configError ??= proposedConfig.reason;
   } else if (configChanged && context.headSha) {
     try {
@@ -38697,6 +38697,12 @@ async function buildPreflightReport({ token, context, request, registryToken, re
     } catch {
       proposedConfig = { valid: false, reason: "the proposed .atlan/package.json could not be read" };
     }
+  }
+  // A widened config covers skills the base does not. They are checked here too, so the pull request that widens it
+  // cannot merge a skill Atlan would refuse; what they are compared with still comes from the base.
+  if (syncFile && config.valid && proposedConfig?.valid && treeFiles) {
+    const widened = skillFolders([...treeFiles.keys()], proposedConfig.paths);
+    config = { ...config, folders: new Set([...config.folders, ...widened]) };
   }
 
   let changes = eligibleChanges(fileResult.files, config);
