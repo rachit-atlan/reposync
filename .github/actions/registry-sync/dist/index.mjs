@@ -29317,6 +29317,11 @@ const MAX_COMMENT_PAGES = 20;
 const PR_FILE_PAGE_SIZE = 100;
 const MAX_PR_FILE_PAGES = 2;
 const MAX_ANALYZED_PR_FILES = PR_FILE_PAGE_SIZE * MAX_PR_FILE_PAGES;
+const MAX_CONFIG_BYTES = 256 * 1024;
+// Configuration arrays are parsed from both trusted base and untrusted pull-request head commits.
+// Keep cardinality bounded before any collection-wide validation or changed-file classification.
+const MAX_SKILL_ROOTS = 500;
+const MAX_EXCLUDED_SKILLS = 500;
 const MAX_ANALYZED_SKILLS = 5;
 // Changed SKILL.md files read per GraphQL query, and the file bytes one query may return (JSON can double them).
 const MAX_DEFINITIONS_PER_QUERY = 50;
@@ -29340,36 +29345,37 @@ const SKILL_FIELD_LIMITS = Object.freeze({ license: 1024, when_to_use: 1024, com
 const SKILL_LIFECYCLES = Object.freeze(["draft", "active", "deprecated"]);
 const MAX_DIGEST_BLOBS = 20;
 const MAX_DIGEST_BYTES = 4 * 1024 * 1024;
-// One identity read, up to MAX_COMMENT_PAGES comment pages, MAX_PR_FILE_PAGES file pages, three tree reads, a config
-// read, a merge-base read, MAX_DIGEST_BLOBS blob reads, and one comment write. SKILL.md validation is outside it: it
-// reads every changed file, a batch per query, so its cost is bounded by the pull request, not by a fixed count.
+const MAX_DISPLAYED_ROOTS = 10;
+// One identity read, up to MAX_COMMENT_PAGES comment pages, MAX_PR_FILE_PAGES file pages, two configuration reads,
+// two tree reads, MAX_DIGEST_BLOBS blob reads, and one comment write. SKILL.md validation is outside it: it reads
+// every changed file, a batch per query, so its cost is bounded by the pull request, not by a fixed count.
 const MAX_PREFLIGHT_REQUESTS = 80;
 const MAX_REGISTRY_REQUESTS = 24;
 const MAX_REGISTRY_RESPONSE_BYTES = 2 * 1024 * 1024;
+const MAX_WORKSPACES = 20;
 const MAX_REMOTE_SKILLS = 500;
 const SHA256 = /^[a-f0-9]{64}$/;
 const COMMIT_SHA = /^[a-f0-9]{40}$/i;
-// git runs from the system path with no system or global config, so a runner's git settings cannot redirect it.
-const GIT_ENVIRONMENT = Object.freeze({ PATH: "/usr/bin:/bin", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" });
 const RELEASE_VERSION = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
 const SAFE_PATH = /^(?=.{1,240}$)(?!\/)(?!.*\/$)(?!.*\/\/)(?!.*(?:^|\/)\.{1,2}(?:\/|$))[^`|\\\u0000-\u001F\u007F]+$/u;
 
 // Registry Sync has one approved Registry endpoint. Keep it Action-owned so a
 // consumer workflow cannot redirect its scoped publish credential elsewhere.
 const PUBLISH_GATEWAY = "https://api.atlan.com";
-// One reviewed, version-addressed Registry CLI release, pinned by SHA-256. It only
-// starts the install: its self-update fetches the newest release from the signed channel.
-const CLI_ORIGIN = "https://app.atlan.com";
-const CLI_ARTIFACT_PATH = "/registry/cli/artifacts/v";
-const CLI_VERSION = "0.1.24";
+// One reviewed, version-addressed aireg release, pinned by SHA-256 as its SHA256SUMS and
+// installer list it. It only starts the install: `aireg self update` fetches the newest
+// release from the signed channel.
+const CLI_ORIGIN = "https://aireg.sh";
+const CLI_ARTIFACT_PATH = "/artifacts/v";
+const CLI_VERSION = "0.1.2";
 const CLI_SHA256 = Object.freeze({
-  "darwin-amd64": "5dfede312b7d5e7fe530b6b8f7f8cdcdd962f0bdda04e1c2fffa3fcb2812e143",
-  "darwin-arm64": "5df0f03df9027ae3a6428babbae6a7ad370ca0a281dbd602291253499f30843f",
-  "linux-amd64": "f046c22b3b54c57349f108f49f19cc26c33185fde6bab99d901fd9221175d446",
-  "linux-arm64": "73ad36fe0a65a41937faad424eb002b19df4ce0c43e492dc9a5a84aac155f23e"
+  "darwin-amd64": "07a8f5c259ff13780db807543d279e4dbe535d8c8db5c7fe9263d47b166f783e",
+  "darwin-arm64": "b2eb5347b3e92e55cf9e4758ab3aeba320899d44b408fc46e9b61ae9c38e139d",
+  "linux-amd64": "353c7ad92efea87d12e22bfdaba00f545317ea926791bd859eb8fe6407269785",
+  "linux-arm64": "0ca1cc37e8bf9559a7875ac27f740d179e60b20132e661a5a64a1923ee1d5d6c"
 });
-// Unversioned, so the CLI installs the newest adapter; it verifies the signed release
-// manifest and digest before any token is present.
+// Unversioned, so aireg installs the newest adapter; it verifies the signed release
+// before any token is present.
 const ADAPTER = "atlan";
 const GITHUB_API_BASE_URL = "https://api.github.com";
 const GITHUB_API_VERSION = "2026-03-10";
@@ -37368,14 +37374,13 @@ const external_node_stream_promises_namespaceObject = __WEBPACK_EXTERNAL_createR
 ;// CONCATENATED MODULE: ./src/inputs.js
 
 
+const KINDS = new Set(["skill", "agent"]);
 const WORKSPACE = /^[A-Za-z0-9_.-]{1,128}$/;
 const MAX_GLOBS = 100;
-const CONFIG_PATH = ".atlan/config.yml";
-const MAX_CONFIG_BYTES = 64 * 1024;
 
 function safeGlob(value) {
   return typeof value === "string" && value.length > 0 && value.length <= 200 && !value.startsWith("/") &&
-    !value.endsWith("/") && !/[\\\0\r\n[\]{}`]/.test(value) && !value.split("/").some(part => part === "..");
+    !value.endsWith("/") && !/[\\\0\r\n[\]{}]/.test(value) && !value.split("/").some(part => part === "..");
 }
 
 // JSON, an unquoted list such as `[skills/**, agents/**]`, or one glob; a trailing `# comment` is dropped.
@@ -37392,39 +37397,33 @@ function globList(raw) {
     .filter(item => item !== "");
 }
 
-function parseWorkspace(environment = process.env) {
+// `artifacts` maps a kind to globs, one line each: `skill: ["skills/**", "team-b/skills/**"]`
+// or `agent: "agents/**"`. A `- glob` list under the kind reads too.
+function parseRegistryInputs(environment = process.env) {
   const workspace = common_getInput("workspace", environment);
   if (!WORKSPACE.test(workspace)) throw new Error("workspace must be the Atlan workspace ID artifacts publish to");
-  return workspace;
-}
-
-function assertGlobs(globs, source) {
-  if (globs.length === 0 || globs.length > MAX_GLOBS || !globs.every(safeGlob)) {
-    throw new Error(`${source} must list 1-${MAX_GLOBS} repository-relative globs such as "skills/**"; brackets, braces and a trailing / are not supported`);
-  }
-}
-
-// `.atlan/config.yml` is `version: 1` and a `skills` list of globs, inline or as `- glob` lines. Only that subset of
-// YAML reads, and a key this version does not know fails rather than being skipped.
-function parseConfig(text) {
-  const config = {};
-  let list;
-  for (const [index, raw] of text.split(/\r?\n/).entries()) {
-    const line = raw.replace(/(?:^|\s+)#.*$/, "").trimEnd();
-    if (!line) continue;
-    const item = /^\s*-\s+(.+)$/.exec(line);
-    if (item && list) {
-      list.push(...globList(item[1]));
+  const artifacts = {};
+  let current;
+  for (const raw of common_getInput("artifacts", environment).split("\n")) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const item = /^-\s*(.+)$/.exec(line);
+    if (item && current) {
+      artifacts[current].push(...globList(item[1].trim()));
       continue;
     }
-    const entry = /^(version|skills):(?:\s+(.*))?$/.exec(line);
-    if (!entry || entry[1] in config) throw new Error(`${CONFIG_PATH} line ${index + 1}: expected \`version: 1\` and a \`skills\` list, once each`);
-    config[entry[1]] = entry[1] === "version" ? entry[2] : entry[2] ? globList(entry[2]) : [];
-    list = entry[1] === "skills" && !entry[2] ? config.skills : undefined;
+    const match = /^([a-z]+)\s*:\s*(.*)$/.exec(line);
+    if (!match || !KINDS.has(match[1]) || artifacts[match[1]]) {
+      throw new Error("each artifacts line names skill or agent once, as in `skill: [\"skills/**\"]`");
+    }
+    current = match[1];
+    artifacts[current] = match[2] ? globList(match[2]) : [];
   }
-  if (!/^(["']?)1\1$/.test(config.version ?? "")) throw new Error(`${CONFIG_PATH} must say \`version: 1\``);
-  assertGlobs(config.skills ?? [], `${CONFIG_PATH} \`skills\``);
-  return { skills: config.skills };
+  const globs = Object.values(artifacts).flat();
+  if (globs.length === 0 || globs.length > MAX_GLOBS || !globs.every(safeGlob)) {
+    throw new Error(`artifacts must list 1-${MAX_GLOBS} repository-relative globs such as "skills/**"; brackets, braces and a trailing / are not supported`);
+  }
+  return { workspace, artifacts };
 }
 
 // `**` crosses folders; `*` and `?` stay inside one.
@@ -37465,19 +37464,17 @@ function skillFolders(files, globs = []) {
   return sorted.filter(folder => !sorted.some(outer => folder.startsWith(`${outer}/`)));
 }
 
-// A glob that matches no skill is almost always a typo, and the skills it was meant for would quietly stop syncing.
-function assertGlobsMatch(files, globs) {
-  const skills = files.filter(file => file.endsWith("/SKILL.md"));
-  const unmatched = globs.find(glob => {
-    const pattern = globPattern(glob);
-    return !skills.some(file => pattern.test(file) || pattern.test(file.slice(0, -"/SKILL.md".length)));
-  });
-  if (unmatched) throw new Error(`\`${unmatched}\` in ${CONFIG_PATH} matches no skill folder; fix the glob or remove it`);
-}
-
-// Preflight's view of the config: the skill folders, found in the pull request's trees.
-function preflightConfig({ workspace, skills }, files) {
-  return { valid: true, folders: new Set(skillFolders(files, skills)), workspaces: new Set([workspace]), workspaceCount: 1 };
+// Preflight's view of the inputs: the skill folders, found in the pull request's trees.
+function preflightConfig({ workspace, artifacts }, files) {
+  const folders = skillFolders(files, artifacts.skill);
+  return {
+    valid: true,
+    paths: artifacts.skill ?? [],
+    folders: new Set(folders),
+    exclude: new Set(),
+    workspaces: new Set([workspace]),
+    workspaceCount: 1
+  };
 }
 
 ;// CONCATENATED MODULE: ./src/publish-baseline.js
@@ -37485,77 +37482,38 @@ function preflightConfig({ workspace, skills }, files) {
 
 
 
-
 const RUN_PAGE_SIZE = 30;
 
 function isAncestor(cwd, sha) {
-  return (0,external_node_child_process_namespaceObject.spawnSync)("git", ["merge-base", "--is-ancestor", sha, "HEAD"], { cwd, env: { ...GIT_ENVIRONMENT } }).status === 0;
-}
-
-// The workflow file and the config name what publishes and where, so a change to either can cover skills whose
-// files did not change.
-function settingsChanged(cwd, sha, environment) {
-  const ref = /^[^/]+\/[^/]+\/(.+)@/.exec(environment.GITHUB_WORKFLOW_REF || "")?.[1];
-  const listed = (0,external_node_child_process_namespaceObject.spawnSync)("git", ["diff", "--quiet", sha, "HEAD", "--", ref || ".github/workflows", CONFIG_PATH], { cwd, env: { ...GIT_ENVIRONMENT } });
-  return listed.status !== 0;
-}
-
-// A rerun replays its own commit. Once the default branch has moved on, that would publish older skills over newer
-// ones and leave Atlan behind the repository, so only a rerun of the branch's latest commit goes ahead. Undoing a
-// change is a revert on the default branch, which preflight checks like any other.
-async function assertCurrentRerun({ environment, eventPayload, request = githubRequest }) {
-  if (!(Number(environment.GITHUB_RUN_ATTEMPT) > 1)) return;
-  const instead = "run Registry Sync manually from the default branch instead";
-  const token = common_getInput("github-token", environment);
-  const repository = environment.GITHUB_REPOSITORY || "";
-  const branch = eventPayload?.repository?.default_branch;
-  let tip;
-  if (token && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository) && typeof branch === "string") {
-    const ref = branch.split("/").map(encodeURIComponent).join("/");
-    tip = await request({ token, method: "GET", requestPath: `/repos/${repository}/git/ref/heads/${ref}`, expectedStatus: 200 })
-      .then(found => found?.object?.sha, () => undefined);
-  }
-  if (typeof tip !== "string" || !COMMIT_SHA.test(tip)) {
-    throw new Error(`this rerun could not confirm the default branch's latest commit, so it did not publish; ${instead}`);
-  }
-  const sha = environment.GITHUB_SHA || "";
-  if (tip.toLowerCase() !== sha.toLowerCase()) {
-    throw new Error(`this rerun is for ${sha.slice(0, 7)}, but ${branch} has moved on to ${tip.slice(0, 7)}, so publishing it would put older skills over newer ones; ${instead}`);
-  }
+  return (0,external_node_child_process_namespaceObject.spawnSync)("git", ["merge-base", "--is-ancestor", sha, "HEAD"], {
+    cwd, env: { PATH: "/usr/bin:/bin", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" }
+  }).status === 0;
 }
 
 // The commit a push publishes changes since: the last run that finished publishing, not the push's parent. GitHub
 // cancels a run still waiting in the concurrency group when a newer one arrives, so its changes would otherwise
-// never publish. A failed run is not retried here: its pull request is told how to publish it.
-// Without `actions: read`, or with no earlier run, the push's parent stands in. When the workflow file or the config
-// changed, there is no baseline, and everything that differs publishes.
-async function publishBaseline({
-  environment, eventPayload, cwd, request = githubRequest, ancestor = isAncestor, changed = settingsChanged
-}) {
+// never publish. A failed run is not retried here: its pull request is told, and a rerun publishes it.
+// Without `actions: read`, or with no earlier run, the push's parent stands in.
+async function publishBaseline({ environment, eventPayload, cwd, request = githubRequest, ancestor = isAncestor }) {
   const before = eventPayload?.before;
   const parent = typeof before === "string" && COMMIT_SHA.test(before) && !/^0+$/.test(before) ? before : undefined;
-  const baseline = parent && (await lastFinishedRun({ environment, eventPayload, cwd, request, ancestor }) ?? parent);
-  return baseline && changed(cwd, baseline, environment) ? undefined : baseline;
-}
-
-async function lastFinishedRun({ environment, eventPayload, cwd, request, ancestor }) {
   const token = common_getInput("github-token", environment);
   const repository = environment.GITHUB_REPOSITORY || "";
   const branch = eventPayload?.repository?.default_branch;
-  if (!token || !/^\d{1,20}$/.test(environment.GITHUB_RUN_ID || "") ||
-      !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository) || typeof branch !== "string") return undefined;
+  if (!parent || !token || !/^\d{1,20}$/.test(environment.GITHUB_RUN_ID || "") ||
+      !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository) || typeof branch !== "string") return parent;
   try {
     const run = await request({ token, method: "GET", requestPath: `/repos/${repository}/actions/runs/${environment.GITHUB_RUN_ID}`, expectedStatus: 200 });
-    if (!Number.isSafeInteger(run?.workflow_id)) return undefined;
+    if (!Number.isSafeInteger(run?.workflow_id)) return parent;
     const query = new URLSearchParams({ branch, status: "completed", per_page: String(RUN_PAGE_SIZE) });
     const listed = await request({ token, method: "GET", requestPath: `/repos/${repository}/actions/workflows/${run.workflow_id}/runs?${query}`, expectedStatus: 200 });
-    return (Array.isArray(listed?.workflow_runs) ? listed.workflow_runs : []).find(candidate =>
-      candidate?.id !== Number(environment.GITHUB_RUN_ID) &&
+    const finished = (Array.isArray(listed?.workflow_runs) ? listed.workflow_runs : []).find(candidate =>
       ["success", "failure"].includes(candidate?.conclusion) && ["push", "workflow_dispatch"].includes(candidate.event) &&
-      typeof candidate.head_sha === "string" && COMMIT_SHA.test(candidate.head_sha) && ancestor(cwd, candidate.head_sha))?.head_sha;
+      typeof candidate.head_sha === "string" && COMMIT_SHA.test(candidate.head_sha) && ancestor(cwd, candidate.head_sha));
+    return finished?.head_sha ?? parent;
   } catch {
     process.stdout.write("::notice title=Registry Sync::earlier runs could not be read, so this push publishes only its own changes; grant the job actions: read\n");
-    return undefined;
+    return parent;
   }
 }
 
@@ -37591,10 +37549,13 @@ const PUBLISH_ENVIRONMENT_KEYS = [
 ];
 
 const SYSTEM_PATH = "/usr/bin:/bin";
-const MANIFEST = "registry.yml";
-const SELF_UPDATE_ARGUMENTS = Object.freeze(["self-update", "--json"]);
-const ADAPTER_ARGUMENTS = Object.freeze(["adapter", "install", ADAPTER]);
+const SELF_UPDATE_ARGUMENTS = Object.freeze(["self", "update", "--json"]);
+// Without a terminal, aireg installs an adapter it does not trust only when told to.
+const ADAPTER_ARGUMENTS = Object.freeze(["adapter", "install", ADAPTER, "--yes"]);
 const PUBLISH_ALIAS = "atlan";
+// Declared in the Action-owned user scope, so the token's only destination is the fixed gateway
+// and nothing is written into the repository.
+const REGISTRY_ARGUMENTS = Object.freeze(["registry", "add", PUBLISH_GATEWAY, "--as", PUBLISH_ALIAS, "--adapter", ADAPTER, "-g"]);
 const MAX_CLI_OUTPUT_BYTES = 64 * 1024;
 
 const CLI_OS = { linux: "linux", darwin: "darwin" };
@@ -37614,7 +37575,7 @@ function resolveCliPlatform(platform = process.platform, arch = process.arch) {
   }
   const target = `${CLI_OS[platform]}-${CLI_ARCH[arch]}`;
   if (!Object.hasOwn(CLI_SHA256, target)) {
-    throw new Error(`the Action does not pin a Registry CLI for ${target}`);
+    throw new Error(`the Action does not pin aireg for ${target}`);
   }
   return target;
 }
@@ -37653,7 +37614,7 @@ function writeBoundedCli(response, destination, createDestination = external_nod
     transform(chunk, _encoding, callback) {
       received += chunk.length;
       callback(received > MAX_CLI_BYTES
-        ? new Error("Registry CLI download exceeds the size limit")
+        ? new Error("aireg download exceeds the size limit")
         : null, chunk);
     }
   });
@@ -37666,23 +37627,23 @@ async function verifyCliDigest(binary, expectedDigest) {
   }
   const metadata = await promises_namespaceObject.lstat(binary);
   if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > MAX_CLI_BYTES) {
-    throw new Error("Registry CLI is not a bounded regular file");
+    throw new Error("aireg is not a bounded regular file");
   }
   const hash = (0,external_node_crypto_.createHash)("sha256");
   for await (const chunk of external_node_fs_namespaceObject.createReadStream(binary)) hash.update(chunk);
   if (!(0,external_node_crypto_.timingSafeEqual)(hash.digest(), Buffer.from(expectedDigest, "hex"))) {
-    throw new Error("Registry CLI digest does not match the Action-pinned digest");
+    throw new Error("aireg digest does not match the Action-pinned digest");
   }
 }
 
 function cliArtifactURL(target, version = CLI_VERSION) {
-  if (!Object.hasOwn(CLI_SHA256, target)) throw new Error("Registry CLI platform is not pinned");
+  if (!Object.hasOwn(CLI_SHA256, target)) throw new Error("aireg platform is not pinned");
   if (!RELEASE_VERSION.test(version)) throw new Error("Action-pinned CLI version is invalid");
-  return `${CLI_ORIGIN}${CLI_ARTIFACT_PATH}${version}/registry-${target}`;
+  return `${CLI_ORIGIN}${CLI_ARTIFACT_PATH}${version}/aireg-${target}`;
 }
 
 const CLI_URL_PATHNAME = new RegExp(
-  `^${CLI_ARTIFACT_PATH}(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)/registry-(?:darwin|linux)-(?:amd64|arm64)$`
+  `^${CLI_ARTIFACT_PATH}(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)/aireg-(?:darwin|linux)-(?:amd64|arm64)$`
 );
 
 function validateCliURL(cliURL) {
@@ -37690,13 +37651,13 @@ function validateCliURL(cliURL) {
   try {
     url = new URL(cliURL);
   } catch {
-    throw new Error("Registry CLI URL must be valid HTTPS");
+    throw new Error("aireg URL must be valid HTTPS");
   }
   if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash || !CLI_URL_PATHNAME.test(url.pathname)) {
-    throw new Error("Registry CLI URL must be a clean HTTPS version-addressed artifact URL");
+    throw new Error("aireg URL must be a clean HTTPS version-addressed artifact URL");
   }
   if (url.origin !== CLI_ORIGIN) {
-    throw new Error("Registry CLI host is not approved");
+    throw new Error("aireg host is not approved");
   }
 }
 
@@ -37709,23 +37670,23 @@ function downloadCli(url, destination) {
     }, response => {
       if (response.statusCode >= 300 && response.statusCode < 400) {
         response.resume();
-        reject(new Error("Registry CLI download redirected; refusing an unapproved source"));
+        reject(new Error("aireg download redirected; refusing an unapproved source"));
         return;
       }
       if (response.statusCode !== 200) {
         response.resume();
-        reject(new Error(`Registry CLI download failed with HTTP ${response.statusCode}`));
+        reject(new Error(`aireg download failed with HTTP ${response.statusCode}`));
         return;
       }
       const declaredSize = Number(response.headers["content-length"] || 0);
       if (declaredSize > MAX_CLI_BYTES) {
         response.resume();
-        reject(new Error("Registry CLI download exceeds the size limit"));
+        reject(new Error("aireg download exceeds the size limit"));
         return;
       }
       void writeBoundedCli(response, destination).then(resolve, reject);
     });
-    request.on("timeout", () => request.destroy(new Error("Registry CLI download timed out")));
+    request.on("timeout", () => request.destroy(new Error("aireg download timed out")));
     request.on("error", reject);
   });
 }
@@ -37738,7 +37699,8 @@ function runtimeEnvironment(environment, keys, runtimeDirectory) {
   return {
     ...allowed,
     HOME: runtimeDirectory,
-    REGISTRY_HOME: external_node_path_namespaceObject.join(runtimeDirectory, ".registry"),
+    AIREG_HOME: external_node_path_namespaceObject.join(runtimeDirectory, ".aireg"),
+    AIREG_USER_SCOPE: external_node_path_namespaceObject.join(runtimeDirectory, "registry"),
     PATH: SYSTEM_PATH
   };
 }
@@ -37747,9 +37709,9 @@ function installEnvironment(environment, runtimeDirectory) {
   return runtimeEnvironment(environment, INSTALL_ENVIRONMENT_KEYS, runtimeDirectory);
 }
 
-// Mirrors the CLI's own per-marketplace variable name, so the token reaches that marketplace alone.
+// Mirrors aireg's own per-registry variable name, so the token reaches that registry alone.
 function tokenVariable(alias) {
-  return `REGISTRY_TOKEN_${alias.toUpperCase().replaceAll(/[^A-Z0-9]/g, "_")}`;
+  return `AIREG_TOKEN_${alias.toUpperCase().replaceAll(/[^A-Z0-9]/g, "_")}`;
 }
 
 function publisherEnvironment(environment, token, runtimeDirectory, aliases = []) {
@@ -37761,28 +37723,28 @@ function publisherEnvironment(environment, token, runtimeDirectory, aliases = []
   };
 }
 
-// The Action writes the CLI's config itself, so the token's only destination is the fixed gateway.
-function manifestFor() {
-  return `${JSON.stringify({ marketplaces: { [PUBLISH_ALIAS]: { source: PUBLISH_GATEWAY } } }, null, 2)}\n`;
-}
-
 // Only what the repository tracks can be an artifact, so a build output never publishes.
 function trackedFiles(cwd) {
   const listed = (0,external_node_child_process_namespaceObject.spawnSync)("git", ["ls-files", "-z"], {
     cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024,
-    env: { ...GIT_ENVIRONMENT }
+    env: { PATH: SYSTEM_PATH, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" }
   });
   if (listed.status !== 0) throw new Error("could not list the repository's files; check it out before this step");
   return listed.stdout.split("\0").filter(Boolean);
 }
 
-// Tracked, so a symbolic link to `.atlan` is not followed: git would track the link, not the file behind it.
-function readConfig(cwd, files) {
-  const file = external_node_path_namespaceObject.join(cwd, CONFIG_PATH);
-  if (!files.includes(CONFIG_PATH) || !external_node_fs_namespaceObject.existsSync(file)) throw new Error(`${CONFIG_PATH} lists the skills Registry Sync publishes; commit one`);
-  const stat = external_node_fs_namespaceObject.lstatSync(file);
-  if (!stat.isFile() || stat.size > MAX_CONFIG_BYTES) throw new Error(`${CONFIG_PATH} must be a file of at most ${MAX_CONFIG_BYTES / 1024} KiB`);
-  return parseConfig(external_node_fs_namespaceObject.readFileSync(file, "utf8"));
+// An agent is a tracked Markdown file with `name` and `description` front matter, so a README is skipped.
+// A SKILL.md never is: the CLI would publish its whole folder, and at the root that is the checkout.
+function agentFiles(cwd, files, globs = []) {
+  const patterns = globs.map(globPattern);
+  return files.filter(file => file.endsWith(".md") && external_node_path_namespaceObject.posix.basename(file) !== "SKILL.md" &&
+    patterns.some(pattern => pattern.test(file)) && hasFrontMatter(external_node_path_namespaceObject.join(cwd, file))).sort();
+}
+
+function hasFrontMatter(file) {
+  if (!external_node_fs_namespaceObject.existsSync(file) || !external_node_fs_namespaceObject.lstatSync(file).isFile() || external_node_fs_namespaceObject.statSync(file).size > MAX_SKILL_BYTES) return false;
+  const head = /^---\r?\n([\s\S]*?)\r?\n---/.exec(external_node_fs_namespaceObject.readFileSync(file, "utf8"));
+  return Boolean(head && /^name:\s*\S/m.test(head[1]) && /^description:\s*\S/m.test(head[1]));
 }
 
 // The CLI compares with the Registry by workspace name, so the ID the workflow names is looked up once.
@@ -37795,20 +37757,18 @@ async function workspaceName(token, workspace, registry = registryRequest) {
 }
 
 // A push publishes only what changed since its baseline. A manual run or a new branch has none,
-// so it publishes everything; so does a CLI older than the flag.
-function changedSinceArguments(baseline, version) {
-  if (typeof baseline !== "string" || !COMMIT_SHA.test(baseline)) return [];
-  const [major, minor, patch] = version.split(/[.-]/).map(Number);
-  return major > 0 || minor > 1 || (minor === 1 && patch >= 25) ? ["--changed-since", baseline] : [];
+// so it publishes everything. Every aireg release takes the flag.
+function changedSinceArguments(baseline) {
+  return typeof baseline === "string" && COMMIT_SHA.test(baseline) ? ["--changed-since", baseline] : [];
 }
 
 function parseCliVersion(raw) {
   const match = /^v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\s*$/.exec(raw.split("\n")[0] ?? "");
-  if (!match) throw new Error("installed Registry CLI did not return a valid version");
+  if (!match) throw new Error("installed aireg did not return a valid version");
   return match[1];
 }
 
-// self-update writes the newest release to REGISTRY_HOME/cli/<version>, or keeps this one.
+// `self update` names the newest release it installed, which must sit in the Action-owned home, or keeps this one.
 function updatedCli(raw, binary, directory) {
   let data;
   try {
@@ -37817,8 +37777,10 @@ function updatedCli(raw, binary, directory) {
     data = undefined;
   }
   if (data?.action === "already-latest") return binary;
-  if (data?.action !== "updated") throw new Error("the Registry CLI returned an unreadable self-update result");
-  return external_node_path_namespaceObject.join(directory, ".registry", "cli", parseCliVersion(String(data.current)), "registry");
+  if (data?.action !== "updated" || typeof data.bin !== "string" || !external_node_path_namespaceObject.isAbsolute(data.bin) || !isWithin(directory, data.bin)) {
+    throw new Error("aireg returned an unreadable self update result");
+  }
+  return data.bin;
 }
 
 // Runs the verified CLI directly, without a shell; captures bounded stdout when asked.
@@ -37840,8 +37802,8 @@ function runCli(binary, args, cwd, environment, capture = false) {
     child.on("error", reject);
     // "close" waits for stdout to drain; "exit" can fire first and lose the tail of it.
     child.on("close", code => {
-      if (size > MAX_CLI_OUTPUT_BYTES) return reject(new Error("Registry CLI output exceeds the size limit"));
-      if (code !== 0) return reject(new Error(`Registry CLI ${args[0]} exited with status ${code}`));
+      if (size > MAX_CLI_OUTPUT_BYTES) return reject(new Error("aireg output exceeds the size limit"));
+      if (code !== 0) return reject(new Error(`aireg ${args[0]} exited with status ${code}`));
       resolve(Buffer.concat(chunks).toString("utf8"));
     });
   });
@@ -37854,8 +37816,9 @@ async function installCli({
   execute = runCli
 } = {}) {
   const target = resolveCliPlatform();
-  const directory = await promises_namespaceObject.mkdtemp(external_node_path_namespaceObject.join(external_node_os_namespaceObject.tmpdir(), "registry-skill-sync-"));
-  const binary = external_node_path_namespaceObject.join(directory, "registry");
+  // Real, so the binary `self update` reports (macOS resolves /var to /private/var) is recognised as inside it.
+  const directory = await promises_namespaceObject.realpath(await promises_namespaceObject.mkdtemp(external_node_path_namespaceObject.join(external_node_os_namespaceObject.tmpdir(), "registry-skill-sync-")));
+  const binary = external_node_path_namespaceObject.join(directory, "aireg");
   try {
     await download(cliArtifactURL(target), binary);
     await verifyCli(binary, CLI_SHA256[target]);
@@ -37872,15 +37835,6 @@ async function installCli({
   }
 }
 
-// The CLI reads the nearest registry.yml, so the Action writes its own for the run and puts the repository's back.
-function claimManifest(file) {
-  const existing = external_node_fs_namespaceObject.lstatSync(file, { throwIfNoEntry: false });
-  if (existing && !existing.isFile()) throw new Error(`${MANIFEST} in the working directory must be a regular file`);
-  const original = existing ? external_node_fs_namespaceObject.readFileSync(file) : undefined;
-  external_node_fs_namespaceObject.writeFileSync(file, manifestFor());
-  return () => (original ? external_node_fs_namespaceObject.writeFileSync(file, original) : external_node_fs_namespaceObject.rmSync(file, { force: true }));
-}
-
 async function runPublishAction({
   environment = process.env,
   install = installCli,
@@ -37888,42 +37842,40 @@ async function runPublishAction({
   registry = registryRequest,
   request,
   ancestor,
-  changed,
   eventPayload
 } = {}) {
   const token = environment.ATLANAI_TOKEN;
   if (!token) throw new Error("ATLANAI_TOKEN must be supplied as a workflow secret");
   maskSecret(token, environment);
-  const workspace = parseWorkspace(environment);
+  const inputs = parseRegistryInputs(environment);
   const cwd = resolveWorkingDirectory(environment);
   if (parseBoolean("prune", common_getInput("prune", environment) || "false")) {
-    throw new Error("prune is not supported with the Registry CLI yet; set prune to false");
+    throw new Error("prune is not supported with aireg yet; set prune to false");
   }
   const files = trackedFiles(cwd);
-  const config = readConfig(cwd, files);
-  assertGlobsMatch(files, config.skills);
   // A tracked file can be missing from the checkout, as in a sparse checkout; it cannot publish.
-  const paths = skillFolders(files, config.skills).filter(folder => external_node_fs_namespaceObject.existsSync(external_node_path_namespaceObject.join(cwd, folder, "SKILL.md")));
+  const skills = skillFolders(files, inputs.artifacts.skill).filter(folder => external_node_fs_namespaceObject.existsSync(external_node_path_namespaceObject.join(cwd, folder, "SKILL.md")));
+  const paths = [...skills, ...agentFiles(cwd, files, inputs.artifacts.agent)];
   // The CLI expands a path it is given, so one that reads as a glob is refused rather than widened.
   const unsafe = paths.find(item => /[*?[\]{}\\]|[+@!]\(/.test(item));
   if (unsafe) throw new Error(`${unsafe} contains glob characters, so it cannot be published as an exact path`);
   if (paths.length === 0) {
-    process.stdout.write(`::notice title=Registry Sync::no tracked skill matches the globs in ${CONFIG_PATH}, so nothing was published\n`);
+    process.stdout.write("::notice title=Registry Sync::no tracked file matches the artifacts globs, so nothing was published\n");
     common_setOutput("status", "success", environment);
     return;
   }
-  const namespace = await workspaceName(token, workspace, registry);
-  const baseline = await publishBaseline({ environment, eventPayload, cwd, request, ancestor, changed });
+  const namespace = await workspaceName(token, inputs.workspace, registry);
+  const baseline = await publishBaseline({ environment, eventPayload, cwd, request, ancestor });
   const { binary, directory, version } = await install({ environment });
-  let restore;
   try {
-    restore = claimManifest(external_node_path_namespaceObject.join(cwd, MANIFEST));
-    const args = ["publish", ...paths.map(item => `./${item}`), "--to", `${PUBLISH_ALIAS}/${namespace}`, "--yes", ...changedSinceArguments(baseline, version)];
-    await execute(binary, args, cwd, publisherEnvironment(environment, token, directory, [PUBLISH_ALIAS]));
+    const publisher = publisherEnvironment(environment, token, directory, [PUBLISH_ALIAS]);
+    // Run where no project manifest is found, so the registry is declared in the user scope alone.
+    await execute(binary, REGISTRY_ARGUMENTS, directory, publisher);
+    const args = ["publish", ...paths.map(item => `./${item}`), "--to", `${PUBLISH_ALIAS}/${namespace}`, "--yes", "-g", ...changedSinceArguments(baseline)];
+    await execute(binary, args, cwd, publisher);
     common_setOutput("status", "success", environment);
     common_setOutput("cli-version", version, environment);
   } finally {
-    restore?.();
     await promises_namespaceObject.rm(directory, { recursive: true, force: true });
   }
 }
@@ -37992,6 +37944,19 @@ const PREFLIGHT_COMMENT = [
   "No skills were published or security-scanned in this pull request."
 ].join("\n");
 
+function repositoryPath(pathname) {
+  if (typeof pathname !== "string" || pathname.length === 0 || pathname.length > 240 ||
+      pathname.startsWith("/") || pathname.endsWith("/") || pathname.includes("//") ||
+      pathname.includes("\\") || /[\0\r\n]/.test(pathname)) {
+    throw new Error("repository path is invalid");
+  }
+  const segments = pathname.split("/");
+  if (segments.some(segment => segment === "." || segment === "..")) {
+    throw new Error("repository path is invalid");
+  }
+  return segments.map(encodeURIComponent).join("/");
+}
+
 function decodeBase64Bytes(response, maxBytes) {
   if (!response || response.encoding !== "base64" || typeof response.content !== "string") {
     throw new Error("GitHub contents response is invalid");
@@ -38006,16 +37971,127 @@ function decodeBase64Bytes(response, maxBytes) {
   return decoded;
 }
 
+function decodeBase64Content(response, maxBytes) {
+  return decodeBase64Bytes(response, maxBytes).toString("utf8");
+}
+
+function safeRepositoryPath(value) {
+  if (typeof value !== "string" || value.length === 0 || value.length > 240 ||
+      value.startsWith("/") || /^[A-Za-z]:\//.test(value) || value.includes("\\") || value.includes("//")) {
+    return false;
+  }
+  const parts = value.split("/");
+  return !parts.some(part => part === "" || part === "." || part === ".." ||
+    part === ".git" || part === ".github" || part === ".atlan");
+}
+
+function hasOnlyKeys(value, allowed) {
+  return Object.keys(value).every(key => allowed.has(key));
+}
+
+function parseSkillSyncConfig(raw, source = "base") {
+  let config;
+  try {
+    config = JSON.parse(raw);
+  } catch {
+    return { valid: false, reason: `the ${source} .atlan/package.json is not valid JSON` };
+  }
+  const publishConfig = config?.publishConfig;
+  if (!config || typeof config !== "object" || Array.isArray(config) ||
+      !publishConfig || typeof publishConfig !== "object" || Array.isArray(publishConfig)) {
+    return { valid: false, reason: `the ${source} configuration is not a supported SkillSync config` };
+  }
+  if (!hasOnlyKeys(config, new Set(["$schema", "name", "skills", "installConfig", "publishConfig"])) ||
+      !hasOnlyKeys(publishConfig, new Set(["workspaces", "skills"]))) {
+    return { valid: false, reason: `the ${source} configuration contains unsupported fields` };
+  }
+  const workspaces = publishConfig.workspaces;
+  if (!Array.isArray(workspaces) || workspaces.length === 0 || workspaces.length > MAX_WORKSPACES ||
+      workspaces.some(workspace => typeof workspace !== "string" || !/^[A-Za-z0-9_.-]{1,128}$/.test(workspace.trim())) ||
+      new Set(workspaces.map(workspace => workspace.trim())).size !== workspaces.length) {
+    return { valid: false, reason: "workspaces must be unique non-empty identifiers" };
+  }
+  const skills = publishConfig.skills;
+  if (!skills || typeof skills !== "object" || Array.isArray(skills) ||
+      !hasOnlyKeys(skills, new Set(["paths", "exclude"]))) {
+    return { valid: false, reason: "publishConfig.skills must contain paths and optional exclude entries" };
+  }
+  const paths = skills.paths;
+  if (!Array.isArray(paths) || paths.length === 0 || paths.length > MAX_SKILL_ROOTS ||
+      paths.some(path => !safeRepositoryPath(path)) ||
+      new Set(paths).size !== paths.length) {
+    return { valid: false, reason: `skill paths must contain 1-${MAX_SKILL_ROOTS} unique safe repository-relative roots` };
+  }
+  const pathSet = new Set(paths);
+  for (const root of paths) {
+    let separator = root.indexOf("/");
+    while (separator >= 0) {
+      if (pathSet.has(root.slice(0, separator))) {
+        return { valid: false, reason: "skill paths cannot overlap" };
+      }
+      separator = root.indexOf("/", separator + 1);
+    }
+  }
+  const exclude = skills.exclude ?? [];
+  if (!Array.isArray(exclude) || exclude.length > MAX_EXCLUDED_SKILLS ||
+      exclude.some(value => !safeRepositoryPath(value)) ||
+      new Set(exclude).size !== exclude.length) {
+    return { valid: false, reason: `excluded skill directories must contain at most ${MAX_EXCLUDED_SKILLS} unique safe repository-relative paths` };
+  }
+  if (exclude.some(value => {
+    const separator = value.lastIndexOf("/");
+    return separator < 0 || !pathSet.has(value.slice(0, separator));
+  })) {
+    return { valid: false, reason: "each excluded path must identify one direct child of a configured skill root" };
+  }
+  return {
+    valid: true,
+    paths,
+    exclude: new Set(exclude),
+    workspaces: new Set(workspaces.map(workspace => workspace.trim())),
+    workspaceCount: workspaces.length
+  };
+}
+
 function classifySkillFile(filename, config) {
   if (!config?.valid || typeof filename !== "string") return { kind: "unknown" };
-  let directory;
-  for (let cut = filename.lastIndexOf("/"); cut > 0 && !directory; cut = filename.lastIndexOf("/", cut - 1)) {
-    if (config.folders.has(filename.slice(0, cut))) directory = filename.slice(0, cut);
+  if (config.folders) {
+    const directory = [...config.folders].filter(folder => filename.startsWith(`${folder}/`))
+      .reduce((deepest, folder) => (folder.length > (deepest?.length ?? 0) ? folder : deepest), undefined);
+    if (!directory) return { kind: "outside" };
+    const manifest = `${directory}/SKILL.md`;
+    return { kind: "eligible", skill: directory.split("/").at(-1), directory, manifest, definition: filename === manifest };
   }
-  if (!directory) return { kind: "outside" };
-  const manifest = `${directory}/SKILL.md`;
-  return { kind: "eligible", skill: directory.split("/").at(-1), directory, manifest, definition: filename === manifest };
+  for (const root of config.paths) {
+    if (!filename.startsWith(`${root}/`)) continue;
+    const relative = filename.slice(root.length + 1);
+    const parts = relative.split("/");
+    if (parts.length < 2 || parts[0] === "" || parts.some(part => part === "." || part === "..")) {
+      return { kind: "outside" };
+    }
+    const skill = parts[0];
+    const directory = `${root}/${skill}`;
+    const manifest = `${directory}/SKILL.md`;
+    return config.exclude.has(directory)
+      ? { kind: "excluded", skill, directory, manifest, definition: filename === manifest }
+      : { kind: "eligible", skill, directory, manifest, definition: filename === manifest };
+  }
+  return { kind: "outside" };
 }
+
+function declaredSkillCount(files, config) {
+  const roots = new Set(config.paths);
+  let count = 0;
+  for (const filename of files) {
+    const parts = filename.split("/");
+    if (parts.length < 3 || parts.at(-1) !== "SKILL.md") continue;
+    const root = parts.slice(0, -2).join("/");
+    const directory = parts.slice(0, -1).join("/");
+    if (roots.has(root) && !config.exclude.has(directory)) count += 1;
+  }
+  return count;
+}
+
 // What the Registry answers with HTTP 422 on publish, mirroring validate_skill_md in the skill extension. Each entry
 // names the problem and the fix, so the author can act from the comment instead of from the error after merge. Only
 // fixed text, booleans, and lengths are rendered; invalid scalar values stay out of trusted bot comments and prompts.
@@ -38081,6 +38157,20 @@ function skillRejections(raw) {
   return rejections;
 }
 
+function describePaths(config) {
+  if (!config.valid) return config.reason;
+  const displayedRoots = config.paths.slice(0, MAX_DISPLAYED_ROOTS)
+    .map(root => `\`${pathForComment(root)}\``);
+  if (config.paths.length > MAX_DISPLAYED_ROOTS) {
+    displayedRoots.push(`_${config.paths.length - MAX_DISPLAYED_ROOTS} more roots omitted_`);
+  }
+  return displayedRoots.join("<br>");
+}
+
+function sameSet(left, right) {
+  return left.size === right.size && [...left].every(value => right.has(value));
+}
+
 function pathForComment(filename) {
   return typeof filename === "string" && SAFE_PATH.test(filename) ? filename : "untrusted path omitted";
 }
@@ -38133,6 +38223,17 @@ async function listPullRequestFiles({ token, context, request }) {
   return { files, limited: true };
 }
 
+async function readRepositoryFile({ token, context, request, filename, ref, maxBytes }) {
+  const response = await request({
+    token,
+    method: "GET",
+    requestPath: `/repos/${encodeURIComponent(context.owner)}/${encodeURIComponent(context.repo)}/contents/${repositoryPath(filename)}?ref=${ref}`,
+    expectedStatus: 200,
+    maxResponseBytes: Math.ceil(maxBytes * 4 / 3) + 4096
+  });
+  return decodeBase64Content(response, maxBytes);
+}
+
 async function readRepositoryTree({ token, context, request, ref = context.headSha }) {
   const response = await request({
     token,
@@ -38163,45 +38264,6 @@ async function readRepositoryBlob({ token, context, request, sha, maxBytes }) {
     maxResponseBytes: Math.ceil(maxBytes * 4 / 3) + 4096
   });
   return decodeBase64Bytes(response, maxBytes);
-}
-
-// The pull request's own config, since that is what publishes once it merges. Its blob is the one the head tree
-// names, so the file and the trees cannot disagree. `inRepository` marks a problem a rerun cannot fix.
-async function readHeadConfig({ token, context, request, workspace, files, head }) {
-  const entry = head.get(CONFIG_PATH);
-  if (!entry) {
-    const hint = head.has(".atlan/package.json") ? "; move the skill paths from `.atlan/package.json` into it" : "";
-    return { valid: false, inRepository: true, reason: `\`${CONFIG_PATH}\` is missing, so there is no list of skills to check${hint}` };
-  }
-  if (!["100644", "100755"].includes(entry.mode) || !(entry.size <= MAX_CONFIG_BYTES)) {
-    return { valid: false, inRepository: true, reason: `\`${CONFIG_PATH}\` must be a file of at most ${MAX_CONFIG_BYTES / 1024} KiB` };
-  }
-  let text;
-  try {
-    text = (await readRepositoryBlob({ token, context, request, sha: entry.sha, maxBytes: MAX_CONFIG_BYTES })).toString("utf8");
-  } catch {
-    return { valid: false, reason: `GitHub could not provide \`${CONFIG_PATH}\`` };
-  }
-  try {
-    const { skills } = parseConfig(text);
-    assertGlobsMatch([...head.keys()], skills);
-    return preflightConfig({ workspace, skills }, files);
-  } catch (error) {
-    return { valid: false, inRepository: true, reason: error.message };
-  }
-}
-
-// Where the pull request branched from its base, so a skill the base branch changed since is not counted as the PR's.
-async function forkPointTree({ token, context, request }) {
-  const compared = await request({
-    token,
-    method: "GET",
-    requestPath: `/repos/${encodeURIComponent(context.owner)}/${encodeURIComponent(context.repo)}/compare/${context.baseSha}...${context.headSha}?per_page=1`,
-    expectedStatus: 200
-  });
-  const sha = compared?.merge_base_commit?.sha;
-  if (typeof sha !== "string" || !/^[a-f0-9]{40}$/i.test(sha)) throw new Error("GitHub did not return the pull request's merge base");
-  return readRepositoryTree({ token, context, request, ref: sha });
 }
 
 function definitionBatches(files, tree) {
@@ -38251,9 +38313,8 @@ async function readDefinitions({ token, context, request, files, tree }) {
   return read;
 }
 
-// The skills a pull request changes, from the tree it branched from and its head, however many files it touches.
-// Past GitHub's file-list pages this is the whole answer; it has no line counts or rename pairs, which only the
-// file list carries.
+// The skills a pull request changes, from its two trees, however many files it touches. Past GitHub's file-list
+// pages this is the whole answer; it has no line counts or rename pairs, which only the file list carries.
 function treeChanges(baseTree, headTree, config) {
   const affected = new Map();
   for (const file of new Set([...baseTree.keys(), ...headTree.keys()])) {
@@ -38447,6 +38508,7 @@ function classifyChangedFile(file, config) {
 
 function eligibleChanges(files, config) {
   const affected = new Map();
+  let excluded = 0;
   const add = (classification, file, status, rename = {}) => {
     const existing = affected.get(classification.manifest) || {
       ...file,
@@ -38484,9 +38546,13 @@ function eligibleChanges(files, config) {
         add(current, file, current.definition ? "added" : "modified",
           current.definition ? { renamedFrom: file.previousFilename } : {});
       }
+      if (previous.kind === "excluded" || current.kind === "excluded") excluded += 1;
       continue;
     }
-    if (current.kind === "eligible") add(current, file, current.definition ? file.status : "modified");
+    if (current.kind === "eligible") {
+      add(current, file, current.definition ? file.status : "modified");
+    }
+    else if (current.kind === "excluded") excluded += 1;
   }
   const eligible = [...affected.values()].map(file => {
     const statuses = file.statuses;
@@ -38496,15 +38562,16 @@ function eligibleChanges(files, config) {
     delete file.statuses;
     return { ...file, status };
   });
-  return { eligible };
+  return { eligible, excluded };
 }
 
-async function buildPreflightReport({ token, context, request, registryToken, registry = registryRequest, workspace }) {
+async function buildPreflightReport({ token, context, request, registryToken, registry = registryRequest, inputs }) {
   let fileResult;
   try {
     fileResult = await listPullRequestFiles({ token, context, request });
   } catch {
-    // The trees still name every changed skill, so validation does not depend on this list.
+    // With artifacts the trees still name every changed skill, so validation does not depend on this list.
+    if (!inputs) return { available: false, reason: "GitHub could not provide the pull request file list" };
     fileResult = { files: [], limited: true };
   }
 
@@ -38513,40 +38580,56 @@ async function buildPreflightReport({ token, context, request, registryToken, re
   let treeFiles;
   if (!context.baseSha || !context.headSha) {
     config = { valid: false, reason: "GitHub did not provide both pull request commit IDs" };
-  } else {
+  } else if (inputs) {
     // Globs reach any depth, so the skill folders come from the trees, not from a path's shape.
     try {
-      [baseTree, treeFiles] = await Promise.all([
+      const [base, head] = await Promise.all([
         readRepositoryTree({ token, context, request, ref: context.baseSha }),
         readRepositoryTree({ token, context, request })
       ]);
+      baseTree = base;
+      treeFiles = head;
+      config = preflightConfig(inputs, [...base.keys(), ...head.keys()]);
     } catch {
       config = { valid: false, reason: "GitHub could not provide the pull request's file trees" };
     }
-    config ??= await readHeadConfig({
-      token, context, request, workspace, files: [...baseTree.keys(), ...treeFiles.keys()], head: treeFiles
-    });
+  } else {
+    try {
+      config = parseSkillSyncConfig(await readRepositoryFile({ token, context, request, filename: ".atlan/package.json", ref: context.baseSha, maxBytes: MAX_CONFIG_BYTES }));
+    } catch {
+      config = { valid: false, reason: "the base .atlan/package.json could not be read" };
+    }
+  }
+
+  const configChanged = !inputs && fileResult.files.some(file => file.filename === ".atlan/package.json" ||
+    file.previousFilename === ".atlan/package.json");
+  let proposedConfig;
+  if (configChanged && context.headSha) {
+    try {
+      proposedConfig = parseSkillSyncConfig(await readRepositoryFile({ token, context, request, filename: ".atlan/package.json", ref: context.headSha, maxBytes: MAX_CONFIG_BYTES }), "proposed");
+    } catch {
+      proposedConfig = { valid: false, reason: "the proposed .atlan/package.json could not be read" };
+    }
   }
 
   let changes = eligibleChanges(fileResult.files, config);
   let limited = fileResult.limited;
   if (limited && baseTree && treeFiles && config.valid) {
-    try {
-      changes = { eligible: treeChanges(await forkPointTree({ token, context, request }), treeFiles, config) };
-      limited = false;
-    } catch {
-      // Left limited: validation below fails the check rather than pass skills it cannot name.
-    }
+    changes = { eligible: treeChanges(baseTree, treeFiles, config), excluded: 0 };
+    limited = false;
   }
   const supportingOnly = changes.eligible.filter(file => !file.definitionChanged);
   let supportingAnalysisUnavailable = false;
-  if (supportingOnly.length > 0 && context.headSha && !treeFiles) {
+  if ((supportingOnly.length > 0 || proposedConfig?.valid) && context.headSha && !treeFiles) {
     try {
       treeFiles = await readRepositoryTree({ token, context, request });
     } catch {
       supportingAnalysisUnavailable = supportingOnly.length > 0;
     }
   }
+  const proposedSkillCount = proposedConfig?.valid && treeFiles
+    ? declaredSkillCount(treeFiles.keys(), proposedConfig)
+    : undefined;
   const eligible = changes.eligible.filter(file => file.definitionChanged || treeFiles?.has(file.filename));
   const supporting = eligible.reduce((count, file) => count + file.supportingChanges, 0);
   // The Registry's front-matter contract, checked before merge. Independent of the Registry comparison: it needs
@@ -38555,8 +38638,7 @@ async function buildPreflightReport({ token, context, request, registryToken, re
   // run unchecked rather than passing it.
   const rejections = [];
   const present = eligible.filter(file => file.status !== "removed");
-  let unchecked = !config.valid ? config.reason
-    : limited ? "GitHub could not say which skills this pull request changes" : undefined;
+  let unchecked = inputs && !config.valid ? config.reason : undefined;
   if (!unchecked && present.length > 0) {
     try {
       if (!context.headSha) throw new Error("GitHub did not provide the pull request's head commit");
@@ -38586,7 +38668,7 @@ async function buildPreflightReport({ token, context, request, registryToken, re
       registryState.reason = undefined;
     } else if (context.baseSha && context.headSha) {
       try {
-        const comparedBase = baseTree || await readRepositoryTree({ token, context, request, ref: context.baseSha });
+        const baseTree = await readRepositoryTree({ token, context, request, ref: context.baseSha });
         const headTree = treeFiles || await readRepositoryTree({ token, context, request, ref: context.headSha });
         const readBlob = boundedBlobReader({ token, context, request });
         const inventory = await loadRegistryInventory({
@@ -38597,7 +38679,7 @@ async function buildPreflightReport({ token, context, request, registryToken, re
         });
         for (const file of eligible.slice(0, MAX_ANALYZED_SKILLS)) {
           try {
-            const base = file.status === "added" ? undefined : await digestTreeSkill(comparedBase, file.directory, readBlob);
+            const base = file.status === "added" ? undefined : await digestTreeSkill(baseTree, file.directory, readBlob);
             const head = file.status === "removed" ? undefined : await digestTreeSkill(headTree, file.directory, readBlob);
             if ((!base && file.status !== "added") || (!head && file.status !== "removed")) {
               throw new Error("GitHub did not provide a complete skill bundle");
@@ -38634,18 +38716,21 @@ async function buildPreflightReport({ token, context, request, registryToken, re
     context,
     available: true,
     config,
+    configChanged,
+    proposedConfig,
+    proposedSkillCount,
     files: fileResult.files,
     limited,
     changedFiles: context.changedFiles,
     eligible,
+    excluded: changes.excluded,
     supporting,
     supportingAnalysisUnavailable,
     detailLimitReached: eligible.length > MAX_ANALYZED_SKILLS,
     registry: registryState,
     conflictCount,
     rejections,
-    unchecked,
-    uncheckedInRepository: Boolean(config.inRepository)
+    unchecked
   };
 }
 
@@ -38724,12 +38809,25 @@ function unconfiguredFinding(file) {
 
 function commentState(report) {
   if (report.conflictCount > 0) return "conflict";
-  const unavailable = !report.available || !report.config?.valid || report.limited;
+  const unavailable = !report.available || !report.config?.valid ||
+    Boolean(report.proposedConfig && !report.proposedConfig.valid) || report.limited ||
+    Boolean(report.configChanged && report.proposedConfig?.valid && !Number.isSafeInteger(report.proposedSkillCount));
   if (unavailable) return "unavailable";
   // No credential at all is different from a credential that failed: only the second is worth a retry.
   if (report.registry && !report.registry.configured) return "unconfigured";
   if (report.registry && !report.registry.available) return "unavailable";
   return notComparedSkills(report).length > 0 ? "partial" : "ready";
+}
+
+function configurationDifference(report) {
+  if (!report.configChanged || !report.config?.valid || !report.proposedConfig?.valid) return [];
+  const destinationsChanged = !sameSet(report.config.workspaces, report.proposedConfig.workspaces);
+  return [
+    "| Setting | Before | After merge |",
+    "| --- | --- | --- |",
+    `| Skill folders | ${describePaths(report.config)} | ${describePaths(report.proposedConfig)} |`,
+    `| Destination workspaces | ${report.config.workspaceCount} | ${report.proposedConfig.workspaceCount}${destinationsChanged ? " (changed)" : ""} |`
+  ];
 }
 
 function conflictRows(report) {
@@ -38861,10 +38959,7 @@ function formatPreflightComment(report, compact = false) {
     : "";
   const lines = [PREFLIGHT_MARKER, `### ${verdict}`, ""];
   if (report.unchecked) {
-    const next = report.uncheckedInRepository
-      ? `Commit a valid \`${CONFIG_PATH}\` to this pull request; preflight runs again on the next push.`
-      : "Rerun it; if it fails again, check the workflow's access to this repository.";
-    lines.push(`${tableCell(report.unchecked)}, so the check fails rather than let unchecked skills merge. ${next}`, "");
+    lines.push(`${tableCell(report.unchecked)}, so the check fails rather than let unchecked skills merge. Rerun it; if it fails again, check the workflow's access to this repository.`, "");
   }
   if (state === "unconfigured") {
     lines.push("No Atlan API key is available in `ATLANAI_TOKEN`, so this pull request was not compared with Atlan and conflicts were not checked. Expose the existing secret as `ATLANAI_TOKEN` on the Registry Sync step to enable it.", "");
@@ -38960,6 +39055,11 @@ function formatPreflightComment(report, compact = false) {
       const names = notCompared.slice(0, MAX_ANALYZED_SKILLS).map(file => skillForComment(report, file)).join(", ");
       tail.push(`Not compared with Atlan (analysis limit, bundle too large, or an identity the Registry cannot resolve): ${names}${notCompared.length > MAX_ANALYZED_SKILLS ? ` and ${notCompared.length - MAX_ANALYZED_SKILLS} more` : ""}. Publishing still decides create, update, or no-op for them.`);
     }
+    const configLines = compact ? [] : configurationDifference(report);
+    if (configLines.length > 0) {
+      if (tail.length > 0) tail.push("");
+      tail.push("<details>", "<summary>Configuration changes</summary>", "", ...configLines, "", "</details>");
+    }
     lines.push(...tail);
   }
   // One trailing newline is what a GitHub comment renders; more is whitespace the fixtures then carry around.
@@ -38995,8 +39095,8 @@ async function runPreflight({ environment = process.env, request = githubRequest
   if (registryToken) maskSecret(registryToken, environment);
   const failOnConflict = parseBoolean("fail-on-conflict", common_getInput("fail-on-conflict", environment) || "false");
   const commenting = parseBoolean("allow-pr-commenting", common_getInput("allow-pr-commenting", environment) || "true");
-  // The workspace is the workflow's, which a pull request cannot change under pull_request_target.
-  const workspace = parseWorkspace(environment);
+  // The workflow's own inputs decide what is checked; a pull request cannot change them under pull_request_target.
+  const inputs = common_getInput("artifacts", environment) ? parseRegistryInputs(environment) : undefined;
   const context = parsePullRequestContext(environment, eventPayload);
   const budgetedRequest = withRequestBudget(request);
   const existing = commenting ? await findMarkerComment({
@@ -39009,13 +39109,13 @@ async function runPreflight({ environment = process.env, request = githubRequest
     request: budgetedRequest,
     registryToken,
     registry,
-    workspace
+    inputs
   });
   report.failOnConflict = failOnConflict;
   // A pull request that touches no listed folder gets no comment, unless an earlier run already left one.
   // A run that could not read the trees says so rather than passing quietly.
-  const untouched = report.available && report.config?.valid && report.eligible.length === 0 && !existing;
-  if (!report.config?.valid) {
+  const untouched = Boolean(inputs) && report.available && report.config?.valid && report.eligible.length === 0 && !existing;
+  if (inputs && !report.config?.valid) {
     process.stdout.write(`::warning title=Atlan Agent Registry preflight::${report.config?.reason || "the pull request could not be checked"}\n`);
   }
   if (commenting && !untouched) {
@@ -39061,7 +39161,7 @@ function publishFailureComment(environment, sha, error) {
     "",
     `Publishing \`${sha.slice(0, 7)}\` to Atlan failed: \`${message}\`.`,
     "",
-    `${runLink(environment)} has Atlan's response. Fix a refused skill in a new pull request, where preflight checks it before it merges. If nothing was refused, rerun this run; if newer changes have merged since, run Registry Sync manually from the default branch instead.`
+    `${runLink(environment)} has Atlan's response. Fix a refused skill in a new pull request, where preflight checks it before it merges; if nothing was refused, rerun the workflow.`
   ].join("\n");
 }
 
@@ -40281,7 +40381,6 @@ async function runEval({
 
 
 
-
 async function runAction({
   environment = process.env,
   request = githubRequest,
@@ -40301,7 +40400,6 @@ async function runAction({
   if (event === "push" || event === "workflow_dispatch") {
     const payload = eventPayload ?? readEventPayload(environment);
     assertDefaultBranch(environment, payload);
-    await assertCurrentRerun({ environment, eventPayload: payload, request });
     try {
       return await publish({ environment, eventPayload: payload, request });
     } catch (error) {
