@@ -30,10 +30,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - uses: ./.github/actions/registry-sync
-        with:
-          workspace: workspace_01m36rz0zdfc1ttjvtj0h9b87j
-          artifacts: |
-            skill: [".claude/skills/**", "skills/**", "team-b/skills/**", "extra/skills/**"]
+        with:                           # the workspace and skill folders live in .registry/config.yml
           preflight: true
           allow-pr-commenting: true
           fail-on-conflict: true
