@@ -1,6 +1,6 @@
 # Registry Sync: the one workspace this repository syncs with, and where its skills live.
 version: 1
-workspace: workspace_01m36rz0zdfc1ttjvtj0h9b87j
+workspace: [workspace_01m36rz0zdfc1ttjvtj0h9b87j, workspace_01m38b2z85f1hvr7ajd5h2s5qr]
 skills:
   - .claude/skills/**
   - skills/**
