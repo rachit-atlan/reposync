@@ -14,6 +14,6 @@ agents:
       - skill_01m4zv48jkezstgdsrvypxef5e          # lives in another repository
   - id: agent_01m51pqh1wen4vg0rqmessg005
     path: .claude/agents/reviewer.md
-    skills: [.claude/skills/edge21-*]
+    skills: [.claude/skills/edge21-*, docs/not-a-skill]
   - id: agent_01m51pqkk3ex8b25w6qqejrz1h
     path: agents/unmanaged
