@@ -16,3 +16,5 @@ Concurrency test push A, 2026-09-29.
 Concurrency test 2 push A.
 
 Config-file test, 2026-10-04: edited in a PR.
+
+This is a new skill cool skill checkinng 2 agents use it
