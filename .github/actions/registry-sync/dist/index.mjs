@@ -37706,12 +37706,14 @@ async function agentInAtlan({ row, workspace, registryToken, registry }) {
   if (found?.workspace_id !== workspace) return `agent ${row.agent.id} is not in the workspace ${CONFIG_FILE} names`;
   if (found.artifact_status === "archived") return `agent ${row.agent.id} is archived in Atlan`;
   row.name = typeof found.name === "string" ? found.name : row.agent.id;
+  row.unreleased = [];
   for (const id of row.ids) {
     const skill = await read(`/registry/v1/artifacts/skill/${encodeURIComponent(id)}`).catch(error => {
       if (notFound(error)) return undefined;
       throw error;
     });
     if (!skill || skill.artifact_status === "archived") return `agent ${row.agent.id}: skill ${id} is not in Atlan`;
+    if (skill.is_released === false) row.unreleased.push(id);
   }
   const edges = await read(`/registry/v1/artifacts/agent/${encodeURIComponent(row.agent.id)}/relationships`);
   row.current = (Array.isArray(edges?.items) ? edges.items : [])
@@ -37767,6 +37769,7 @@ async function compareAgents({ rows, workspace, repository, registryToken, regis
       for (const folder of row.folders) {
         const [skill] = ownSkills(remote, folder, repository);
         if (skill) desired.add(skill.id);
+        if (skill?.released === false) row.unreleased.push(folder);
         if (!skill || !row.current.includes(skill.id)) row.added.push(folder);
       }
       row.removed = row.current.filter(id => !desired.has(id));
@@ -37787,7 +37790,9 @@ function agentLines(agents) {
     const parts = [
       ...(row.lost ?? []).map(skill => `− ${code(skill)} (removed in this pull request; merging unpins it)`),
       ...(row.added ?? []).map(skill => `+ ${code(skill)}`),
-      ...(row.removed ?? []).map(skill => `− ${code(skill)} (pinned in Atlan only; merging removes it)`)
+      ...(row.removed ?? []).map(skill => `− ${code(skill)} (pinned in Atlan only; merging removes it)`),
+      // Not a failure here: this pull request may be what releases it.
+      ...(row.unreleased ?? []).map(skill => `⚠️ ${code(skill)} has no release in Atlan yet; merging cannot pin it until it has one`)
     ];
     if (parts.length > 0) return parts.join("<br>");
     return agents.changed && !agents.compared ? "Not compared with Atlan" : "No change";
@@ -38299,7 +38304,7 @@ function validateRemoteSkill(item, workspace) {
   return {
     id: item.id, name: item.name, workspaceId: workspace, sourceDigest: item.source_digest,
     sourceId: remoteSourcePath(item), repoId: item.repo_id, versionOrdinal: item.version_ordinal,
-    sourceUri: typeof item.source_uri === "string" ? item.source_uri : undefined
+    sourceUri: typeof item.source_uri === "string" ? item.source_uri : undefined, released: item.is_released !== false
   };
 }
 
@@ -39132,7 +39137,13 @@ function ownSkillId(remote, folder, repository, agent) {
   const found = ownSkills(remote, folder, repository);
   if (found.length > 1) throw new Error(`agent ${agent.id}: ${folder} is more than one skill in Atlan, so it cannot be pinned`);
   if (found.length === 0) throw new Error(`agent ${agent.id}: ${folder} is not in Atlan yet, so it cannot be pinned`);
-  return found[0].id;
+  return released(found[0], folder, agent);
+}
+
+// The gateway pins a skill's current release and refuses one with none, without saying which.
+function released(skill, label, agent) {
+  if (skill?.released === false) throw new Error(`agent ${agent.id}: ${label} has no release in Atlan yet, so it cannot be pinned`);
+  return skill.id;
 }
 
 function answer(raw, agent) {
@@ -39162,6 +39173,7 @@ async function syncAgents({ agents, folders, token, workspace, repository, regis
   const results = [];
   for (const agent of managed) {
     const { ids, folders: own } = agentSkills(agent, folders);
+    for (const id of ids) released(remote.find(skill => skill.id === id) ?? { id }, id, agent);
     const pins = [...new Set([...own.map(folder => ownSkillId(remote, folder, repository, agent)), ...ids])];
     const route = `/agent/v1/agents/${agent.id}`;
     const call = (args, input) => aireg(args, input).catch(error => {
