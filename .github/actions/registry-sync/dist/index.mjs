@@ -37419,16 +37419,138 @@ function keyedLists(text, keys, usage) {
   return lists;
 }
 
-// The repository's own config: `version: 1`, its one `workspace`, and `skills:` as a list of globs.
-// Agents join with agent sync.
+const CONFIG_USAGE = `${CONFIG_FILE} takes \`version: 1\`, \`workspace\`, \`skills\`, a list of globs such as "skills/**", and \`agents\``;
+const AGENTS_USAGE = `each entry under \`agents\` in ${CONFIG_FILE} is \`- id: agent_…\` with \`path\` and \`skills\` below it`;
+const AGENT_ID = /^agent_[A-Za-z0-9]{1,64}$/;
+const SKILL_ID = /^skill_[A-Za-z0-9]{1,64}$/;
+const MAX_AGENTS = 100;
+const MAX_AGENT_SKILLS = 100;
+
+// The config's lines with their indent, past blank lines and comments. Tabs would make the nesting ambiguous.
+function indentedLines(text) {
+  const lines = [];
+  for (const raw of text.split("\n")) {
+    const body = raw.replace(/\s+#.*$/, "").trimEnd();
+    if (!body.trim() || body.trim().startsWith("#")) continue;
+    const indent = /^ */.exec(body)[0].length;
+    if (body[indent] === "\t") throw new Error(`${CONFIG_FILE} must be indented with spaces, not tabs`);
+    lines.push({ indent, text: body.slice(indent) });
+  }
+  return lines;
+}
+
+function scalar(value, usage) {
+  const values = globList(value);
+  if (values.length !== 1 || typeof values[0] !== "string") throw new Error(usage);
+  return values[0];
+}
+
+// `agents:` is a list of entries: `- id: …` opens one, and `path` and `skills` follow, deeper than its dash.
+function agentEntries(block) {
+  const entries = [];
+  let current;
+  let listing = false;
+  for (const line of block) {
+    let { text } = line;
+    if (line.indent === block[0].indent && text.startsWith("- ")) {
+      current = {};
+      entries.push(current);
+      listing = false;
+      text = text.slice(2).trim();
+    } else if (!current || line.indent <= block[0].indent) {
+      throw new Error(AGENTS_USAGE);
+    }
+    const item = /^-\s+(.+)$/.exec(text);
+    if (item) {
+      if (!listing) throw new Error(AGENTS_USAGE);
+      current.skills.push(...globList(item[1]));
+      continue;
+    }
+    const match = /^([a-z]+)\s*:\s*(.*)$/.exec(text);
+    if (!match || !["id", "path", "skills"].includes(match[1]) || match[1] in current) throw new Error(AGENTS_USAGE);
+    listing = match[1] === "skills" && !match[2];
+    current[match[1]] = match[1] === "skills" ? (match[2] ? globList(match[2]) : []) : scalar(match[2], AGENTS_USAGE);
+  }
+  return entries;
+}
+
+function checkAgents(agents) {
+  if (agents.length > MAX_AGENTS) throw new Error(`${CONFIG_FILE} lists more than ${MAX_AGENTS} agents`);
+  const ids = new Set();
+  const paths = new Set();
+  for (const agent of agents) {
+    if (!AGENT_ID.test(agent.id ?? "")) throw new Error(`${CONFIG_FILE}: every agent needs an \`id\` such as agent_01abc`);
+    if (!safeGlob(agent.path) || /[*?]/.test(agent.path)) {
+      throw new Error(`${CONFIG_FILE}: agent ${agent.id} needs a \`path\`, the repository-relative file or folder it lives in`);
+    }
+    if (ids.has(agent.id) || paths.has(agent.path)) {
+      throw new Error(`${CONFIG_FILE} lists agent ${ids.has(agent.id) ? agent.id : agent.path} twice`);
+    }
+    ids.add(agent.id);
+    paths.add(agent.path);
+    const skills = agent.skills ?? [];
+    if (skills.length > MAX_AGENT_SKILLS || new Set(skills).size !== skills.length ||
+        !skills.every(skill => SKILL_ID.test(skill) || safeGlob(skill))) {
+      throw new Error(`${CONFIG_FILE}: agent ${agent.id} lists up to ${MAX_AGENT_SKILLS} different skills, each a skill folder, a glob, or a skill_ ID`);
+    }
+  }
+  return agents.map(agent => ({ id: agent.id, path: agent.path, skills: agent.skills ?? [] }));
+}
+
+// The repository's own config: `version: 1`, its one `workspace`, `skills:` as a list of globs, and `agents`,
+// each with its Atlan `id`, the `path` it lives at, and the `skills` it uses.
 function configSettings(text) {
-  const lists = keyedLists(text, new Set(["version", "workspace", "skills"]),
-    `${CONFIG_FILE} takes \`version: 1\`, \`workspace\` and \`skills\`, a list of globs such as "skills/**"`);
-  if (lists.version?.length !== 1 || lists.version[0] !== 1) throw new Error(`${CONFIG_FILE} must set \`version: 1\``);
-  if (lists.workspace?.length !== 1) {
+  const lines = indentedLines(text);
+  const settings = {};
+  for (let index = 0; index < lines.length;) {
+    const match = /^([a-z]+)\s*:\s*(.*)$/.exec(lines[index].text);
+    if (lines[index].indent !== 0 || !match || !["version", "workspace", "skills", "agents"].includes(match[1]) ||
+        match[1] in settings) {
+      throw new Error(CONFIG_USAGE);
+    }
+    const block = [];
+    for (index += 1; index < lines.length && lines[index].indent > 0; index += 1) block.push(lines[index]);
+    if (match[1] === "agents") {
+      if (match[2]) throw new Error(AGENTS_USAGE);
+      settings.agents = agentEntries(block);
+    } else if (match[2]) {
+      if (block.length > 0) throw new Error(CONFIG_USAGE);
+      settings[match[1]] = globList(match[2]);
+    } else {
+      settings[match[1]] = block.map(line => {
+        const item = /^-\s+(.+)$/.exec(line.text);
+        if (!item) throw new Error(CONFIG_USAGE);
+        return globList(item[1]);
+      }).flat();
+    }
+  }
+  if (settings.version?.length !== 1 || settings.version[0] !== 1) throw new Error(`${CONFIG_FILE} must set \`version: 1\``);
+  if (settings.workspace?.length !== 1) {
     throw new Error(`${CONFIG_FILE} must name exactly one workspace: a repository syncs with one workspace`);
   }
-  return { workspace: lists.workspace[0], artifacts: { skill: lists.skills ?? [] } };
+  return {
+    workspace: settings.workspace[0],
+    artifacts: { skill: settings.skills ?? [] },
+    agents: checkAgents(settings.agents ?? [])
+  };
+}
+
+// An agent's skills as Atlan IDs and as this repository's skill folders, which must be ones the config publishes.
+function agentSkills(agent, folders) {
+  const ids = [];
+  const own = [];
+  for (const entry of agent.skills) {
+    if (SKILL_ID.test(entry)) {
+      ids.push(entry);
+      continue;
+    }
+    const matched = skillFolders(folders.map(folder => `${folder}/SKILL.md`), [entry]);
+    if (matched.length === 0) {
+      throw new Error(`agent ${agent.id}: ${entry} matches no skill folder that \`skills\` in ${CONFIG_FILE} covers`);
+    }
+    own.push(...matched);
+  }
+  return { ids: [...new Set(ids)], folders: [...new Set(own)] };
 }
 
 // `config` is the text of the repository's CONFIG_FILE, read by the caller from the commit it trusts. Without
@@ -37443,8 +37565,8 @@ function parseRegistryInputs(environment = process.env, config) {
   if (config === undefined && !input) {
     throw new Error(`add ${CONFIG_FILE} with your workspace and skill folders, or set the workspace and artifacts inputs`);
   }
-  const { workspace, artifacts } = config === undefined
-    ? { workspace: named, artifacts: keyedLists(input, KINDS, "each artifacts line names skill or agent once, as in `skill: [\"skills/**\"]`") }
+  const { workspace, artifacts, agents } = config === undefined
+    ? { workspace: named, artifacts: keyedLists(input, KINDS, "each artifacts line names skill or agent once, as in `skill: [\"skills/**\"]`"), agents: [] }
     : configSettings(config);
   if (typeof workspace !== "string" || !WORKSPACE.test(workspace)) {
     throw new Error("workspace must be the Atlan workspace ID artifacts publish to");
@@ -37453,7 +37575,7 @@ function parseRegistryInputs(environment = process.env, config) {
   if (globs.length === 0 || globs.length > MAX_GLOBS || !globs.every(safeGlob)) {
     throw new Error(`${input ? "artifacts" : CONFIG_FILE} must list 1-${MAX_GLOBS} repository-relative globs such as "skills/**"; brackets, braces and a trailing / are not supported`);
   }
-  return { workspace, artifacts };
+  return { workspace, artifacts, agents };
 }
 
 // `**` crosses folders; `*` and `?` stay inside one.
@@ -37507,429 +37629,6 @@ function preflightConfig({ workspace, artifacts }, files) {
   };
 }
 
-;// CONCATENATED MODULE: ./src/publish-baseline.js
-
-
-
-
-const RUN_PAGE_SIZE = 30;
-
-function isAncestor(cwd, sha) {
-  return (0,external_node_child_process_namespaceObject.spawnSync)("git", ["merge-base", "--is-ancestor", sha, "HEAD"], {
-    cwd, env: { PATH: "/usr/bin:/bin", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" }
-  }).status === 0;
-}
-
-// The commit a push publishes changes since: the last run that finished publishing, not the push's parent. GitHub
-// cancels a run still waiting in the concurrency group when a newer one arrives, so its changes would otherwise
-// never publish. A failed run is not retried here: its pull request is told, and a rerun publishes it.
-// Without `actions: read`, or with no earlier run, the push's parent stands in.
-async function publishBaseline({ environment, eventPayload, cwd, request = githubRequest, ancestor = isAncestor }) {
-  const before = eventPayload?.before;
-  const parent = typeof before === "string" && COMMIT_SHA.test(before) && !/^0+$/.test(before) ? before : undefined;
-  const token = common_getInput("github-token", environment);
-  const repository = environment.GITHUB_REPOSITORY || "";
-  const branch = eventPayload?.repository?.default_branch;
-  if (!parent || !token || !/^\d{1,20}$/.test(environment.GITHUB_RUN_ID || "") ||
-      !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository) || typeof branch !== "string") return parent;
-  try {
-    const run = await request({ token, method: "GET", requestPath: `/repos/${repository}/actions/runs/${environment.GITHUB_RUN_ID}`, expectedStatus: 200 });
-    if (!Number.isSafeInteger(run?.workflow_id)) return parent;
-    const query = new URLSearchParams({ branch, status: "completed", per_page: String(RUN_PAGE_SIZE) });
-    const listed = await request({ token, method: "GET", requestPath: `/repos/${repository}/actions/workflows/${run.workflow_id}/runs?${query}`, expectedStatus: 200 });
-    const finished = (Array.isArray(listed?.workflow_runs) ? listed.workflow_runs : []).find(candidate =>
-      ["success", "failure"].includes(candidate?.conclusion) && ["push", "workflow_dispatch"].includes(candidate.event) &&
-      typeof candidate.head_sha === "string" && COMMIT_SHA.test(candidate.head_sha) && ancestor(cwd, candidate.head_sha));
-    return finished?.head_sha ?? parent;
-  } catch {
-    process.stdout.write("::notice title=Registry Sync::earlier runs could not be read, so this push publishes only its own changes; grant the job actions: read\n");
-    return parent;
-  }
-}
-
-;// CONCATENATED MODULE: ./src/cli.js
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-const INSTALL_ENVIRONMENT_KEYS = [
-  "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL",
-  "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY",
-  "https_proxy", "http_proxy", "all_proxy", "no_proxy",
-  "SSL_CERT_FILE", "SSL_CERT_DIR", "RUNNER_OS", "RUNNER_ARCH"
-];
-
-const PUBLISH_ENVIRONMENT_KEYS = [
-  "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL",
-  "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY",
-  "https_proxy", "http_proxy", "all_proxy", "no_proxy",
-  "RUNNER_OS", "RUNNER_ARCH", "CI", "GITHUB_ACTIONS", "GITHUB_ACTOR", "GITHUB_JOB",
-  "GITHUB_REF", "GITHUB_REF_NAME", "GITHUB_REF_TYPE", "GITHUB_REPOSITORY",
-  "GITHUB_RUN_ATTEMPT", "GITHUB_RUN_ID", "GITHUB_SHA", "GITHUB_WORKFLOW"
-];
-
-const SYSTEM_PATH = "/usr/bin:/bin";
-const SELF_UPDATE_ARGUMENTS = Object.freeze(["self", "update", "--json"]);
-// Without a terminal, aireg installs an adapter it does not trust only when told to.
-const ADAPTER_ARGUMENTS = Object.freeze(["adapter", "install", ADAPTER, "--yes"]);
-const PUBLISH_ALIAS = "atlan";
-// Declared in the Action-owned user scope, so the token's only destination is the fixed gateway
-// and nothing is written into the repository.
-const REGISTRY_ARGUMENTS = Object.freeze(["registry", "add", PUBLISH_GATEWAY, "--as", PUBLISH_ALIAS, "--adapter", ADAPTER, "-g"]);
-const MAX_CLI_OUTPUT_BYTES = 64 * 1024;
-
-const CLI_OS = { linux: "linux", darwin: "darwin" };
-const CLI_ARCH = { x64: "amd64", arm64: "arm64" };
-
-function assertSupportedPublishPlatform(platform = process.platform) {
-  if (!Object.hasOwn(CLI_OS, platform)) {
-    throw new Error("publish mode supports Linux and macOS runners; use ubuntu-latest or macos-latest");
-  }
-}
-
-// Maps the Node runtime platform onto the pinned CLI artifact name.
-function resolveCliPlatform(platform = process.platform, arch = process.arch) {
-  assertSupportedPublishPlatform(platform);
-  if (!Object.hasOwn(CLI_ARCH, arch)) {
-    throw new Error("publish mode supports amd64 and arm64 runners only");
-  }
-  const target = `${CLI_OS[platform]}-${CLI_ARCH[arch]}`;
-  if (!Object.hasOwn(CLI_SHA256, target)) {
-    throw new Error(`the Action does not pin aireg for ${target}`);
-  }
-  return target;
-}
-
-function assertNoSymlinks(root, candidate) {
-  const relative = external_node_path_namespaceObject.relative(root, candidate);
-  let current = root;
-  for (const part of relative ? relative.split(external_node_path_namespaceObject.sep) : []) {
-    current = external_node_path_namespaceObject.join(current, part);
-    if (external_node_fs_namespaceObject.lstatSync(current).isSymbolicLink()) throw new Error("working-directory cannot contain symbolic links");
-  }
-}
-
-function resolveWorkingDirectory(environment = process.env) {
-  const workspaceInput = external_node_path_namespaceObject.resolve(environment.GITHUB_WORKSPACE || process.cwd());
-  const workspace = external_node_fs_namespaceObject.realpathSync(workspaceInput);
-  const requested = external_node_path_namespaceObject.resolve(common_getInput("working-directory", environment) || workspaceInput);
-  const lexicalRoot = isWithin(workspaceInput, requested) ? workspaceInput : workspace;
-  if (!isWithin(lexicalRoot, requested) || !external_node_fs_namespaceObject.existsSync(requested)) {
-    throw new Error("working-directory must be an existing directory inside GITHUB_WORKSPACE");
-  }
-  assertNoSymlinks(lexicalRoot, requested);
-  const resolved = external_node_fs_namespaceObject.realpathSync(requested);
-  if (!isWithin(workspace, resolved)) {
-    throw new Error("working-directory must be an existing directory inside GITHUB_WORKSPACE");
-  }
-  if (!external_node_fs_namespaceObject.statSync(resolved).isDirectory()) {
-    throw new Error("working-directory must be an existing directory inside GITHUB_WORKSPACE");
-  }
-  return resolved;
-}
-
-function writeBoundedCli(response, destination, createDestination = external_node_fs_namespaceObject.createWriteStream) {
-  let received = 0;
-  const limiter = new external_node_stream_.Transform({
-    transform(chunk, _encoding, callback) {
-      received += chunk.length;
-      callback(received > MAX_CLI_BYTES
-        ? new Error("aireg download exceeds the size limit")
-        : null, chunk);
-    }
-  });
-  return (0,external_node_stream_promises_namespaceObject.pipeline)(response, limiter, createDestination(destination, { mode: 0o700 }));
-}
-
-async function verifyCliDigest(binary, expectedDigest) {
-  if (typeof expectedDigest !== "string" || !SHA256.test(expectedDigest)) {
-    throw new Error("Action-pinned CLI digest is invalid");
-  }
-  const metadata = await promises_namespaceObject.lstat(binary);
-  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > MAX_CLI_BYTES) {
-    throw new Error("aireg is not a bounded regular file");
-  }
-  const hash = (0,external_node_crypto_.createHash)("sha256");
-  for await (const chunk of external_node_fs_namespaceObject.createReadStream(binary)) hash.update(chunk);
-  if (!(0,external_node_crypto_.timingSafeEqual)(hash.digest(), Buffer.from(expectedDigest, "hex"))) {
-    throw new Error("aireg digest does not match the Action-pinned digest");
-  }
-}
-
-function cliArtifactURL(target, version = CLI_VERSION) {
-  if (!Object.hasOwn(CLI_SHA256, target)) throw new Error("aireg platform is not pinned");
-  if (!RELEASE_VERSION.test(version)) throw new Error("Action-pinned CLI version is invalid");
-  return `${CLI_ORIGIN}${CLI_ARTIFACT_PATH}${version}/aireg-${target}`;
-}
-
-const CLI_URL_PATHNAME = new RegExp(
-  `^${CLI_ARTIFACT_PATH}(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)/aireg-(?:darwin|linux)-(?:amd64|arm64)$`
-);
-
-function validateCliURL(cliURL) {
-  let url;
-  try {
-    url = new URL(cliURL);
-  } catch {
-    throw new Error("aireg URL must be valid HTTPS");
-  }
-  if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash || !CLI_URL_PATHNAME.test(url.pathname)) {
-    throw new Error("aireg URL must be a clean HTTPS version-addressed artifact URL");
-  }
-  if (url.origin !== CLI_ORIGIN) {
-    throw new Error("aireg host is not approved");
-  }
-}
-
-function downloadCli(url, destination) {
-  validateCliURL(url);
-  return new Promise((resolve, reject) => {
-    const request = external_node_https_namespaceObject.get(url, {
-      timeout: 60_000,
-      headers: { "User-Agent": "atlan-agent-registry-action" }
-    }, response => {
-      if (response.statusCode >= 300 && response.statusCode < 400) {
-        response.resume();
-        reject(new Error("aireg download redirected; refusing an unapproved source"));
-        return;
-      }
-      if (response.statusCode !== 200) {
-        response.resume();
-        reject(new Error(`aireg download failed with HTTP ${response.statusCode}`));
-        return;
-      }
-      const declaredSize = Number(response.headers["content-length"] || 0);
-      if (declaredSize > MAX_CLI_BYTES) {
-        response.resume();
-        reject(new Error("aireg download exceeds the size limit"));
-        return;
-      }
-      void writeBoundedCli(response, destination).then(resolve, reject);
-    });
-    request.on("timeout", () => request.destroy(new Error("aireg download timed out")));
-    request.on("error", reject);
-  });
-}
-
-function runtimeEnvironment(environment, keys, runtimeDirectory) {
-  if (!external_node_path_namespaceObject.isAbsolute(runtimeDirectory)) throw new Error("Action-owned CLI home must be an absolute path");
-  const allowed = Object.fromEntries(keys
-    .filter(key => environment[key] !== undefined)
-    .map(key => [key, environment[key]]));
-  return {
-    ...allowed,
-    HOME: runtimeDirectory,
-    AIREG_HOME: external_node_path_namespaceObject.join(runtimeDirectory, ".aireg"),
-    AIREG_USER_SCOPE: external_node_path_namespaceObject.join(runtimeDirectory, "registry"),
-    PATH: SYSTEM_PATH
-  };
-}
-
-function installEnvironment(environment, runtimeDirectory) {
-  return runtimeEnvironment(environment, INSTALL_ENVIRONMENT_KEYS, runtimeDirectory);
-}
-
-// Mirrors aireg's own per-registry variable name, so the token reaches that registry alone.
-function tokenVariable(alias) {
-  return `AIREG_TOKEN_${alias.toUpperCase().replaceAll(/[^A-Z0-9]/g, "_")}`;
-}
-
-function publisherEnvironment(environment, token, runtimeDirectory, aliases = []) {
-  return {
-    ...runtimeEnvironment(environment, PUBLISH_ENVIRONMENT_KEYS, runtimeDirectory),
-    GIT_CONFIG_NOSYSTEM: "1",
-    GIT_CONFIG_GLOBAL: "/dev/null",
-    ...Object.fromEntries(aliases.map(alias => [tokenVariable(alias), token]))
-  };
-}
-
-// Only what the repository tracks can be an artifact, so a build output never publishes.
-function trackedFiles(cwd) {
-  const listed = (0,external_node_child_process_namespaceObject.spawnSync)("git", ["ls-files", "-z"], {
-    cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024,
-    env: { PATH: SYSTEM_PATH, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" }
-  });
-  if (listed.status !== 0) throw new Error("could not list the repository's files; check it out before this step");
-  return listed.stdout.split("\0").filter(Boolean);
-}
-
-// The repository's CONFIG_FILE when it tracks one: a regular file only, so a link cannot pull in another.
-function syncConfig(cwd, files) {
-  if (!files.includes(CONFIG_FILE)) return undefined;
-  const found = external_node_fs_namespaceObject.lstatSync(external_node_path_namespaceObject.join(cwd, CONFIG_FILE), { throwIfNoEntry: false });
-  if (!found?.isFile() || found.size > MAX_CONFIG_BYTES) {
-    throw new Error(`${CONFIG_FILE} must be a regular file of at most ${MAX_CONFIG_BYTES} bytes`);
-  }
-  return external_node_fs_namespaceObject.readFileSync(external_node_path_namespaceObject.join(cwd, CONFIG_FILE), "utf8");
-}
-
-// A changed config can cover skills whose files did not change. git exits 1 for a difference alone.
-function configChanged(cwd, sha) {
-  return (0,external_node_child_process_namespaceObject.spawnSync)("git", ["diff", "--quiet", sha, "HEAD", "--", CONFIG_FILE], {
-    cwd, env: { PATH: SYSTEM_PATH, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" }
-  }).status === 1;
-}
-
-// An agent is a tracked Markdown file with `name` and `description` front matter, so a README is skipped.
-// A SKILL.md never is: the CLI would publish its whole folder, and at the root that is the checkout.
-function agentFiles(cwd, files, globs = []) {
-  const patterns = globs.map(globPattern);
-  return files.filter(file => file.endsWith(".md") && external_node_path_namespaceObject.posix.basename(file) !== "SKILL.md" &&
-    patterns.some(pattern => pattern.test(file)) && hasFrontMatter(external_node_path_namespaceObject.join(cwd, file))).sort();
-}
-
-function hasFrontMatter(file) {
-  if (!external_node_fs_namespaceObject.existsSync(file) || !external_node_fs_namespaceObject.lstatSync(file).isFile() || external_node_fs_namespaceObject.statSync(file).size > MAX_SKILL_BYTES) return false;
-  const head = /^---\r?\n([\s\S]*?)\r?\n---/.exec(external_node_fs_namespaceObject.readFileSync(file, "utf8"));
-  return Boolean(head && /^name:\s*\S/m.test(head[1]) && /^description:\s*\S/m.test(head[1]));
-}
-
-// The CLI compares with the Registry by workspace name, so the ID the workflow names is looked up once.
-async function workspaceName(token, workspace, registry = registryRequest) {
-  const found = await registry({ token, requestPath: `/registry/v1/workspaces/${encodeURIComponent(workspace)}` });
-  if (typeof found?.name !== "string" || !/^[A-Za-z0-9_.-]{1,128}$/.test(found.name)) {
-    throw new Error(`workspace ${workspace} was not found, or its name cannot be read`);
-  }
-  return found.name;
-}
-
-// A push publishes only what changed since its baseline. A manual run or a new branch has none,
-// so it publishes everything. Every aireg release takes the flag.
-function changedSinceArguments(baseline) {
-  return typeof baseline === "string" && COMMIT_SHA.test(baseline) ? ["--changed-since", baseline] : [];
-}
-
-function parseCliVersion(raw) {
-  const match = /^v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\s*$/.exec(raw.split("\n")[0] ?? "");
-  if (!match) throw new Error("installed aireg did not return a valid version");
-  return match[1];
-}
-
-// `self update` names the newest release it installed, which must sit in the Action-owned home, or keeps this one.
-function updatedCli(raw, binary, directory) {
-  let data;
-  try {
-    data = JSON.parse(raw)?.data;
-  } catch {
-    data = undefined;
-  }
-  if (data?.action === "already-latest") return binary;
-  if (data?.action !== "updated" || typeof data.bin !== "string" || !external_node_path_namespaceObject.isAbsolute(data.bin) || !isWithin(directory, data.bin)) {
-    throw new Error("aireg returned an unreadable self update result");
-  }
-  return data.bin;
-}
-
-// Runs the verified CLI directly, without a shell; captures bounded stdout when asked.
-function runCli(binary, args, cwd, environment, capture = false) {
-  return new Promise((resolve, reject) => {
-    const child = (0,external_node_child_process_namespaceObject.spawn)(binary, [...args], {
-      cwd,
-      env: environment,
-      shell: false,
-      stdio: capture ? ["ignore", "pipe", "inherit"] : "inherit"
-    });
-    const chunks = [];
-    let size = 0;
-    child.stdout?.on("data", chunk => {
-      size += chunk.length;
-      if (size <= MAX_CLI_OUTPUT_BYTES) chunks.push(chunk);
-      else child.kill();
-    });
-    child.on("error", reject);
-    // "close" waits for stdout to drain; "exit" can fire first and lose the tail of it.
-    child.on("close", code => {
-      if (size > MAX_CLI_OUTPUT_BYTES) return reject(new Error("aireg output exceeds the size limit"));
-      if (code !== 0) return reject(new Error(`aireg ${args[0]} exited with status ${code}`));
-      resolve(Buffer.concat(chunks).toString("utf8"));
-    });
-  });
-}
-
-async function installCli({
-  environment = process.env,
-  download = downloadCli,
-  verifyCli = verifyCliDigest,
-  execute = runCli
-} = {}) {
-  const target = resolveCliPlatform();
-  // Real, so the binary `self update` reports (macOS resolves /var to /private/var) is recognised as inside it.
-  const directory = await promises_namespaceObject.realpath(await promises_namespaceObject.mkdtemp(external_node_path_namespaceObject.join(external_node_os_namespaceObject.tmpdir(), "registry-skill-sync-")));
-  const binary = external_node_path_namespaceObject.join(directory, "aireg");
-  try {
-    await download(cliArtifactURL(target), binary);
-    await verifyCli(binary, CLI_SHA256[target]);
-    await promises_namespaceObject.chmod(binary, 0o700);
-    const safeEnvironment = installEnvironment(environment, directory);
-    const updated = await execute(binary, SELF_UPDATE_ARGUMENTS, directory, safeEnvironment, true);
-    const newest = updatedCli(updated, binary, directory);
-    const version = parseCliVersion(await execute(newest, ["--version"], directory, safeEnvironment, true));
-    await execute(newest, ADAPTER_ARGUMENTS, directory, safeEnvironment);
-    return { binary: newest, directory, version };
-  } catch (error) {
-    await promises_namespaceObject.rm(directory, { recursive: true, force: true });
-    throw error;
-  }
-}
-
-async function runPublishAction({
-  environment = process.env,
-  install = installCli,
-  execute = runCli,
-  registry = registryRequest,
-  request,
-  ancestor,
-  eventPayload
-} = {}) {
-  const token = environment.ATLANAI_TOKEN;
-  if (!token) throw new Error("ATLANAI_TOKEN must be supplied as a workflow secret");
-  maskSecret(token, environment);
-  const cwd = resolveWorkingDirectory(environment);
-  if (parseBoolean("prune", common_getInput("prune", environment) || "false")) {
-    throw new Error("prune is not supported with aireg yet; set prune to false");
-  }
-  const files = trackedFiles(cwd);
-  const config = syncConfig(cwd, files);
-  const inputs = parseRegistryInputs(environment, config);
-  // A tracked file can be missing from the checkout, as in a sparse checkout; it cannot publish.
-  const skills = skillFolders(files, inputs.artifacts.skill).filter(folder => external_node_fs_namespaceObject.existsSync(external_node_path_namespaceObject.join(cwd, folder, "SKILL.md")));
-  const paths = [...skills, ...agentFiles(cwd, files, inputs.artifacts.agent)];
-  // The CLI expands a path it is given, so one that reads as a glob is refused rather than widened.
-  const unsafe = paths.find(item => /[*?[\]{}\\]|[+@!]\(/.test(item));
-  if (unsafe) throw new Error(`${unsafe} contains glob characters, so it cannot be published as an exact path`);
-  if (paths.length === 0) {
-    process.stdout.write("::notice title=Registry Sync::no tracked file matches the skill globs, so nothing was published\n");
-    common_setOutput("status", "success", environment);
-    return;
-  }
-  const namespace = await workspaceName(token, inputs.workspace, registry);
-  const since = await publishBaseline({ environment, eventPayload, cwd, request, ancestor });
-  // With no baseline, everything the config covers that differs from Atlan publishes.
-  const baseline = since && config !== undefined && configChanged(cwd, since) ? undefined : since;
-  const { binary, directory, version } = await install({ environment });
-  try {
-    const publisher = publisherEnvironment(environment, token, directory, [PUBLISH_ALIAS]);
-    // Run where no project manifest is found, so the registry is declared in the user scope alone.
-    await execute(binary, REGISTRY_ARGUMENTS, directory, publisher);
-    const args = ["publish", ...paths.map(item => `./${item}`), "--to", `${PUBLISH_ALIAS}/${namespace}`, "--yes", "-g", ...changedSinceArguments(baseline)];
-    await execute(binary, args, cwd, publisher);
-    common_setOutput("status", "success", environment);
-    common_setOutput("cli-version", version, environment);
-  } finally {
-    await promises_namespaceObject.rm(directory, { recursive: true, force: true });
-  }
-}
-
 ;// CONCATENATED MODULE: ./src/skill-digest.js
 
 
@@ -37979,7 +37678,122 @@ function canonicalSkillName(raw) {
   return undefined;
 }
 
+;// CONCATENATED MODULE: ./src/preflight-agents.js
+
+
+// The repository identity aireg stamps on a skill it publishes from this checkout.
+function repositoryUri(repository) {
+  return `https://github.com/${repository}`.toLowerCase();
+}
+
+// This repository's Atlan skills at `folder`: another repository's skill at the same path is not one of them.
+function ownSkills(remote, folder, repository) {
+  const uri = repositoryUri(repository);
+  return remote.filter(skill => skill.sourceId === folder && skill.sourceUri?.toLowerCase().replace(/\.git$/, "") === uri);
+}
+
+const notFound = error => error?.status === 404;
+
+async function agentInAtlan({ row, workspace, registryToken, registry }) {
+  const read = requestPath => registry({ token: registryToken, requestPath });
+  const found = await read(`/registry/v1/artifacts/agent/${encodeURIComponent(row.agent.id)}`);
+  if (found?.workspace_id !== workspace) return `agent ${row.agent.id} is not in the workspace ${CONFIG_FILE} names`;
+  if (found.artifact_status === "archived") return `agent ${row.agent.id} is archived in Atlan`;
+  row.name = typeof found.name === "string" ? found.name : row.agent.id;
+  for (const id of row.ids) {
+    const skill = await read(`/registry/v1/artifacts/skill/${encodeURIComponent(id)}`).catch(error => {
+      if (notFound(error)) return undefined;
+      throw error;
+    });
+    if (!skill || skill.artifact_status === "archived") return `agent ${row.agent.id}: skill ${id} is not in Atlan`;
+  }
+  const edges = await read(`/registry/v1/artifacts/agent/${encodeURIComponent(row.agent.id)}/relationships`);
+  row.current = (Array.isArray(edges?.items) ? edges.items : [])
+    .filter(edge => edge?.rel_type === "uses_skill" && edge.relationship_status === "active" && typeof edge.to?.id === "string")
+    .map(edge => edge.to.id);
+  return undefined;
+}
+
+// Each agent's skills resolved against a tree: its path must be there, and each skill entry a skill folder the
+// config publishes or a skill ID. Local only, so a pull request that changes only skills can afford it.
+function resolveAgents({ agents, tree, globs }) {
+  const files = [...tree];
+  const folders = skillFolders(files, globs);
+  const rows = [];
+  for (const agent of agents) {
+    if (!files.some(file => file === agent.path || file.startsWith(`${agent.path}/`))) {
+      return { error: `agent ${agent.id}: ${agent.path} is not in this pull request's files; update its \`path\` in ${CONFIG_FILE}` };
+    }
+    try {
+      rows.push({ agent, ...agentSkills(agent, folders) });
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : `agent ${agent.id} lists skills that cannot be resolved` };
+    }
+  }
+  return { rows };
+}
+
+// The skill folders an agent pinned at the base and loses at the head, as a skill-only pull request can do.
+function lostPins(rows, baseRows) {
+  for (const row of rows) {
+    const before = baseRows.find(item => item.agent.id === row.agent.id);
+    row.lost = (before?.folders ?? []).filter(folder => !row.folders.includes(folder));
+  }
+  return rows;
+}
+
+// For a pull request that changes an agent: each must be in the config's one workspace, and what merging pins
+// is shown against what Atlan pins now, since the repository's list replaces it. An agent Atlan has no record
+// of fails; a Registry that cannot answer leaves the rows not compared.
+async function compareAgents({ rows, workspace, repository, registryToken, registry, inventory }) {
+  if (!registryToken) return { compared: false };
+  try {
+    const remote = (await inventory()) ?? [];
+    for (const row of rows.filter(item => item.agent.skills.length > 0)) {
+      const missing = await agentInAtlan({ row, workspace, registryToken, registry }).catch(error => {
+        if (notFound(error)) return `agent ${row.agent.id} is not in Atlan; link it first`;
+        throw error;
+      });
+      if (missing) return { compared: false, error: missing };
+      const desired = new Set(row.ids);
+      row.added = row.ids.filter(id => !row.current.includes(id));
+      for (const folder of row.folders) {
+        const [skill] = ownSkills(remote, folder, repository);
+        if (skill) desired.add(skill.id);
+        if (!skill || !row.current.includes(skill.id)) row.added.push(folder);
+      }
+      row.removed = row.current.filter(id => !desired.has(id));
+    }
+    return { compared: true };
+  } catch {
+    return { compared: false };
+  }
+}
+
+const code = value => `\`${String(value).replaceAll("`", "'")}\``;
+
+// One row per agent: how many skills it pins after merge, and what changes in Atlan.
+function agentLines(agents) {
+  if (!agents?.rows?.length) return [];
+  const change = row => {
+    if (row.agent.skills.length === 0) return "Skills not managed by this repository";
+    const parts = [
+      ...(row.lost ?? []).map(skill => `− ${code(skill)} (removed in this pull request; merging unpins it)`),
+      ...(row.added ?? []).map(skill => `+ ${code(skill)}`),
+      ...(row.removed ?? []).map(skill => `− ${code(skill)} (pinned in Atlan only; merging removes it)`)
+    ];
+    if (parts.length > 0) return parts.join("<br>");
+    return agents.changed && !agents.compared ? "Not compared with Atlan" : "No change";
+  };
+  return [
+    "| Agent | Skills after merge | Change in Atlan |",
+    "| --- | --- | --- |",
+    ...agents.rows.map(row => `| ${code(row.name ?? row.agent.id)} (${code(row.agent.path)}) | ${row.agent.skills.length === 0 ? "—" : row.ids.length + row.folders.length} | ${change(row)} |`)
+  ];
+}
+
 ;// CONCATENATED MODULE: ./src/preflight.js
+
 
 
 
@@ -38477,7 +38291,8 @@ function validateRemoteSkill(item, workspace) {
   }
   return {
     id: item.id, name: item.name, workspaceId: workspace, sourceDigest: item.source_digest,
-    sourceId: remoteSourcePath(item), repoId: item.repo_id, versionOrdinal: item.version_ordinal
+    sourceId: remoteSourcePath(item), repoId: item.repo_id, versionOrdinal: item.version_ordinal,
+    sourceUri: typeof item.source_uri === "string" ? item.source_uri : undefined
   };
 }
 
@@ -38685,8 +38500,10 @@ async function buildPreflightReport({ token, context, request, registryToken, re
 
   const configChanged = !fromInput && touches(syncFile ? CONFIG_FILE : ".atlan/package.json");
   let proposedConfig;
+  let proposedInputs;
   if (configChanged && context.headSha && syncFile) {
     const proposed = await readSyncConfig({ token, context, request, ref: context.headSha, environment, source: "proposed" });
+    proposedInputs = proposed?.inputs;
     proposedConfig = proposed?.inputs
       ? preflightConfig(proposed.inputs, [])
       : { valid: false, reason: proposed?.error ?? `This pull request removes ${CONFIG_FILE}, which names the workspace and skills` };
@@ -38729,8 +38546,36 @@ async function buildPreflightReport({ token, context, request, registryToken, re
   // no token, and a skill that will be answered with HTTP 422 on publish is worth saying whatever else is known.
   // Validation is the gate before publishing: every changed skill is checked, and one that cannot be read makes the
   // run unchecked rather than passing it.
+  // Agents depend on skills, not the reverse. Every pull request re-resolves each agent's skills against its tree,
+  // locally, so deleting a skill an agent uses fails here rather than halfway through a publish. One that changes an
+  // agent also checks every skill that agent lists, then the agent itself in Atlan.
+  const agentConfig = syncFile && !configError ? proposedInputs ?? baseConfig?.inputs : undefined;
+  const agentsChanged = Boolean(proposedInputs) &&
+    JSON.stringify(proposedInputs.agents) !== JSON.stringify(baseConfig?.inputs?.agents ?? []);
+  let agents;
+  const dependent = [];
+  if (agentConfig?.agents.length > 0 && treeFiles) {
+    const resolved = resolveAgents({ agents: agentConfig.agents, tree: treeFiles.keys(), globs: agentConfig.artifacts.skill });
+    if (resolved.error) {
+      configError = resolved.error;
+    } else if (agentsChanged) {
+      agents = { rows: resolved.rows, changed: true };
+      const listed = new Set(eligible.map(file => file.directory));
+      for (const folder of new Set(resolved.rows.flatMap(row => row.folders))) {
+        if (listed.has(folder)) continue;
+        dependent.push({
+          filename: `${folder}/SKILL.md`, directory: folder, skill: folder.split("/").at(-1), status: "modified",
+          additions: 0, deletions: 0, definitionChanged: true, supportingChanges: 0
+        });
+      }
+    } else if (baseTree && baseConfig?.inputs) {
+      const before = resolveAgents({ agents: baseConfig.inputs.agents, tree: baseTree.keys(), globs: baseConfig.inputs.artifacts.skill });
+      const affected = before.error ? [] : lostPins(resolved.rows, before.rows).filter(row => row.lost.length > 0);
+      if (affected.length > 0) agents = { rows: affected, changed: false };
+    }
+  }
   const rejections = [];
-  const present = eligible.filter(file => file.status !== "removed");
+  const present = [...eligible.filter(file => file.status !== "removed"), ...dependent];
   let unchecked = !configError && inputs && !config.valid ? config.reason : undefined;
   if (!unchecked && present.length > 0) {
     try {
@@ -38744,6 +38589,8 @@ async function buildPreflightReport({ token, context, request, registryToken, re
           ? [{ problem: `\`SKILL.md\` is over ${MAX_SKILL_BYTES / 1024 / 1024} MiB`, fix: "move reference material into files beside SKILL.md and link to them" }]
           : skillRejections(content);
         if (problems.length > 0) rejections.push({ file, problems });
+        // A skill an agent lists that this pull request did not change is shown only when Atlan would refuse it.
+        if (problems.length > 0 && dependent.includes(file)) eligible.push(file);
       }
     } catch (error) {
       unchecked = error instanceof Error ? error.message : "the changed SKILL.md files could not be read";
@@ -38803,6 +38650,18 @@ async function buildPreflightReport({ token, context, request, registryToken, re
       }
     }
   }
+  // An agent's skills are compared with Atlan only under a base config: the pull request that adds the config would
+  // otherwise choose what the token reads.
+  if (agents?.changed && !configError) {
+    const workspace = baseConfig?.inputs?.workspace;
+    const result = await compareAgents({
+      rows: agents.rows, workspace, repository: context.repository, registryToken: workspace ? registryToken : "", registry,
+      inventory: async () => (await loadRegistryInventory({ token: registryToken, request: registry, context, workspaces: [workspace] }))
+        .byWorkspace.get(workspace)
+    });
+    agents.compared = result.compared;
+    if (result.error) configError = result.error;
+  }
   const conflictCount = registryState.comparisons.reduce((count, comparison) =>
     count + comparison.results.filter(result => result.status === "conflict").length, 0);
   return {
@@ -38810,6 +38669,7 @@ async function buildPreflightReport({ token, context, request, registryToken, re
     available: true,
     configured: Boolean(inputs),
     configError,
+    agents,
     setup: syncFile && !baseConfig && !configError,
     config,
     configChanged,
@@ -39150,6 +39010,9 @@ function formatPreflightComment(report, compact = false) {
     );
   }
 
+  const agentTable = report.configError ? [] : agentLines(report.agents);
+  if (agentTable.length > 0) lines.push("#### Agents", "", ...agentTable, "");
+
   if (state === "unavailable" && !report.unchecked && !report.configError && !report.setup) {
     lines.push("We couldn't compare this PR with Atlan. Check the Registry token or workflow configuration, then retry.");
   } else if (state !== "conflict") {
@@ -39247,6 +39110,509 @@ async function runPreflight({ environment = process.env, request = githubRequest
     throw new Error(`${plural(report.rejections.length, "skill")} the Registry would reject must be fixed before this check can pass`);
   }
   if (report.unchecked) throw new Error(`preflight could not check every changed skill: ${report.unchecked}`);
+}
+
+;// CONCATENATED MODULE: ./src/publish-agents.js
+
+
+
+
+// A repository skill folder as its Atlan skill: this repository's, at that path, and only one of them.
+function ownSkillId(remote, folder, repository, agent) {
+  const found = ownSkills(remote, folder, repository);
+  if (found.length > 1) throw new Error(`agent ${agent.id}: ${folder} is more than one skill in Atlan, so it cannot be pinned`);
+  if (found.length === 0) throw new Error(`agent ${agent.id}: ${folder} is not in Atlan yet, so it cannot be pinned`);
+  return found[0].id;
+}
+
+function answer(raw, agent) {
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`agent ${agent.id}: aireg returned an unreadable answer`);
+  }
+  const body = parsed?.data?.body;
+  if (parsed?.ok !== true || !body || typeof body !== "object") throw new Error(`agent ${agent.id}: aireg returned an unreadable answer`);
+  return body;
+}
+
+// After the skills publish, each agent with skills is pinned to exactly what the config lists, the repository
+// being the source of truth. The gateway pins each skill's current release and keeps the agent's version when
+// nothing moved, so sending the whole list every run is safe. An agent with no skills listed is left alone,
+// since an empty list would archive every skill link it has. CI never creates an agent or touches its key.
+async function syncAgents({ agents, folders, token, workspace, repository, registry, alias, aireg }) {
+  const managed = agents.filter(agent => agent.skills.length > 0);
+  if (managed.length === 0) return [];
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository ?? "")) {
+    throw new Error("GITHUB_REPOSITORY is needed to find this repository's skills in Atlan");
+  }
+  const { byWorkspace } = await loadRegistryInventory({ token, request: registry, context: { repository }, workspaces: [workspace] });
+  const remote = byWorkspace.get(workspace) ?? [];
+  // `aireg atlan api` reads a stored sign-in, which the Action-owned home keeps for this run alone.
+  await aireg(["auth", "login", alias, "--token-stdin"], token);
+  const results = [];
+  for (const agent of managed) {
+    const { ids, folders: own } = agentSkills(agent, folders);
+    const pins = [...new Set([...own.map(folder => ownSkillId(remote, folder, repository, agent)), ...ids])];
+    const route = `/agent/v1/agents/${agent.id}`;
+    const call = (args, input) => aireg(args, input).catch(error => {
+      throw new Error(`agent ${agent.id}: ${error instanceof Error ? error.message : "aireg failed"}`);
+    });
+    const before = answer(await call(["atlan", "api", "get", route, "--registry", alias, "--json"]), agent);
+    if (before.workspace_id !== workspace) throw new Error(`agent ${agent.id} is not in the workspace ${CONFIG_FILE} names`);
+    if (before.artifact_status === "archived") throw new Error(`agent ${agent.id} is archived in Atlan`);
+    const body = JSON.stringify({ skills: pins.map(skillId => ({ skill_id: skillId })) });
+    const after = answer(await call(["atlan", "api", "patch", route, "--registry", alias, "--input", "-", "--json"], body), agent);
+    results.push({ id: agent.id, name: after.name ?? agent.id, pins: pins.length, from: before.version_ordinal, to: after.version_ordinal });
+  }
+  return results;
+}
+
+;// CONCATENATED MODULE: ./src/publish-baseline.js
+
+
+
+
+const RUN_PAGE_SIZE = 30;
+
+function isAncestor(cwd, sha) {
+  return (0,external_node_child_process_namespaceObject.spawnSync)("git", ["merge-base", "--is-ancestor", sha, "HEAD"], {
+    cwd, env: { PATH: "/usr/bin:/bin", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" }
+  }).status === 0;
+}
+
+// The commit a push publishes changes since: the last run that finished publishing, not the push's parent. GitHub
+// cancels a run still waiting in the concurrency group when a newer one arrives, so its changes would otherwise
+// never publish. A failed run is not retried here: its pull request is told, and a rerun publishes it.
+// Without `actions: read`, or with no earlier run, the push's parent stands in.
+async function publishBaseline({ environment, eventPayload, cwd, request = githubRequest, ancestor = isAncestor }) {
+  const before = eventPayload?.before;
+  const parent = typeof before === "string" && COMMIT_SHA.test(before) && !/^0+$/.test(before) ? before : undefined;
+  const token = common_getInput("github-token", environment);
+  const repository = environment.GITHUB_REPOSITORY || "";
+  const branch = eventPayload?.repository?.default_branch;
+  if (!parent || !token || !/^\d{1,20}$/.test(environment.GITHUB_RUN_ID || "") ||
+      !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository) || typeof branch !== "string") return parent;
+  try {
+    const run = await request({ token, method: "GET", requestPath: `/repos/${repository}/actions/runs/${environment.GITHUB_RUN_ID}`, expectedStatus: 200 });
+    if (!Number.isSafeInteger(run?.workflow_id)) return parent;
+    const query = new URLSearchParams({ branch, status: "completed", per_page: String(RUN_PAGE_SIZE) });
+    const listed = await request({ token, method: "GET", requestPath: `/repos/${repository}/actions/workflows/${run.workflow_id}/runs?${query}`, expectedStatus: 200 });
+    const finished = (Array.isArray(listed?.workflow_runs) ? listed.workflow_runs : []).find(candidate =>
+      ["success", "failure"].includes(candidate?.conclusion) && ["push", "workflow_dispatch"].includes(candidate.event) &&
+      typeof candidate.head_sha === "string" && COMMIT_SHA.test(candidate.head_sha) && ancestor(cwd, candidate.head_sha));
+    return finished?.head_sha ?? parent;
+  } catch {
+    process.stdout.write("::notice title=Registry Sync::earlier runs could not be read, so this push publishes only its own changes; grant the job actions: read\n");
+    return parent;
+  }
+}
+
+;// CONCATENATED MODULE: ./src/cli.js
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+const INSTALL_ENVIRONMENT_KEYS = [
+  "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL",
+  "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY",
+  "https_proxy", "http_proxy", "all_proxy", "no_proxy",
+  "SSL_CERT_FILE", "SSL_CERT_DIR", "RUNNER_OS", "RUNNER_ARCH"
+];
+
+const PUBLISH_ENVIRONMENT_KEYS = [
+  "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL",
+  "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY",
+  "https_proxy", "http_proxy", "all_proxy", "no_proxy",
+  "RUNNER_OS", "RUNNER_ARCH", "CI", "GITHUB_ACTIONS", "GITHUB_ACTOR", "GITHUB_JOB",
+  "GITHUB_REF", "GITHUB_REF_NAME", "GITHUB_REF_TYPE", "GITHUB_REPOSITORY",
+  "GITHUB_RUN_ATTEMPT", "GITHUB_RUN_ID", "GITHUB_SHA", "GITHUB_WORKFLOW"
+];
+
+const SYSTEM_PATH = "/usr/bin:/bin";
+const SELF_UPDATE_ARGUMENTS = Object.freeze(["self", "update", "--json"]);
+// Without a terminal, aireg installs an adapter it does not trust only when told to.
+const ADAPTER_ARGUMENTS = Object.freeze(["adapter", "install", ADAPTER, "--yes"]);
+const PUBLISH_ALIAS = "atlan";
+// Declared in the Action-owned user scope, so the token's only destination is the fixed gateway
+// and nothing is written into the repository.
+const REGISTRY_ARGUMENTS = Object.freeze(["registry", "add", PUBLISH_GATEWAY, "--as", PUBLISH_ALIAS, "--adapter", ADAPTER, "-g"]);
+const MAX_CLI_OUTPUT_BYTES = 64 * 1024;
+
+const CLI_OS = { linux: "linux", darwin: "darwin" };
+const CLI_ARCH = { x64: "amd64", arm64: "arm64" };
+
+function assertSupportedPublishPlatform(platform = process.platform) {
+  if (!Object.hasOwn(CLI_OS, platform)) {
+    throw new Error("publish mode supports Linux and macOS runners; use ubuntu-latest or macos-latest");
+  }
+}
+
+// Maps the Node runtime platform onto the pinned CLI artifact name.
+function resolveCliPlatform(platform = process.platform, arch = process.arch) {
+  assertSupportedPublishPlatform(platform);
+  if (!Object.hasOwn(CLI_ARCH, arch)) {
+    throw new Error("publish mode supports amd64 and arm64 runners only");
+  }
+  const target = `${CLI_OS[platform]}-${CLI_ARCH[arch]}`;
+  if (!Object.hasOwn(CLI_SHA256, target)) {
+    throw new Error(`the Action does not pin aireg for ${target}`);
+  }
+  return target;
+}
+
+function assertNoSymlinks(root, candidate) {
+  const relative = external_node_path_namespaceObject.relative(root, candidate);
+  let current = root;
+  for (const part of relative ? relative.split(external_node_path_namespaceObject.sep) : []) {
+    current = external_node_path_namespaceObject.join(current, part);
+    if (external_node_fs_namespaceObject.lstatSync(current).isSymbolicLink()) throw new Error("working-directory cannot contain symbolic links");
+  }
+}
+
+function resolveWorkingDirectory(environment = process.env) {
+  const workspaceInput = external_node_path_namespaceObject.resolve(environment.GITHUB_WORKSPACE || process.cwd());
+  const workspace = external_node_fs_namespaceObject.realpathSync(workspaceInput);
+  const requested = external_node_path_namespaceObject.resolve(common_getInput("working-directory", environment) || workspaceInput);
+  const lexicalRoot = isWithin(workspaceInput, requested) ? workspaceInput : workspace;
+  if (!isWithin(lexicalRoot, requested) || !external_node_fs_namespaceObject.existsSync(requested)) {
+    throw new Error("working-directory must be an existing directory inside GITHUB_WORKSPACE");
+  }
+  assertNoSymlinks(lexicalRoot, requested);
+  const resolved = external_node_fs_namespaceObject.realpathSync(requested);
+  if (!isWithin(workspace, resolved)) {
+    throw new Error("working-directory must be an existing directory inside GITHUB_WORKSPACE");
+  }
+  if (!external_node_fs_namespaceObject.statSync(resolved).isDirectory()) {
+    throw new Error("working-directory must be an existing directory inside GITHUB_WORKSPACE");
+  }
+  return resolved;
+}
+
+function writeBoundedCli(response, destination, createDestination = external_node_fs_namespaceObject.createWriteStream) {
+  let received = 0;
+  const limiter = new external_node_stream_.Transform({
+    transform(chunk, _encoding, callback) {
+      received += chunk.length;
+      callback(received > MAX_CLI_BYTES
+        ? new Error("aireg download exceeds the size limit")
+        : null, chunk);
+    }
+  });
+  return (0,external_node_stream_promises_namespaceObject.pipeline)(response, limiter, createDestination(destination, { mode: 0o700 }));
+}
+
+async function verifyCliDigest(binary, expectedDigest) {
+  if (typeof expectedDigest !== "string" || !SHA256.test(expectedDigest)) {
+    throw new Error("Action-pinned CLI digest is invalid");
+  }
+  const metadata = await promises_namespaceObject.lstat(binary);
+  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > MAX_CLI_BYTES) {
+    throw new Error("aireg is not a bounded regular file");
+  }
+  const hash = (0,external_node_crypto_.createHash)("sha256");
+  for await (const chunk of external_node_fs_namespaceObject.createReadStream(binary)) hash.update(chunk);
+  if (!(0,external_node_crypto_.timingSafeEqual)(hash.digest(), Buffer.from(expectedDigest, "hex"))) {
+    throw new Error("aireg digest does not match the Action-pinned digest");
+  }
+}
+
+function cliArtifactURL(target, version = CLI_VERSION) {
+  if (!Object.hasOwn(CLI_SHA256, target)) throw new Error("aireg platform is not pinned");
+  if (!RELEASE_VERSION.test(version)) throw new Error("Action-pinned CLI version is invalid");
+  return `${CLI_ORIGIN}${CLI_ARTIFACT_PATH}${version}/aireg-${target}`;
+}
+
+const CLI_URL_PATHNAME = new RegExp(
+  `^${CLI_ARTIFACT_PATH}(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)/aireg-(?:darwin|linux)-(?:amd64|arm64)$`
+);
+
+function validateCliURL(cliURL) {
+  let url;
+  try {
+    url = new URL(cliURL);
+  } catch {
+    throw new Error("aireg URL must be valid HTTPS");
+  }
+  if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash || !CLI_URL_PATHNAME.test(url.pathname)) {
+    throw new Error("aireg URL must be a clean HTTPS version-addressed artifact URL");
+  }
+  if (url.origin !== CLI_ORIGIN) {
+    throw new Error("aireg host is not approved");
+  }
+}
+
+function downloadCli(url, destination) {
+  validateCliURL(url);
+  return new Promise((resolve, reject) => {
+    const request = external_node_https_namespaceObject.get(url, {
+      timeout: 60_000,
+      headers: { "User-Agent": "atlan-agent-registry-action" }
+    }, response => {
+      if (response.statusCode >= 300 && response.statusCode < 400) {
+        response.resume();
+        reject(new Error("aireg download redirected; refusing an unapproved source"));
+        return;
+      }
+      if (response.statusCode !== 200) {
+        response.resume();
+        reject(new Error(`aireg download failed with HTTP ${response.statusCode}`));
+        return;
+      }
+      const declaredSize = Number(response.headers["content-length"] || 0);
+      if (declaredSize > MAX_CLI_BYTES) {
+        response.resume();
+        reject(new Error("aireg download exceeds the size limit"));
+        return;
+      }
+      void writeBoundedCli(response, destination).then(resolve, reject);
+    });
+    request.on("timeout", () => request.destroy(new Error("aireg download timed out")));
+    request.on("error", reject);
+  });
+}
+
+function runtimeEnvironment(environment, keys, runtimeDirectory) {
+  if (!external_node_path_namespaceObject.isAbsolute(runtimeDirectory)) throw new Error("Action-owned CLI home must be an absolute path");
+  const allowed = Object.fromEntries(keys
+    .filter(key => environment[key] !== undefined)
+    .map(key => [key, environment[key]]));
+  return {
+    ...allowed,
+    HOME: runtimeDirectory,
+    AIREG_HOME: external_node_path_namespaceObject.join(runtimeDirectory, ".aireg"),
+    AIREG_USER_SCOPE: external_node_path_namespaceObject.join(runtimeDirectory, "registry"),
+    PATH: SYSTEM_PATH
+  };
+}
+
+function installEnvironment(environment, runtimeDirectory) {
+  return runtimeEnvironment(environment, INSTALL_ENVIRONMENT_KEYS, runtimeDirectory);
+}
+
+// Mirrors aireg's own per-registry variable name, so the token reaches that registry alone.
+function tokenVariable(alias) {
+  return `AIREG_TOKEN_${alias.toUpperCase().replaceAll(/[^A-Z0-9]/g, "_")}`;
+}
+
+function publisherEnvironment(environment, token, runtimeDirectory, aliases = []) {
+  return {
+    ...runtimeEnvironment(environment, PUBLISH_ENVIRONMENT_KEYS, runtimeDirectory),
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    ...Object.fromEntries(aliases.map(alias => [tokenVariable(alias), token]))
+  };
+}
+
+// Only what the repository tracks can be an artifact, so a build output never publishes.
+function trackedFiles(cwd) {
+  const listed = (0,external_node_child_process_namespaceObject.spawnSync)("git", ["ls-files", "-z"], {
+    cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024,
+    env: { PATH: SYSTEM_PATH, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" }
+  });
+  if (listed.status !== 0) throw new Error("could not list the repository's files; check it out before this step");
+  return listed.stdout.split("\0").filter(Boolean);
+}
+
+// The repository's CONFIG_FILE when it tracks one: a regular file only, so a link cannot pull in another.
+function syncConfig(cwd, files) {
+  if (!files.includes(CONFIG_FILE)) return undefined;
+  const found = external_node_fs_namespaceObject.lstatSync(external_node_path_namespaceObject.join(cwd, CONFIG_FILE), { throwIfNoEntry: false });
+  if (!found?.isFile() || found.size > MAX_CONFIG_BYTES) {
+    throw new Error(`${CONFIG_FILE} must be a regular file of at most ${MAX_CONFIG_BYTES} bytes`);
+  }
+  return external_node_fs_namespaceObject.readFileSync(external_node_path_namespaceObject.join(cwd, CONFIG_FILE), "utf8");
+}
+
+// A changed config can cover skills whose files did not change. git exits 1 for a difference alone.
+function configChanged(cwd, sha) {
+  return (0,external_node_child_process_namespaceObject.spawnSync)("git", ["diff", "--quiet", sha, "HEAD", "--", CONFIG_FILE], {
+    cwd, env: { PATH: SYSTEM_PATH, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" }
+  }).status === 1;
+}
+
+// An agent is a tracked Markdown file with `name` and `description` front matter, so a README is skipped.
+// A SKILL.md never is: the CLI would publish its whole folder, and at the root that is the checkout.
+function agentFiles(cwd, files, globs = []) {
+  const patterns = globs.map(globPattern);
+  return files.filter(file => file.endsWith(".md") && external_node_path_namespaceObject.posix.basename(file) !== "SKILL.md" &&
+    patterns.some(pattern => pattern.test(file)) && hasFrontMatter(external_node_path_namespaceObject.join(cwd, file))).sort();
+}
+
+function hasFrontMatter(file) {
+  if (!external_node_fs_namespaceObject.existsSync(file) || !external_node_fs_namespaceObject.lstatSync(file).isFile() || external_node_fs_namespaceObject.statSync(file).size > MAX_SKILL_BYTES) return false;
+  const head = /^---\r?\n([\s\S]*?)\r?\n---/.exec(external_node_fs_namespaceObject.readFileSync(file, "utf8"));
+  return Boolean(head && /^name:\s*\S/m.test(head[1]) && /^description:\s*\S/m.test(head[1]));
+}
+
+// The CLI compares with the Registry by workspace name, so the ID the workflow names is looked up once.
+async function workspaceName(token, workspace, registry = registryRequest) {
+  const found = await registry({ token, requestPath: `/registry/v1/workspaces/${encodeURIComponent(workspace)}` });
+  if (typeof found?.name !== "string" || !/^[A-Za-z0-9_.-]{1,128}$/.test(found.name)) {
+    throw new Error(`workspace ${workspace} was not found, or its name cannot be read`);
+  }
+  return found.name;
+}
+
+// A push publishes only what changed since its baseline. A manual run or a new branch has none,
+// so it publishes everything. Every aireg release takes the flag.
+function changedSinceArguments(baseline) {
+  return typeof baseline === "string" && COMMIT_SHA.test(baseline) ? ["--changed-since", baseline] : [];
+}
+
+function parseCliVersion(raw) {
+  const match = /^v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\s*$/.exec(raw.split("\n")[0] ?? "");
+  if (!match) throw new Error("installed aireg did not return a valid version");
+  return match[1];
+}
+
+// `self update` names the newest release it installed, which must sit in the Action-owned home, or keeps this one.
+function updatedCli(raw, binary, directory) {
+  let data;
+  try {
+    data = JSON.parse(raw)?.data;
+  } catch {
+    data = undefined;
+  }
+  if (data?.action === "already-latest") return binary;
+  if (data?.action !== "updated" || typeof data.bin !== "string" || !external_node_path_namespaceObject.isAbsolute(data.bin) || !isWithin(directory, data.bin)) {
+    throw new Error("aireg returned an unreadable self update result");
+  }
+  return data.bin;
+}
+
+// Runs the verified CLI directly, without a shell; captures bounded stdout when asked.
+// `input`, when given, is the child's whole stdin, so a secret it carries never reaches argv or the environment.
+function runCli(binary, args, cwd, environment, capture = false, input) {
+  return new Promise((resolve, reject) => {
+    const child = (0,external_node_child_process_namespaceObject.spawn)(binary, [...args], {
+      cwd,
+      env: environment,
+      shell: false,
+      stdio: [input === undefined ? (capture ? "ignore" : "inherit") : "pipe", capture ? "pipe" : "inherit", "inherit"]
+    });
+    if (input !== undefined) child.stdin.end(input);
+    const chunks = [];
+    let size = 0;
+    child.stdout?.on("data", chunk => {
+      size += chunk.length;
+      if (size <= MAX_CLI_OUTPUT_BYTES) chunks.push(chunk);
+      else child.kill();
+    });
+    child.on("error", reject);
+    // "close" waits for stdout to drain; "exit" can fire first and lose the tail of it.
+    child.on("close", code => {
+      if (size > MAX_CLI_OUTPUT_BYTES) return reject(new Error("aireg output exceeds the size limit"));
+      if (code !== 0) return reject(new Error(`aireg ${args[0]} exited with status ${code}`));
+      resolve(Buffer.concat(chunks).toString("utf8"));
+    });
+  });
+}
+
+async function installCli({
+  environment = process.env,
+  download = downloadCli,
+  verifyCli = verifyCliDigest,
+  execute = runCli
+} = {}) {
+  const target = resolveCliPlatform();
+  // Real, so the binary `self update` reports (macOS resolves /var to /private/var) is recognised as inside it.
+  const directory = await promises_namespaceObject.realpath(await promises_namespaceObject.mkdtemp(external_node_path_namespaceObject.join(external_node_os_namespaceObject.tmpdir(), "registry-skill-sync-")));
+  const binary = external_node_path_namespaceObject.join(directory, "aireg");
+  try {
+    await download(cliArtifactURL(target), binary);
+    await verifyCli(binary, CLI_SHA256[target]);
+    await promises_namespaceObject.chmod(binary, 0o700);
+    const safeEnvironment = installEnvironment(environment, directory);
+    const updated = await execute(binary, SELF_UPDATE_ARGUMENTS, directory, safeEnvironment, true);
+    const newest = updatedCli(updated, binary, directory);
+    const version = parseCliVersion(await execute(newest, ["--version"], directory, safeEnvironment, true));
+    await execute(newest, ADAPTER_ARGUMENTS, directory, safeEnvironment);
+    return { binary: newest, directory, version };
+  } catch (error) {
+    await promises_namespaceObject.rm(directory, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+async function runPublishAction({
+  environment = process.env,
+  install = installCli,
+  execute = runCli,
+  registry = registryRequest,
+  request,
+  ancestor,
+  eventPayload
+} = {}) {
+  const token = environment.ATLANAI_TOKEN;
+  if (!token) throw new Error("ATLANAI_TOKEN must be supplied as a workflow secret");
+  maskSecret(token, environment);
+  const cwd = resolveWorkingDirectory(environment);
+  if (parseBoolean("prune", common_getInput("prune", environment) || "false")) {
+    throw new Error("prune is not supported with aireg yet; set prune to false");
+  }
+  const files = trackedFiles(cwd);
+  const config = syncConfig(cwd, files);
+  const inputs = parseRegistryInputs(environment, config);
+  // A tracked file can be missing from the checkout, as in a sparse checkout; it cannot publish.
+  const skills = skillFolders(files, inputs.artifacts.skill).filter(folder => external_node_fs_namespaceObject.existsSync(external_node_path_namespaceObject.join(cwd, folder, "SKILL.md")));
+  const paths = [...skills, ...agentFiles(cwd, files, inputs.artifacts.agent)];
+  // The CLI expands a path it is given, so one that reads as a glob is refused rather than widened.
+  const unsafe = paths.find(item => /[*?[\]{}\\]|[+@!]\(/.test(item));
+  if (unsafe) throw new Error(`${unsafe} contains glob characters, so it cannot be published as an exact path`);
+  // An agent's path and skills are checked before anything installs, so a stale config fails fast.
+  for (const agent of inputs.agents) {
+    if (!files.some(file => file === agent.path || file.startsWith(`${agent.path}/`))) {
+      throw new Error(`agent ${agent.id}: ${agent.path} is not in the repository; update its \`path\` in ${CONFIG_FILE}`);
+    }
+    agentSkills(agent, skills);
+  }
+  if (paths.length === 0 && inputs.agents.length === 0) {
+    process.stdout.write("::notice title=Registry Sync::no tracked file matches the skill globs, so nothing was published\n");
+    common_setOutput("status", "success", environment);
+    return;
+  }
+  const namespace = await workspaceName(token, inputs.workspace, registry);
+  const since = await publishBaseline({ environment, eventPayload, cwd, request, ancestor });
+  // With no baseline, everything the config covers that differs from Atlan publishes.
+  const baseline = since && config !== undefined && configChanged(cwd, since) ? undefined : since;
+  const { binary, directory, version } = await install({ environment });
+  try {
+    const publisher = publisherEnvironment(environment, token, directory, [PUBLISH_ALIAS]);
+    // Run where no project manifest is found, so the registry is declared in the user scope alone.
+    await execute(binary, REGISTRY_ARGUMENTS, directory, publisher);
+    if (paths.length > 0) {
+      const args = ["publish", ...paths.map(item => `./${item}`), "--to", `${PUBLISH_ALIAS}/${namespace}`, "--yes", "-g", ...changedSinceArguments(baseline)];
+      await execute(binary, args, cwd, publisher);
+    }
+    // aireg refuses to store a sign-in while the token variable is set, so agent calls run without it.
+    const signin = { ...publisher };
+    delete signin[tokenVariable(PUBLISH_ALIAS)];
+    const synced = await syncAgents({
+      agents: inputs.agents, folders: skills, token, workspace: inputs.workspace, repository: environment.GITHUB_REPOSITORY,
+      registry, alias: PUBLISH_ALIAS, aireg: (args, input) => execute(binary, args, directory, signin, true, input)
+    });
+    for (const agent of synced) {
+      const moved = agent.to === agent.from ? "unchanged" : `version ${agent.from} → ${agent.to}`;
+      process.stdout.write(`::notice title=Registry Sync::agent ${agent.name}: ${agent.pins} skills pinned, ${moved}\n`);
+    }
+    common_setOutput("status", "success", environment);
+    common_setOutput("cli-version", version, environment);
+  } finally {
+    await promises_namespaceObject.rm(directory, { recursive: true, force: true });
+  }
 }
 
 ;// CONCATENATED MODULE: ./src/publish-failure.js
