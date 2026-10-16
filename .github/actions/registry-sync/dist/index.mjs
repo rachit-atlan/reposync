@@ -39133,17 +39133,20 @@ async function runPreflight({ environment = process.env, request = githubRequest
 
 
 // A repository skill folder as its Atlan skill: this repository's, at that path, and only one of them.
-function ownSkillId(remote, folder, repository, agent) {
+function ownSkill(remote, folder, repository, agent) {
   const found = ownSkills(remote, folder, repository);
   if (found.length > 1) throw new Error(`agent ${agent.id}: ${folder} is more than one skill in Atlan, so it cannot be pinned`);
   if (found.length === 0) throw new Error(`agent ${agent.id}: ${folder} is not in Atlan yet, so it cannot be pinned`);
-  return released(found[0], folder, agent);
+  return found[0];
 }
 
-// The gateway pins a skill's current release and refuses one with none, without saying which.
-function released(skill, label, agent) {
-  if (skill?.released === false) throw new Error(`agent ${agent.id}: ${label} has no release in Atlan yet, so it cannot be pinned`);
-  return skill.id;
+// The gateway pins a skill's current release and refuses one with none, without saying which. A listing's
+// `is_released` can trail a publish by a moment, so a skill it calls unreleased is asked about directly.
+async function assertReleased(skill, label, agent, read) {
+  if (skill.released !== false) return;
+  const releases = await read(`/registry/v1/artifacts/skill/${encodeURIComponent(skill.id)}/releases`);
+  if (Array.isArray(releases?.items) && releases.items.length > 0) return;
+  throw new Error(`agent ${agent.id}: ${label} has no release in Atlan yet, so it cannot be pinned`);
 }
 
 function answer(raw, agent) {
@@ -39173,8 +39176,12 @@ async function syncAgents({ agents, folders, token, workspace, repository, regis
   const results = [];
   for (const agent of managed) {
     const { ids, folders: own } = agentSkills(agent, folders);
-    for (const id of ids) released(remote.find(skill => skill.id === id) ?? { id }, id, agent);
-    const pins = [...new Set([...own.map(folder => ownSkillId(remote, folder, repository, agent)), ...ids])];
+    const skills = [
+      ...own.map(folder => [folder, ownSkill(remote, folder, repository, agent)]),
+      ...ids.map(id => [id, remote.find(skill => skill.id === id) ?? { id }])
+    ];
+    for (const [label, skill] of skills) await assertReleased(skill, label, agent, requestPath => registry({ token, requestPath }));
+    const pins = [...new Set(skills.map(([, skill]) => skill.id))];
     const route = `/agent/v1/agents/${agent.id}`;
     const call = (args, input) => aireg(args, input).catch(error => {
       throw new Error(`agent ${agent.id}: ${error instanceof Error ? error.message : "aireg failed"}`);
