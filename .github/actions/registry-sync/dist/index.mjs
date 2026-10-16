@@ -37536,6 +37536,9 @@ function configSettings(text) {
 }
 
 // An agent's skills as Atlan IDs and as this repository's skill folders, which must be ones the config publishes.
+// How messages name an agent: by the path a reader knows, then the ID Atlan knows it by.
+const agentName = agent => `Agent \`${agent.path}\` (${agent.id})`;
+
 function agentSkills(agent, folders) {
   const ids = [];
   const own = [];
@@ -37546,7 +37549,7 @@ function agentSkills(agent, folders) {
     }
     const matched = skillFolders(folders.map(folder => `${folder}/SKILL.md`), [entry]);
     if (matched.length === 0) {
-      throw new Error(`agent ${agent.id}: ${entry} matches no skill folder that \`skills\` in ${CONFIG_FILE} covers`);
+      throw new Error(`${agentName(agent)}: \`${entry}\` matches no skill folder that \`skills\` in ${CONFIG_FILE} covers; add its folder to \`skills\`, or take it out of the agent's list`);
     }
     own.push(...matched);
   }
@@ -37703,17 +37706,19 @@ const notFound = error => error?.status === 404;
 async function agentInAtlan({ row, workspace, registryToken, registry }) {
   const read = requestPath => registry({ token: registryToken, requestPath });
   const found = await read(`/registry/v1/artifacts/agent/${encodeURIComponent(row.agent.id)}`);
-  if (found?.workspace_id !== workspace) return `agent ${row.agent.id} is not in the workspace ${CONFIG_FILE} names`;
-  if (found.artifact_status === "archived") return `agent ${row.agent.id} is archived in Atlan`;
-  row.name = typeof found.name === "string" ? found.name : row.agent.id;
+  if (found?.workspace_id !== workspace) return `${agentName(row.agent)} is in another workspace; list only agents in the workspace ${CONFIG_FILE} names`;
+  if (found.artifact_status === "archived") return `${agentName(row.agent)} is archived in Atlan; take it out of ${CONFIG_FILE}, or link a new agent`;
+  row.name = typeof found.name === "string" ? found.name : undefined;
   row.unreleased = [];
+  row.labels = {};
   for (const id of row.ids) {
     const skill = await read(`/registry/v1/artifacts/skill/${encodeURIComponent(id)}`).catch(error => {
       if (notFound(error)) return undefined;
       throw error;
     });
-    if (!skill || skill.artifact_status === "archived") return `agent ${row.agent.id}: skill ${id} is not in Atlan`;
+    if (!skill || skill.artifact_status === "archived") return `${agentName(row.agent)}: skill ${id} is not in Atlan; correct the ID or take it out of the agent's \`skills\``;
     if (skill.is_released === false) row.unreleased.push(id);
+    if (typeof skill.name === "string") row.labels[id] = skill.name;
   }
   const edges = await read(`/registry/v1/artifacts/agent/${encodeURIComponent(row.agent.id)}/relationships`);
   row.current = (Array.isArray(edges?.items) ? edges.items : [])
@@ -37730,22 +37735,24 @@ function resolveAgents({ agents, tree, globs }) {
   const rows = [];
   for (const agent of agents) {
     if (!files.some(file => file === agent.path || file.startsWith(`${agent.path}/`))) {
-      return { error: `agent ${agent.id}: ${agent.path} is not in this pull request's files; update its \`path\` in ${CONFIG_FILE}` };
+      return { error: `${agentName(agent)} is not in this pull request's files; update its \`path\` in ${CONFIG_FILE}` };
     }
     try {
       rows.push({ agent, ...agentSkills(agent, folders) });
     } catch (error) {
-      return { error: error instanceof Error ? error.message : `agent ${agent.id} lists skills that cannot be resolved` };
+      return { error: error instanceof Error ? error.message : `${agentName(agent)} lists skills that cannot be resolved` };
     }
   }
   return { rows };
 }
 
-// The skill folders an agent pinned at the base and loses at the head, as a skill-only pull request can do.
-function lostPins(rows, baseRows) {
+// The skill folders an agent loses or gains between base and head, as a skill-only pull request can do through a
+// glob: merging changes its pins either way.
+function pinChanges(rows, baseRows) {
   for (const row of rows) {
-    const before = baseRows.find(item => item.agent.id === row.agent.id);
-    row.lost = (before?.folders ?? []).filter(folder => !row.folders.includes(folder));
+    const before = baseRows.find(item => item.agent.id === row.agent.id)?.folders ?? [];
+    row.lost = before.filter(folder => !row.folders.includes(folder));
+    row.gained = row.folders.filter(folder => !before.includes(folder));
   }
   return rows;
 }
@@ -37757,9 +37764,10 @@ async function compareAgents({ rows, workspace, repository, registryToken, regis
   if (!registryToken) return { compared: false };
   try {
     const remote = (await inventory()) ?? [];
+    const named = id => remote.find(skill => skill.id === id)?.name;
     for (const row of rows) {
       const missing = await agentInAtlan({ row, workspace, registryToken, registry }).catch(error => {
-        if (notFound(error)) return `agent ${row.agent.id} is not in Atlan; link it first`;
+        if (notFound(error)) return `${agentName(row.agent)} is not in Atlan; link it with the atlan-link-agent skill, or correct its \`id\``;
         throw error;
       });
       if (missing) return { compared: false, error: missing };
@@ -37773,6 +37781,7 @@ async function compareAgents({ rows, workspace, repository, registryToken, regis
         if (!skill || !row.current.includes(skill.id)) row.added.push(folder);
       }
       row.removed = row.current.filter(id => !desired.has(id));
+      for (const id of row.removed) row.labels[id] ??= named(id);
     }
     return { compared: true };
   } catch {
@@ -37781,6 +37790,8 @@ async function compareAgents({ rows, workspace, repository, registryToken, regis
 }
 
 const code = value => `\`${String(value).replaceAll("`", "'")}\``;
+// A skill ID reads as its name when Atlan gave one.
+const skillLabel = (row, skill) => row.labels?.[skill] ? `${code(row.labels[skill])} (${skill})` : code(skill);
 
 // One row per agent: how many skills it pins after merge, and what changes in Atlan.
 function agentLines(agents) {
@@ -37789,10 +37800,11 @@ function agentLines(agents) {
     if (row.agent.skills.length === 0) return "Skills not managed by this repository";
     const parts = [
       ...(row.lost ?? []).map(skill => `− ${code(skill)} (removed in this pull request; merging unpins it)`),
-      ...(row.added ?? []).map(skill => `+ ${code(skill)}`),
-      ...(row.removed ?? []).map(skill => `− ${code(skill)} (pinned in Atlan only; merging removes it)`),
+      ...(row.gained ?? []).map(skill => `+ ${code(skill)} (added in this pull request; merging pins it)`),
+      ...(row.added ?? []).map(skill => `+ ${skillLabel(row, skill)}`),
+      ...(row.removed ?? []).map(skill => `− ${skillLabel(row, skill)} (pinned in Atlan only; merging removes it)`),
       // Not a failure here: this pull request may be what releases it.
-      ...(row.unreleased ?? []).map(skill => `⚠️ ${code(skill)} has no release in Atlan yet; merging cannot pin it until it has one`)
+      ...(row.unreleased ?? []).map(skill => `⚠️ ${skillLabel(row, skill)} has no release in Atlan yet; merging cannot pin it until it has one`)
     ];
     if (parts.length > 0) return parts.join("<br>");
     return agents.changed && !agents.compared ? "Not compared with Atlan" : "No change";
@@ -37800,7 +37812,7 @@ function agentLines(agents) {
   return [
     "| Agent | Skills after merge | Change in Atlan |",
     "| --- | --- | --- |",
-    ...agents.rows.map(row => `| ${code(row.name ?? row.agent.id)} (${code(row.agent.path)}) | ${row.agent.skills.length === 0 ? "—" : row.ids.length + row.folders.length} | ${change(row)} |`)
+    ...agents.rows.map(row => `| ${row.name ? `${code(row.name)} (${code(row.agent.path)})` : code(row.agent.path)} | ${row.agent.skills.length === 0 ? "—" : row.ids.length + row.folders.length} | ${change(row)} |`)
   ];
 }
 
@@ -38582,7 +38594,7 @@ async function buildPreflightReport({ token, context, request, registryToken, re
       }
     } else if (baseTree && baseConfig?.inputs) {
       const before = resolveAgents({ agents: baseConfig.inputs.agents, tree: baseTree.keys(), globs: baseConfig.inputs.artifacts.skill });
-      const affected = before.error ? [] : lostPins(resolved.rows, before.rows).filter(row => row.lost.length > 0);
+      const affected = before.error ? [] : pinChanges(resolved.rows, before.rows).filter(row => row.lost.length + row.gained.length > 0);
       if (affected.length > 0) agents = { rows: affected, changed: false };
     }
   }
@@ -38789,16 +38801,16 @@ function commentState(report) {
 
 function configurationDifference(report) {
   if (!report.configChanged || !report.config?.valid || !report.proposedConfig?.valid) return [];
+  // Only what changed: an unchanged row reads as a change. A changed agent shows in the Agents table instead.
   const destinationsChanged = !sameSet(report.config.workspaces, report.proposedConfig.workspaces);
-  return [
-    "| Setting | Before | After merge |",
-    "| --- | --- | --- |",
-    `| Skill folders | ${describePaths(report.config)} | ${describePaths(report.proposedConfig)} |`,
-    `| Destination workspaces | ${report.config.workspaceCount} | ${report.proposedConfig.workspaceCount}${destinationsChanged ? " (changed)" : ""} |`,
-    ...(report.config.agentCount || report.proposedConfig.agentCount
-      ? [`| Agents | ${report.config.agentCount ?? 0} | ${report.proposedConfig.agentCount ?? 0} |`]
-      : [])
+  const [folders, proposedFolders] = [describePaths(report.config), describePaths(report.proposedConfig)];
+  const [agents, proposedAgents] = [report.config.agentCount ?? 0, report.proposedConfig.agentCount ?? 0];
+  const rows = [
+    ...(folders === proposedFolders ? [] : [`| Skill folders | ${folders} | ${proposedFolders} |`]),
+    ...(destinationsChanged ? [`| Destination workspaces | ${report.config.workspaceCount} | ${report.proposedConfig.workspaceCount} (changed) |`] : []),
+    ...(agents === proposedAgents ? [] : [`| Agents | ${agents} | ${proposedAgents} |`])
   ];
+  return rows.length === 0 ? [] : ["| Setting | Before | After merge |", "| --- | --- | --- |", ...rows];
 }
 
 function conflictRows(report) {
@@ -38943,7 +38955,9 @@ function formatPreflightComment(report, compact = false) {
     lines.push("No Atlan API key is available in `ATLANAI_TOKEN`, so this pull request was not compared with Atlan and conflicts were not checked. Expose the existing secret as `ATLANAI_TOKEN` on the Registry Sync step to enable it.", "");
   }
 
-  if (state !== "unavailable" && report.config?.valid) {
+  const agentTable = report.configError ? [] : agentLines(report.agents);
+  // A config error is the whole story, and a pull request that changes only agents is told by their table.
+  if (state !== "unavailable" && report.config?.valid && !report.configError && (eligible.length > 0 || agentTable.length === 0)) {
     const summary = report.limited
       ? `${plural(report.changedFiles || 0, "file")} changed; skill count unavailable across ${plural(workspaceCount, "workspace")}.`
       : `${plural(eligible.length, "skill")} changed across ${plural(workspaceCount, "workspace")}.`;
@@ -39025,7 +39039,6 @@ function formatPreflightComment(report, compact = false) {
     );
   }
 
-  const agentTable = report.configError ? [] : agentLines(report.agents);
   if (agentTable.length > 0) lines.push("#### Agents", "", ...agentTable, "");
 
   if (state === "unavailable" && !report.unchecked && !report.configError && !report.setup) {
@@ -39135,8 +39148,8 @@ async function runPreflight({ environment = process.env, request = githubRequest
 // A repository skill folder as its Atlan skill: this repository's, at that path, and only one of them.
 function ownSkill(remote, folder, repository, agent) {
   const found = ownSkills(remote, folder, repository);
-  if (found.length > 1) throw new Error(`agent ${agent.id}: ${folder} is more than one skill in Atlan, so it cannot be pinned`);
-  if (found.length === 0) throw new Error(`agent ${agent.id}: ${folder} is not in Atlan yet, so it cannot be pinned`);
+  if (found.length > 1) throw new Error(`${agentName(agent)}: \`${folder}\` is more than one skill in Atlan, so it cannot be pinned`);
+  if (found.length === 0) throw new Error(`${agentName(agent)}: \`${folder}\` is not in Atlan yet, so it cannot be pinned`);
   return found[0];
 }
 
@@ -39146,7 +39159,7 @@ async function assertReleased(skill, label, agent, read) {
   if (skill.released !== false) return;
   const releases = await read(`/registry/v1/artifacts/skill/${encodeURIComponent(skill.id)}/releases`);
   if (Array.isArray(releases?.items) && releases.items.length > 0) return;
-  throw new Error(`agent ${agent.id}: ${label} has no release in Atlan yet, so it cannot be pinned`);
+  throw new Error(`${agentName(agent)}: \`${label}\` has no release in Atlan yet, so it cannot be pinned`);
 }
 
 function answer(raw, agent) {
@@ -39154,10 +39167,10 @@ function answer(raw, agent) {
   try {
     parsed = JSON.parse(raw);
   } catch {
-    throw new Error(`agent ${agent.id}: aireg returned an unreadable answer`);
+    throw new Error(`${agentName(agent)}: aireg returned an unreadable answer`);
   }
   const body = parsed?.data?.body;
-  if (parsed?.ok !== true || !body || typeof body !== "object") throw new Error(`agent ${agent.id}: aireg returned an unreadable answer`);
+  if (parsed?.ok !== true || !body || typeof body !== "object") throw new Error(`${agentName(agent)}: aireg returned an unreadable answer`);
   return body;
 }
 
@@ -39184,11 +39197,11 @@ async function syncAgents({ agents, folders, token, workspace, repository, regis
     const pins = [...new Set(skills.map(([, skill]) => skill.id))];
     const route = `/agent/v1/agents/${agent.id}`;
     const call = (args, input) => aireg(args, input).catch(error => {
-      throw new Error(`agent ${agent.id}: ${error instanceof Error ? error.message : "aireg failed"}`);
+      throw new Error(`${agentName(agent)}: ${error instanceof Error ? error.message : "aireg failed"}`);
     });
     const before = answer(await call(["atlan", "api", "get", route, "--registry", alias, "--json"]), agent);
-    if (before.workspace_id !== workspace) throw new Error(`agent ${agent.id} is not in the workspace ${CONFIG_FILE} names`);
-    if (before.artifact_status === "archived") throw new Error(`agent ${agent.id} is archived in Atlan`);
+    if (before.workspace_id !== workspace) throw new Error(`${agentName(agent)} is in another workspace; list only agents in the workspace ${CONFIG_FILE} names`);
+    if (before.artifact_status === "archived") throw new Error(`${agentName(agent)} is archived in Atlan; take it out of ${CONFIG_FILE}, or link a new agent`);
     const body = JSON.stringify({ skills: pins.map(skillId => ({ skill_id: skillId })) });
     const after = answer(await call(["atlan", "api", "patch", route, "--registry", alias, "--input", "-", "--json"], body), agent);
     results.push({ id: agent.id, name: after.name ?? agent.id, pins: pins.length, from: before.version_ordinal, to: after.version_ordinal });
@@ -39602,7 +39615,7 @@ async function runPublishAction({
   // An agent's path and skills are checked before anything installs, so a stale config fails fast.
   for (const agent of inputs.agents) {
     if (!files.some(file => file === agent.path || file.startsWith(`${agent.path}/`))) {
-      throw new Error(`agent ${agent.id}: ${agent.path} is not in the repository; update its \`path\` in ${CONFIG_FILE}`);
+      throw new Error(`${agentName(agent)} is not in the repository; update its \`path\` in ${CONFIG_FILE}`);
     }
     agentSkills(agent, skills);
   }
@@ -39657,7 +39670,7 @@ function publishFailureComment(environment, sha, error) {
     "",
     `Publishing \`${sha.slice(0, 7)}\` to Atlan failed: \`${message}\`.`,
     "",
-    `${runLink(environment)} has Atlan's response. Fix a refused skill in a new pull request, where preflight checks it before it merges; if nothing was refused, rerun the workflow.`
+    `${runLink(environment)} has Atlan's response. Fix what it names in a new pull request, where preflight checks it before it merges. If Atlan refused nothing, or a skill an agent needs has since been released, rerun the workflow.`
   ].join("\n");
 }
 
