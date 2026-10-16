@@ -39183,6 +39183,18 @@ async function currentRelease(skill, label, agent, read, settle) {
   }
 }
 
+// A skill this run did not publish has a settled release, so the gateway pins its current one. It refuses a skill
+// with none without saying which; the workspace listing marks one, and its releases confirm it before it is named.
+async function settledRelease(skill, label, agent, read) {
+  if (skill.released === false) {
+    const releases = itemsOf(await read(`/registry/v1/artifacts/skill/${encodeURIComponent(skill.id)}/releases`));
+    if (!releases.some(release => release?.channel === "latest" && release.is_current === true && release.release_status === "released")) {
+      throw new Error(`${agentName(agent)}: \`${label}\` has no release in Atlan yet, so it cannot be pinned`);
+    }
+  }
+  return { skill_id: skill.id };
+}
+
 function answer(raw, agent) {
   let parsed;
   try {
@@ -39199,7 +39211,7 @@ function answer(raw, agent) {
 // being the source of truth, each skill at its current release. The gateway keeps the agent's version when
 // nothing moved, so sending the whole list every run is safe. An agent with no skills listed is left alone,
 // since an empty list would archive every skill link it has. CI never creates an agent or touches its key.
-async function syncAgents({ agents, folders, token, workspace, repository, registry, alias, aireg, now = Date.now, wait = pause }) {
+async function syncAgents({ agents, folders, token, workspace, repository, registry, alias, aireg, fresh = [], now = Date.now, wait = pause }) {
   const managed = agents.filter(agent => agent.skills.length > 0);
   if (managed.length === 0) return [];
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository ?? "")) {
@@ -39213,14 +39225,17 @@ async function syncAgents({ agents, folders, token, workspace, repository, regis
   const results = [];
   for (const agent of managed) {
     const { ids, folders: own } = agentSkills(agent, folders);
+    // Only a skill this run may have published can have a release still settling, so only it is pinned by version.
     const skills = [
-      ...own.map(folder => [folder, ownSkill(remote, folder, repository, agent)]),
-      ...ids.map(id => [id, remote.find(skill => skill.id === id) ?? { id }])
+      ...own.map(folder => [folder, ownSkill(remote, folder, repository, agent), fresh.includes(folder)]),
+      ...ids.map(id => [id, remote.find(skill => skill.id === id) ?? { id }, false])
     ];
     const pins = [];
-    for (const [label, skill] of skills) {
+    for (const [label, skill, published] of skills) {
       if (pins.some(pin => pin.skill_id === skill.id)) continue;
-      if (!resolved.has(skill.id)) resolved.set(skill.id, await currentRelease(skill, label, agent, read, settle));
+      if (!resolved.has(skill.id)) {
+        resolved.set(skill.id, published ? await currentRelease(skill, label, agent, read, settle) : await settledRelease(skill, label, agent, read));
+      }
       pins.push(resolved.get(skill.id));
     }
     const route = `/agent/v1/agents/${agent.id}`;
@@ -39303,29 +39318,43 @@ function changedFiles(cwd, baseline) {
   return result.status === 0 ? result.stdout.toString().split("\0").filter(Boolean) : undefined;
 }
 
+// Regular files only, as preflight's digest: a symlink is never followed, and such a skill is left to the batch.
 function localSkill(cwd, files, folder) {
   const prefix = `${folder}/`;
-  const entries = files.filter(file => file.startsWith(prefix))
-    .map(file => ({ path: file.slice(prefix.length), sha256: sha256(external_node_fs_namespaceObject.readFileSync(external_node_path_namespaceObject.join(cwd, file))) }));
+  const members = files.filter(file => file.startsWith(prefix));
+  if (members.some(file => !external_node_fs_namespaceObject.lstatSync(external_node_path_namespaceObject.join(cwd, file)).isFile())) return undefined;
+  const entries = members.map(file => ({ path: file.slice(prefix.length), sha256: sha256(external_node_fs_namespaceObject.readFileSync(external_node_path_namespaceObject.join(cwd, file))) }));
   return { name: canonicalSkillName(external_node_fs_namespaceObject.readFileSync(external_node_path_namespaceObject.join(cwd, folder, "SKILL.md"), "utf8")), digest: bundleDigest(entries) };
 }
 
-// The skills this run updates in Atlan, each with the version to publish it as: aireg knows a skill by its name in
-// the workspace, so one there under the same name whose content differs, and that changed since the baseline when
-// there is one, as `--changed-since` would choose. A new or unchanged skill stays with the batch publish.
-async function plannedUpdates({ cwd, files, skills, baseline, token, workspace, repository, registry }) {
-  if (skills.length === 0) return [];
+// The skill folders this run can publish: those changed since the baseline, as `--changed-since` chooses, or all.
+function changedSkills(cwd, skills, baseline) {
   const changed = baseline ? changedFiles(cwd, baseline) : undefined;
-  const candidates = changed ? skills.filter(folder => changed.some(file => file.startsWith(`${folder}/`))) : skills;
+  return changed ? skills.filter(folder => changed.some(file => file.startsWith(`${folder}/`))) : skills;
+}
+
+const warn = message => process.stdout.write(`::warning title=Registry Sync::${message}\n`);
+
+// The skills this run updates in Atlan, each with the version to publish it as: aireg knows a skill by its name in
+// the workspace, so one there under the same name whose content differs. A new or unchanged skill stays with the
+// batch publish, as does every skill when Atlan cannot list the workspace in full: that is no worse than before.
+async function plannedUpdates({ cwd, files, candidates, token, workspace, repository, registry }) {
   if (candidates.length === 0) return [];
-  const { byWorkspace } = await loadRegistryInventory({ token, request: registry, context: { repository }, workspaces: [workspace] });
-  const remote = byWorkspace.get(workspace) ?? [];
+  let remote;
+  try {
+    const { byWorkspace } = await loadRegistryInventory({ token, request: registry, context: { repository }, workspaces: [workspace] });
+    remote = byWorkspace.get(workspace) ?? [];
+  } catch (error) {
+    warn(`skill updates publish without a named version: ${error instanceof Error ? error.message : "Atlan could not list the workspace"}`);
+    return [];
+  }
   const updates = [];
   for (const folder of candidates) {
     const local = localSkill(cwd, files, folder);
-    const current = remote.find(skill => skill.name === local.name);
+    const current = local && remote.find(skill => skill.name === local.name);
     if (!current || current.sourceDigest === local.digest) continue;
-    const releases = await registry({ token, requestPath: `/registry/v1/artifacts/skill/${encodeURIComponent(current.id)}/releases` });
+    // Without its labels, the version number still names an update.
+    const releases = await registry({ token, requestPath: `/registry/v1/artifacts/skill/${encodeURIComponent(current.id)}/releases` }).catch(() => undefined);
     const labels = (Array.isArray(releases?.items) ? releases.items : []).map(release => release?.version_label);
     updates.push({ folder, name: local.name, version: nextVersion(labels, current.versionOrdinal) });
   }
@@ -39712,8 +39741,9 @@ async function runPublishAction({
   const since = await publishBaseline({ environment, eventPayload, cwd, request, ancestor });
   // With no baseline, everything the config covers that differs from Atlan publishes.
   const baseline = since && config !== undefined && configChanged(cwd, since) ? undefined : since;
+  const candidates = changedSkills(cwd, skills, baseline);
   const updates = await plannedUpdates({
-    cwd, files, skills, baseline, token, workspace: inputs.workspace, repository: environment.GITHUB_REPOSITORY, registry
+    cwd, files, candidates, token, workspace: inputs.workspace, repository: environment.GITHUB_REPOSITORY, registry
   });
   const batched = paths.filter(item => !updates.some(update => update.folder === item));
   const { binary, directory, version } = await install({ environment });
@@ -39721,12 +39751,12 @@ async function runPublishAction({
     const publisher = publisherEnvironment(environment, token, directory, [PUBLISH_ALIAS]);
     // Run where no project manifest is found, so the registry is declared in the user scope alone.
     await execute(binary, REGISTRY_ARGUMENTS, directory, publisher);
+    // A skill Atlan refuses does not hold back the others, in the batch or among the updates naming their version.
+    const failed = [];
     if (batched.length > 0) {
       const args = ["publish", ...batched.map(item => `./${item}`), "--to", `${PUBLISH_ALIAS}/${namespace}`, "--yes", "-g", ...changedSinceArguments(baseline)];
-      await execute(binary, args, cwd, publisher);
+      await execute(binary, args, cwd, publisher).catch(error => failed.push(error));
     }
-    // Each update names its version; one Atlan refuses does not hold back the others.
-    const failed = [];
     for (const update of updates) {
       const target = `${PUBLISH_ALIAS}/${namespace}/${update.name}@${update.version}`;
       await execute(binary, ["publish", `./${update.folder}`, "--to", target, "--yes", "-g"], cwd, publisher).catch(error => failed.push(error));
@@ -39734,7 +39764,7 @@ async function runPublishAction({
     if (failed.length > 0) throw failed[0];
     const synced = await syncAgents({
       agents: inputs.agents, folders: skills, token, workspace: inputs.workspace, repository: environment.GITHUB_REPOSITORY,
-      registry, alias: PUBLISH_ALIAS, aireg: (args, input) => execute(binary, args, directory, publisher, true, input)
+      registry, alias: PUBLISH_ALIAS, aireg: (args, input) => execute(binary, args, directory, publisher, true, input), fresh: candidates
     });
     for (const agent of synced) {
       const moved = agent.to === agent.from ? "unchanged" : `version ${agent.from} → ${agent.to}`;
