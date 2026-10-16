@@ -39449,6 +39449,7 @@ const PUBLISH_ALIAS = "atlan";
 // and nothing is written into the repository.
 const REGISTRY_ARGUMENTS = Object.freeze(["registry", "add", PUBLISH_GATEWAY, "--as", PUBLISH_ALIAS, "--adapter", ADAPTER, "-g"]);
 const MAX_CLI_OUTPUT_BYTES = 64 * 1024;
+const MAX_CLI_STDERR_CHARS = 8 * 1024;
 
 const CLI_OS = { linux: "linux", darwin: "darwin" };
 const CLI_ARCH = { x64: "amd64", arm64: "arm64" };
@@ -39694,15 +39695,32 @@ function updatedCli(raw, binary, directory) {
 
 // Runs the verified CLI directly, without a shell; captures bounded stdout when asked.
 // `input`, when given, is the child's whole stdin, such as a request body.
+// aireg's own explanation of a failure, its `error:` line and the `hint:` after it, with the checkout's path left
+// out, so a failed publish can say why rather than only that it exited.
+function cliFailure(stderr, cwd) {
+  const lines = stderr.split(/\r?\n/);
+  const at = lines.findLastIndex(line => line.startsWith("error: "));
+  if (at < 0) return undefined;
+  const hint = lines.slice(at + 1).find(line => line.startsWith("hint: "));
+  const text = [lines[at].slice(7), hint && `Hint: ${hint.slice(6)}`].filter(Boolean).join(" ");
+  return cwd ? text.replaceAll(`${cwd}/`, "") : text;
+}
+
 function runCli(binary, args, cwd, environment, capture = false, input) {
   return new Promise((resolve, reject) => {
     const child = (0,external_node_child_process_namespaceObject.spawn)(binary, [...args], {
       cwd,
       env: environment,
       shell: false,
-      stdio: [input === undefined ? (capture ? "ignore" : "inherit") : "pipe", capture ? "pipe" : "inherit", "inherit"]
+      stdio: [input === undefined ? (capture ? "ignore" : "inherit") : "pipe", capture ? "pipe" : "inherit", "pipe"]
     });
     if (input !== undefined) child.stdin.end(input);
+    // stderr still reaches the job log as it arrives; only its tail is kept, for the failure's reason.
+    let stderr = "";
+    child.stderr.on("data", chunk => {
+      process.stderr.write(chunk);
+      stderr = (stderr + chunk.toString("utf8")).slice(-MAX_CLI_STDERR_CHARS);
+    });
     const chunks = [];
     let size = 0;
     child.stdout?.on("data", chunk => {
@@ -39714,7 +39732,10 @@ function runCli(binary, args, cwd, environment, capture = false, input) {
     // "close" waits for stdout to drain; "exit" can fire first and lose the tail of it.
     child.on("close", code => {
       if (size > MAX_CLI_OUTPUT_BYTES) return reject(new Error("aireg output exceeds the size limit"));
-      if (code !== 0) return reject(new Error(`aireg ${args[0]} exited with status ${code}`));
+      if (code !== 0) {
+        const reason = cliFailure(stderr, cwd);
+        return reject(new Error(`aireg ${args[0]} exited with status ${code}${reason ? `: ${reason}` : ""}`));
+      }
       resolve(Buffer.concat(chunks).toString("utf8"));
     });
   });
@@ -39807,7 +39828,8 @@ async function runPublishAction({
       const target = `${PUBLISH_ALIAS}/${namespace}/${update.name}@${update.version}`;
       await execute(binary, ["publish", `./${update.folder}`, "--to", target, "--yes", "-g"], cwd, publisher).catch(error => failed.push(error));
     }
-    if (failed.length > 0) throw failed[0];
+    if (failed.length === 1) throw failed[0];
+    if (failed.length > 1) throw Object.assign(new Error(`${failed.length} publishes failed`), { failures: failed.map(error => error.message) });
     const synced = await syncAgents({
       agents: inputs.agents, folders: skills, cwd, token, workspace: inputs.workspace, repository: environment.GITHUB_REPOSITORY,
       registry, alias: PUBLISH_ALIAS, aireg: (args, input) => execute(binary, args, directory, publisher, true, input), fresh: candidates
@@ -39834,13 +39856,23 @@ function runLink(environment) {
   return runId ? `[The run log](${server}/${environment.GITHUB_REPOSITORY}/actions/runs/${runId})` : "The run log";
 }
 
+// GitHub masks secrets in logs, not in comment text, so the token is blanked here too, whatever said it.
+function clean(text, environment) {
+  const token = environment.ATLANAI_TOKEN;
+  const plain = String(text).replace(/[\r\n`]/g, " ");
+  return (token && token.length >= 8 ? plain.replaceAll(token, "***") : plain).slice(0, 500);
+}
+
 function publishFailureComment(environment, sha, error) {
-  const message = (error instanceof Error ? error.message : "publishing failed").replace(/[\r\n`]/g, " ").slice(0, 500);
+  const failures = Array.isArray(error?.failures) ? error.failures.slice(0, 10) : undefined;
+  const summary = failures
+    ? [`Publishing \`${sha.slice(0, 7)}\` to Atlan failed for ${error.failures.length} items:`, "", ...failures.map(item => `- \`${clean(item, environment)}\``)]
+    : [`Publishing \`${sha.slice(0, 7)}\` to Atlan failed: \`${clean(error instanceof Error ? error.message : "publishing failed", environment)}\`.`];
   return [
     PUBLISH_FAILURE_MARKER,
     "### Registry Sync could not publish this merge",
     "",
-    `Publishing \`${sha.slice(0, 7)}\` to Atlan failed: \`${message}\`.`,
+    ...summary,
     "",
     `${runLink(environment)} has Atlan's response. Fix what it names in a new pull request, where preflight checks it before it merges. If Atlan refused nothing, or a skill an agent needs has since been released, rerun the workflow.`
   ].join("\n");
