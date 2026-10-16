@@ -37688,9 +37688,14 @@ function repositoryUri(repository) {
 }
 
 // This repository's Atlan skills at `folder`: another repository's skill at the same path is not one of them.
+// A skill published from a laptop has no lineage; as skill preflight adopts it, its name stands in when no
+// repository claims it.
 function ownSkills(remote, folder, repository) {
   const uri = repositoryUri(repository);
-  return remote.filter(skill => skill.sourceId === folder && skill.sourceUri?.toLowerCase().replace(/\.git$/, "") === uri);
+  const linked = remote.filter(skill => skill.sourceId === folder && skill.sourceUri?.toLowerCase().replace(/\.git$/, "") === uri);
+  if (linked.length > 0) return linked;
+  const name = folder.split("/").at(-1);
+  return remote.filter(skill => skill.name === name && !skill.repoId && !skill.sourceUri);
 }
 
 const notFound = error => error?.status === 404;
