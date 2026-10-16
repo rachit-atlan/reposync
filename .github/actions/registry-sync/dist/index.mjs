@@ -37633,6 +37633,41 @@ function preflightConfig({ workspace, artifacts, agents }, files) {
   };
 }
 
+;// CONCATENATED MODULE: ./src/agent-definition.js
+
+
+
+
+function unquote(value) {
+  const single = /^'(.*)'$/.exec(value);
+  if (single) return single[1].replace(/''/g, "'");
+  const double = /^"(.*)"$/.exec(value);
+  if (double) return double[1].replace(/\\(["\\])/g, "$1");
+  return value;
+}
+
+// An agent file's `description`, from its front matter on one line, and its instructions, the body after it. A
+// folder or code entry point carries neither, so that agent's text is left as Atlan has it. Only a regular file is
+// read: a symlink could point the instructions at anything on the runner.
+function agentDefinition(cwd, agentPath) {
+  if (!agentPath.endsWith(".md")) return {};
+  const file = external_node_path_namespaceObject.join(cwd, agentPath);
+  const stat = external_node_fs_namespaceObject.lstatSync(file, { throwIfNoEntry: false });
+  if (!stat?.isFile() || stat.size > MAX_SKILL_BYTES) return {};
+  const text = external_node_fs_namespaceObject.readFileSync(file, "utf8").replace(/\r\n?/g, "\n");
+  const head = /^---\n([\s\S]*?)\n---(?:\n|$)/.exec(text);
+  if (!head) return {};
+  const line = head[1].split("\n").find(entry => /^description\s*:/.test(entry));
+  const raw = line?.replace(/^description\s*:\s*/, "").trim() ?? "";
+  // A block scalar (`|` or `>`) spans lines this reader does not follow, so it is left alone rather than guessed.
+  const description = raw === "" || /^[|>]/.test(raw) ? undefined : unquote(raw);
+  const instructions = text.slice(head[0].length).trim();
+  return {
+    ...(description ? { description } : {}),
+    ...(instructions ? { instructions } : {})
+  };
+}
+
 ;// CONCATENATED MODULE: ./src/skill-digest.js
 
 
@@ -39145,6 +39180,7 @@ async function runPreflight({ environment = process.env, request = githubRequest
 
 
 
+
 // A repository skill folder as its Atlan skill: this repository's, at that path, and only one of them.
 function ownSkill(remote, folder, repository, agent) {
   const found = ownSkills(remote, folder, repository);
@@ -39209,10 +39245,12 @@ function answer(raw, agent) {
 
 // After the skills publish, each agent with skills is pinned to exactly what the config lists, the repository
 // being the source of truth, each skill at its current release. The gateway keeps the agent's version when
-// nothing moved, so sending the whole list every run is safe. An agent with no skills listed is left alone,
-// since an empty list would archive every skill link it has. CI never creates an agent or touches its key.
-async function syncAgents({ agents, folders, token, workspace, repository, registry, alias, aireg, fresh = [], now = Date.now, wait = pause }) {
-  const managed = agents.filter(agent => agent.skills.length > 0);
+// nothing moved, so sending the whole list every run is safe. An agent with no skills listed keeps its pins,
+// since an empty list would archive every skill link it has. An agent defined by a Markdown file also gets that
+// file's description and instructions, sent only when they differ. CI never creates an agent or touches its key.
+async function syncAgents({ agents, folders, cwd, token, workspace, repository, registry, alias, aireg, fresh = [], now = Date.now, wait = pause }) {
+  const definitions = new Map(agents.map(agent => [agent.id, cwd ? agentDefinition(cwd, agent.path) : {}]));
+  const managed = agents.filter(agent => agent.skills.length > 0 || Object.keys(definitions.get(agent.id)).length > 0);
   if (managed.length === 0) return [];
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository ?? "")) {
     throw new Error("GITHUB_REPOSITORY is needed to find this repository's skills in Atlan");
@@ -39245,9 +39283,17 @@ async function syncAgents({ agents, folders, token, workspace, repository, regis
     const before = answer(await call(["atlan", "api", "get", route, "--registry", alias, "--json"]), agent);
     if (before.workspace_id !== workspace) throw new Error(`${agentName(agent)} is in another workspace; list only agents in the workspace ${CONFIG_FILE} names`);
     if (before.artifact_status === "archived") throw new Error(`${agentName(agent)} is archived in Atlan; take it out of ${CONFIG_FILE}, or link a new agent`);
-    const body = JSON.stringify({ skills: pins });
-    const after = answer(await call(["atlan", "api", "patch", route, "--registry", alias, "--input", "-", "--json"], body), agent);
-    results.push({ id: agent.id, name: after.name ?? agent.id, pins: pins.length, from: before.version_ordinal, to: after.version_ordinal });
+    const text = Object.fromEntries(Object.entries(definitions.get(agent.id)).filter(([field, value]) => before[field] !== value));
+    const body = { ...text, ...(agent.skills.length > 0 ? { skills: pins } : {}) };
+    if (Object.keys(body).length === 0) {
+      results.push({ id: agent.id, name: before.name ?? agent.id, pins: undefined, text: [], from: before.version_ordinal, to: before.version_ordinal });
+      continue;
+    }
+    const after = answer(await call(["atlan", "api", "patch", route, "--registry", alias, "--input", "-", "--json"], JSON.stringify(body)), agent);
+    results.push({
+      id: agent.id, name: after.name ?? agent.id, pins: agent.skills.length > 0 ? pins.length : undefined, text: Object.keys(text),
+      from: before.version_ordinal, to: after.version_ordinal
+    });
   }
   return results;
 }
@@ -39763,12 +39809,13 @@ async function runPublishAction({
     }
     if (failed.length > 0) throw failed[0];
     const synced = await syncAgents({
-      agents: inputs.agents, folders: skills, token, workspace: inputs.workspace, repository: environment.GITHUB_REPOSITORY,
+      agents: inputs.agents, folders: skills, cwd, token, workspace: inputs.workspace, repository: environment.GITHUB_REPOSITORY,
       registry, alias: PUBLISH_ALIAS, aireg: (args, input) => execute(binary, args, directory, publisher, true, input), fresh: candidates
     });
     for (const agent of synced) {
       const moved = agent.to === agent.from ? "unchanged" : `version ${agent.from} → ${agent.to}`;
-      process.stdout.write(`::notice title=Registry Sync::agent ${agent.name}: ${agent.pins} skills pinned, ${moved}\n`);
+      const done = [...(agent.pins === undefined ? [] : [`${agent.pins} skills pinned`]), ...agent.text.map(field => `${field} updated`)];
+      process.stdout.write(`::notice title=Registry Sync::agent ${agent.name}: ${[...done, moved].join(", ")}\n`);
     }
     common_setOutput("status", "success", environment);
     common_setOutput("cli-version", version, environment);
