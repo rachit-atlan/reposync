@@ -39859,7 +39859,7 @@ function runLink(environment) {
 // GitHub masks secrets in logs, not in comment text, so the token is blanked here too, whatever said it.
 function clean(text, environment) {
   const token = environment.ATLANAI_TOKEN;
-  const plain = String(text).replace(/[\r\n`]/g, " ");
+  const plain = String(text).replace(/[\r\n]/g, " ").replaceAll("`", "'");
   return (token && token.length >= 8 ? plain.replaceAll(token, "***") : plain).slice(0, 500);
 }
 
