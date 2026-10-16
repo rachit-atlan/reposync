@@ -39249,7 +39249,63 @@ async function publishBaseline({ environment, eventPayload, cwd, request = githu
   }
 }
 
+;// CONCATENATED MODULE: ./src/publish-updates.js
+
+
+
+
+
+
+const SEMVER = /^(\d+)\.(\d+)\.(\d+)$/;
+const GIT_ENVIRONMENT = { PATH: "/usr/bin:/bin", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" };
+
+// aireg works out an update's next version by bumping the current one, and the Atlan adapter reports a version
+// whose release it cannot name as its bare number, which is not SemVer. Until it names versions by their release,
+// each update names its own: the newest release label, bumped, or the version number as a minor.
+function nextVersion(labels, ordinal) {
+  const parsed = labels.map(label => SEMVER.exec(label ?? "")).filter(Boolean).map(match => match.slice(1, 4).map(Number));
+  if (parsed.length === 0) return `0.${ordinal + 1}.0`;
+  const [major, minor, patch] = parsed.sort((a, b) => b[0] - a[0] || b[1] - a[1] || b[2] - a[2])[0];
+  return `${major}.${minor}.${patch + 1}`;
+}
+
+// A baseline git cannot diff against leaves every skill a candidate: only those that differ from Atlan publish.
+function changedFiles(cwd, baseline) {
+  const result = (0,external_node_child_process_namespaceObject.spawnSync)("git", ["diff", "--name-only", "-z", baseline, "HEAD"], { cwd, env: GIT_ENVIRONMENT });
+  return result.status === 0 ? result.stdout.toString().split("\0").filter(Boolean) : undefined;
+}
+
+function localSkill(cwd, files, folder) {
+  const prefix = `${folder}/`;
+  const entries = files.filter(file => file.startsWith(prefix))
+    .map(file => ({ path: file.slice(prefix.length), sha256: sha256(external_node_fs_namespaceObject.readFileSync(external_node_path_namespaceObject.join(cwd, file))) }));
+  return { name: canonicalSkillName(external_node_fs_namespaceObject.readFileSync(external_node_path_namespaceObject.join(cwd, folder, "SKILL.md"), "utf8")), digest: bundleDigest(entries) };
+}
+
+// The skills this run updates in Atlan, each with the version to publish it as: aireg knows a skill by its name in
+// the workspace, so one there under the same name whose content differs, and that changed since the baseline when
+// there is one, as `--changed-since` would choose. A new or unchanged skill stays with the batch publish.
+async function plannedUpdates({ cwd, files, skills, baseline, token, workspace, repository, registry }) {
+  if (skills.length === 0) return [];
+  const changed = baseline ? changedFiles(cwd, baseline) : undefined;
+  const candidates = changed ? skills.filter(folder => changed.some(file => file.startsWith(`${folder}/`))) : skills;
+  if (candidates.length === 0) return [];
+  const { byWorkspace } = await loadRegistryInventory({ token, request: registry, context: { repository }, workspaces: [workspace] });
+  const remote = byWorkspace.get(workspace) ?? [];
+  const updates = [];
+  for (const folder of candidates) {
+    const local = localSkill(cwd, files, folder);
+    const current = remote.find(skill => skill.name === local.name);
+    if (!current || current.sourceDigest === local.digest) continue;
+    const releases = await registry({ token, requestPath: `/registry/v1/artifacts/skill/${encodeURIComponent(current.id)}/releases` });
+    const labels = (Array.isArray(releases?.items) ? releases.items : []).map(release => release?.version_label);
+    updates.push({ folder, name: local.name, version: nextVersion(labels, current.versionOrdinal) });
+  }
+  return updates;
+}
+
 ;// CONCATENATED MODULE: ./src/cli.js
+
 
 
 
@@ -39628,15 +39684,26 @@ async function runPublishAction({
   const since = await publishBaseline({ environment, eventPayload, cwd, request, ancestor });
   // With no baseline, everything the config covers that differs from Atlan publishes.
   const baseline = since && config !== undefined && configChanged(cwd, since) ? undefined : since;
+  const updates = await plannedUpdates({
+    cwd, files, skills, baseline, token, workspace: inputs.workspace, repository: environment.GITHUB_REPOSITORY, registry
+  });
+  const batched = paths.filter(item => !updates.some(update => update.folder === item));
   const { binary, directory, version } = await install({ environment });
   try {
     const publisher = publisherEnvironment(environment, token, directory, [PUBLISH_ALIAS]);
     // Run where no project manifest is found, so the registry is declared in the user scope alone.
     await execute(binary, REGISTRY_ARGUMENTS, directory, publisher);
-    if (paths.length > 0) {
-      const args = ["publish", ...paths.map(item => `./${item}`), "--to", `${PUBLISH_ALIAS}/${namespace}`, "--yes", "-g", ...changedSinceArguments(baseline)];
+    if (batched.length > 0) {
+      const args = ["publish", ...batched.map(item => `./${item}`), "--to", `${PUBLISH_ALIAS}/${namespace}`, "--yes", "-g", ...changedSinceArguments(baseline)];
       await execute(binary, args, cwd, publisher);
     }
+    // Each update names its version; one Atlan refuses does not hold back the others.
+    const failed = [];
+    for (const update of updates) {
+      const target = `${PUBLISH_ALIAS}/${namespace}/${update.name}@${update.version}`;
+      await execute(binary, ["publish", `./${update.folder}`, "--to", target, "--yes", "-g"], cwd, publisher).catch(error => failed.push(error));
+    }
+    if (failed.length > 0) throw failed[0];
     const synced = await syncAgents({
       agents: inputs.agents, folders: skills, token, workspace: inputs.workspace, repository: environment.GITHUB_REPOSITORY,
       registry, alias: PUBLISH_ALIAS, aireg: (args, input) => execute(binary, args, directory, publisher, true, input)
