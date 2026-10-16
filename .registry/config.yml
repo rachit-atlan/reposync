@@ -16,4 +16,4 @@ agents:
     path: .claude/agents/reviewer.md
     skills: [.claude/skills/edge21-*]
   - id: agent_01m51pqkk3ex8b25w6qqejrz1h
-    path: agents/unmanaged
+    path: agents/gone
