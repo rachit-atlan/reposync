@@ -39155,20 +39155,32 @@ function ownSkill(remote, folder, repository, agent) {
 
 const versionKey = value => String(value ?? "").replace(/^ver_/, "");
 
-// The version of a skill's current release, pinned by number: the gateway resolves an unversioned pin to the
-// current release a moment behind a release just cut, so an agent updated right after a publish could keep the
-// previous version. A skill with no current release cannot be pinned, and the gateway refuses it without saying
-// which, so it is named here. A version the list does not show is left to the gateway to resolve.
-async function currentRelease(skill, label, agent, read) {
+const itemsOf = page => (Array.isArray(page?.items) ? page.items : []);
+const SETTLE_MS = 30_000;
+const POLL_MS = 2_000;
+const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+// The version of a skill's current release, pinned by number. Atlan cuts a release with its version but marks it
+// released a moment later, and resolves an unversioned pin later still, so a release still settling is waited for,
+// up to the run's shared deadline. A newest version with no release (one awaiting review) is not waited for. A skill
+// with no current release cannot be pinned, and the gateway refuses it without saying which, so it is named here.
+async function currentRelease(skill, label, agent, read, settle) {
   const id = encodeURIComponent(skill.id);
-  const releases = await read(`/registry/v1/artifacts/skill/${id}/releases`);
-  const current = (Array.isArray(releases?.items) ? releases.items : [])
-    .find(release => release?.channel === "latest" && release.is_current === true && release.release_status === "released");
-  if (!current) throw new Error(`${agentName(agent)}: \`${label}\` has no release in Atlan yet, so it cannot be pinned`);
-  const versions = await read(`/registry/v1/artifacts/skill/${id}/versions?limit=100`);
-  const ordinal = (Array.isArray(versions?.items) ? versions.items : [])
-    .find(version => versionKey(version?.version_id) === versionKey(current.version_id))?.version_ordinal;
-  return { skill_id: skill.id, ...(Number.isSafeInteger(ordinal) ? { version_ordinal: ordinal } : {}) };
+  for (;;) {
+    const releases = itemsOf(await read(`/registry/v1/artifacts/skill/${id}/releases`)).filter(release => release?.channel === "latest");
+    const versions = itemsOf(await read(`/registry/v1/artifacts/skill/${id}/versions?limit=100`));
+    const current = releases.find(release => release.is_current === true && release.release_status === "released");
+    const newest = versions.reduce((top, version) => (version?.version_ordinal > (top?.version_ordinal ?? 0) ? version : top), undefined);
+    const pending = newest && releases.find(release => versionKey(release.version_id) === versionKey(newest.version_id) &&
+      release !== current && !["superseded", "withdrawn"].includes(release.release_status));
+    if (pending && settle.now() < settle.deadline) {
+      await settle.wait(POLL_MS);
+      continue;
+    }
+    if (!current) throw new Error(`${agentName(agent)}: \`${label}\` has no release in Atlan yet, so it cannot be pinned`);
+    const ordinal = versions.find(version => versionKey(version?.version_id) === versionKey(current.version_id))?.version_ordinal;
+    return { skill_id: skill.id, ...(Number.isSafeInteger(ordinal) ? { version_ordinal: ordinal } : {}) };
+  }
 }
 
 function answer(raw, agent) {
@@ -39187,7 +39199,7 @@ function answer(raw, agent) {
 // being the source of truth, each skill at its current release. The gateway keeps the agent's version when
 // nothing moved, so sending the whole list every run is safe. An agent with no skills listed is left alone,
 // since an empty list would archive every skill link it has. CI never creates an agent or touches its key.
-async function syncAgents({ agents, folders, token, workspace, repository, registry, alias, aireg }) {
+async function syncAgents({ agents, folders, token, workspace, repository, registry, alias, aireg, now = Date.now, wait = pause }) {
   const managed = agents.filter(agent => agent.skills.length > 0);
   if (managed.length === 0) return [];
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository ?? "")) {
@@ -39196,6 +39208,7 @@ async function syncAgents({ agents, folders, token, workspace, repository, regis
   const { byWorkspace } = await loadRegistryInventory({ token, request: registry, context: { repository }, workspaces: [workspace] });
   const remote = byWorkspace.get(workspace) ?? [];
   const read = requestPath => registry({ token, requestPath });
+  const settle = { now, wait, deadline: now() + SETTLE_MS };
   const resolved = new Map();
   const results = [];
   for (const agent of managed) {
@@ -39207,7 +39220,7 @@ async function syncAgents({ agents, folders, token, workspace, repository, regis
     const pins = [];
     for (const [label, skill] of skills) {
       if (pins.some(pin => pin.skill_id === skill.id)) continue;
-      if (!resolved.has(skill.id)) resolved.set(skill.id, await currentRelease(skill, label, agent, read));
+      if (!resolved.has(skill.id)) resolved.set(skill.id, await currentRelease(skill, label, agent, read, settle));
       pins.push(resolved.get(skill.id));
     }
     const route = `/agent/v1/agents/${agent.id}`;
