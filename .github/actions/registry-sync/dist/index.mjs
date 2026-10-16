@@ -38975,7 +38975,7 @@ function formatPreflightComment(report, compact = false) {
   const workspaceCount = report.config?.valid ? report.config.workspaceCount : 0;
   const resolutionPrompt = state === "conflict" || rejected.length > 0 ? buildResolutionPrompt(report) : "";
   const resolutionActions = resolutionPrompt
-    ? `${actionBadge({ href: codexHandoffUrl(resolutionPrompt), light: CODEX_BADGE_URL, dark: CODEX_BADGE_DARK_URL, alt: "Fix in Codex" })} ${actionBadge({ href: claudeHandoffUrl(report, resolutionPrompt), light: CLAUDE_BADGE_URL, dark: CLAUDE_BADGE_DARK_URL, alt: "Fix in Claude Code" })} **[Fix in Claude.ai](${claudeWebHandoffUrl(report, resolutionPrompt)})**`
+    ? `${actionBadge({ href: codexHandoffUrl(resolutionPrompt), light: CODEX_BADGE_URL, dark: CODEX_BADGE_DARK_URL, alt: "Fix in Codex" })} ${actionBadge({ href: claudeHandoffUrl(report, resolutionPrompt), light: CLAUDE_BADGE_URL, dark: CLAUDE_BADGE_DARK_URL, alt: "Fix in Claude Code" })}\n\nOr fix it in the browser with [Claude.ai](${claudeWebHandoffUrl(report, resolutionPrompt)}).`
     : "";
   const lines = [PREFLIGHT_MARKER, `### ${verdict}`, ""];
   if (report.configError) {
