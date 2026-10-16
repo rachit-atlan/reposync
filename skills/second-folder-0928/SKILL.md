@@ -20,3 +20,4 @@ Config-file test, 2026-10-04: edited in a PR.
 This is a new skill cool skill checkinng 2 agents use it
 
 Named-version update test.
+Second named-version update test.
