@@ -37617,7 +37617,7 @@ function skillFolders(files, globs = []) {
 }
 
 // Preflight's view of the inputs: the skill folders, found in the pull request's trees.
-function preflightConfig({ workspace, artifacts }, files) {
+function preflightConfig({ workspace, artifacts, agents }, files) {
   const folders = skillFolders(files, artifacts.skill);
   return {
     valid: true,
@@ -37625,7 +37625,8 @@ function preflightConfig({ workspace, artifacts }, files) {
     folders: new Set(folders),
     exclude: new Set(),
     workspaces: new Set([workspace]),
-    workspaceCount: 1
+    workspaceCount: 1,
+    agentCount: agents?.length ?? 0
   };
 }
 
@@ -37749,12 +37750,13 @@ async function compareAgents({ rows, workspace, repository, registryToken, regis
   if (!registryToken) return { compared: false };
   try {
     const remote = (await inventory()) ?? [];
-    for (const row of rows.filter(item => item.agent.skills.length > 0)) {
+    for (const row of rows) {
       const missing = await agentInAtlan({ row, workspace, registryToken, registry }).catch(error => {
         if (notFound(error)) return `agent ${row.agent.id} is not in Atlan; link it first`;
         throw error;
       });
       if (missing) return { compared: false, error: missing };
+      if (row.agent.skills.length === 0) continue;
       const desired = new Set(row.ids);
       row.added = row.ids.filter(id => !row.current.includes(id));
       for (const folder of row.folders) {
@@ -38782,7 +38784,10 @@ function configurationDifference(report) {
     "| Setting | Before | After merge |",
     "| --- | --- | --- |",
     `| Skill folders | ${describePaths(report.config)} | ${describePaths(report.proposedConfig)} |`,
-    `| Destination workspaces | ${report.config.workspaceCount} | ${report.proposedConfig.workspaceCount}${destinationsChanged ? " (changed)" : ""} |`
+    `| Destination workspaces | ${report.config.workspaceCount} | ${report.proposedConfig.workspaceCount}${destinationsChanged ? " (changed)" : ""} |`,
+    ...(report.config.agentCount || report.proposedConfig.agentCount
+      ? [`| Agents | ${report.config.agentCount ?? 0} | ${report.proposedConfig.agentCount ?? 0} |`]
+      : [])
   ];
 }
 
@@ -39149,8 +39154,6 @@ async function syncAgents({ agents, folders, token, workspace, repository, regis
   }
   const { byWorkspace } = await loadRegistryInventory({ token, request: registry, context: { repository }, workspaces: [workspace] });
   const remote = byWorkspace.get(workspace) ?? [];
-  // `aireg atlan api` reads a stored sign-in, which the Action-owned home keeps for this run alone.
-  await aireg(["auth", "login", alias, "--token-stdin"], token);
   const results = [];
   for (const agent of managed) {
     const { ids, folders: own } = agentSkills(agent, folders);
@@ -39494,7 +39497,7 @@ function updatedCli(raw, binary, directory) {
 }
 
 // Runs the verified CLI directly, without a shell; captures bounded stdout when asked.
-// `input`, when given, is the child's whole stdin, so a secret it carries never reaches argv or the environment.
+// `input`, when given, is the child's whole stdin, such as a request body.
 function runCli(binary, args, cwd, environment, capture = false, input) {
   return new Promise((resolve, reject) => {
     const child = (0,external_node_child_process_namespaceObject.spawn)(binary, [...args], {
@@ -39597,12 +39600,9 @@ async function runPublishAction({
       const args = ["publish", ...paths.map(item => `./${item}`), "--to", `${PUBLISH_ALIAS}/${namespace}`, "--yes", "-g", ...changedSinceArguments(baseline)];
       await execute(binary, args, cwd, publisher);
     }
-    // aireg refuses to store a sign-in while the token variable is set, so agent calls run without it.
-    const signin = { ...publisher };
-    delete signin[tokenVariable(PUBLISH_ALIAS)];
     const synced = await syncAgents({
       agents: inputs.agents, folders: skills, token, workspace: inputs.workspace, repository: environment.GITHUB_REPOSITORY,
-      registry, alias: PUBLISH_ALIAS, aireg: (args, input) => execute(binary, args, directory, signin, true, input)
+      registry, alias: PUBLISH_ALIAS, aireg: (args, input) => execute(binary, args, directory, publisher, true, input)
     });
     for (const agent of synced) {
       const moved = agent.to === agent.from ? "unchanged" : `version ${agent.from} → ${agent.to}`;
