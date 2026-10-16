@@ -20,3 +20,6 @@ agents:
   - id: agent_01m51yzst8e0t9td376s24fg6b
     path: .claude/agents/docs-writer-1016.md
     skills: [skills/second-folder-0928]
+  - id: agent_01m52102v7ednvkjkqjnhsr3s8
+    path: agents/triage-1016
+    skills: [skills/config-new-1015]
