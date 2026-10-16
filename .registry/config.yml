@@ -19,4 +19,4 @@ agents:
     path: agents/unmanaged
   - id: agent_01m51yzst8e0t9td376s24fg6b
     path: .claude/agents/docs-writer-1016.md
-    skills: [skills/second-folder-0928]
+    skills: [skills/second-folder-0928, docs/nothing]
