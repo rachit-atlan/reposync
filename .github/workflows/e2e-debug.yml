@@ -35,21 +35,13 @@ jobs:
           npm install --global --force corepack@0.34.6 && corepack enable pnpm
           pnpm install --frozen-lockfile
           pnpm run build
-      - name: "A: the agents 0.1.17 left half-created"
+      - name: "C: someone edits e2e1023-review in the registry"
         env:
           AIREG_TOKEN_ATLAN: ${{ secrets.REGISTRY_TOKEN }}
         run: |
           export AIREG_MAIN="$PWD/.aireg-src/cli/dist/main.mjs" LOGGER="$PWD/e2e1023/debug/fetch-log.mjs" ADAPTER="$PWD/e2e1023/debug/adapter.mjs"
-          e2e1023/debug/run.sh A .
-      - name: "A again: nothing changed"
-        env:
-          AIREG_TOKEN_ATLAN: ${{ secrets.REGISTRY_TOKEN }}
-        run: |
-          export AIREG_MAIN="$PWD/.aireg-src/cli/dist/main.mjs" LOGGER="$PWD/e2e1023/debug/fetch-log.mjs" ADAPTER="$PWD/e2e1023/debug/adapter.mjs"
-          e2e1023/debug/run.sh A2 .
-      - name: "B: a new skill and its agent in one run"
-        env:
-          AIREG_TOKEN_ATLAN: ${{ secrets.REGISTRY_TOKEN }}
-        run: |
-          export AIREG_MAIN="$PWD/.aireg-src/cli/dist/main.mjs" LOGGER="$PWD/e2e1023/debug/fetch-log.mjs" ADAPTER="$PWD/e2e1023/debug/adapter.mjs"
-          e2e1023/debug/run.sh B e2e1023/debug/fresh
+          git fetch -q --depth 1 origin main && git checkout -q FETCH_HEAD
+          printf '\nAlso check the tests. (edited in the registry)\n' >> e2e1023/skills/e2e1023-review/SKILL.md
+          git -c user.name=e2e -c user.email=e2e@example.com commit -qam "registry-side edit"
+          git checkout -q ${{ github.sha }} -- e2e1023/debug
+          e2e1023/debug/run.sh C .
