@@ -1,38 +1,50 @@
 name: Registry Sync
 
+# Test harness: the Action is vendored at .github/actions/registry-sync from
+# atlanai/agent-registry-action#44. A consumer uses atlanai/agent-registry-action@<version>.
 on:
-  pull_request_target:                  # PRs: preflight only; pull-request code is never checked out
-    types: [opened, synchronize, reopened]
+  pull_request:
   push:
     branches: [main]
-  workflow_dispatch:                    # manual run on main = publish everything
+  workflow_dispatch:
 
 permissions: {}
 
 concurrency:
   group: registry-sync-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}   # never cancel a publish
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  registry-sync:
+  # Shows on the pull request what merging publishes; aireg reads the pull request's files and never runs them.
+  preview:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    environment: registry               # its token is released to main only
+    environment: registry
     permissions:
-      actions: read
       contents: read
       pull-requests: write
     steps:
-      # Test harness only: the Action is vendored here, so the base branch is checked out to reach it.
-      # A consumer uses atlanai/agent-registry-action@<version> and checks out only on main.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
           persist-credentials: false
       - uses: ./.github/actions/registry-sync
-        with:                           # the workspace and skill folders live in .registry/config.yml
-          preflight: true
-          allow-pr-commenting: true
-          fail-on-conflict: true
         env:
-          ATLANAI_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          AIREG_TOKEN_ATLAN: ${{ secrets.REGISTRY_TOKEN }}
+
+  # Publishes the exports .registry/manifest.yml declares, to its publish.to target.
+  publish:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: registry
+    permissions:
+      contents: read
+      pull-requests: write  # comments on the merged pull request when publishing fails
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/registry-sync
+        env:
+          AIREG_TOKEN_ATLAN: ${{ secrets.REGISTRY_TOKEN }}
