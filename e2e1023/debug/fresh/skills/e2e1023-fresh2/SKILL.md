@@ -1,5 +1,5 @@
 ---
-name: e2e1023-fresh
+name: e2e1023-fresh2
 description: Throwaway skill for the same-run pin debug, 2026-10-23. Safe to delete.
 ---
 A fresh skill.
