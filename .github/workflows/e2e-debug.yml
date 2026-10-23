@@ -38,4 +38,4 @@ jobs:
       - name: "Probe: repository registration and link"
         env:
           AIREG_TOKEN_ATLAN: ${{ secrets.REGISTRY_TOKEN }}
-        run: e2e1023/debug/probe.sh
+        run: e2e1023/debug/probe2.sh
