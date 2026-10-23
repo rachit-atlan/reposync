@@ -1,6 +1,6 @@
 # Registry Sync e2e, 2026-10-23: only what is under e2e1023/ publishes.
 registries:
-  atlan: { source: https://api.atlan.com, adapter: atlan }
+  atlan: { source: https://registry.example.com, adapter: atlan }
 exports:
   - e2e1023/skills/*
   - path: e2e1023/agents/e2e1023-reviewer
