@@ -2,8 +2,8 @@
 registries:
   atlan: { source: https://api.atlan.com, adapter: atlan }
 exports:
-  - skills/e2e1023-fresh2
-  - path: agents/e2e1023-fresh2-agent
-    depends_on: [./skills/e2e1023-fresh2]
+  - skills/e2e1023-fresh3
+  - path: agents/e2e1023-fresh3-agent
+    depends_on: [./skills/e2e1023-fresh3]
 publish:
   to: atlan/registry-cli-test

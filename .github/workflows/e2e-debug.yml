@@ -35,7 +35,15 @@ jobs:
           npm install --global --force corepack@0.34.6 && corepack enable pnpm
           pnpm install --frozen-lockfile
           pnpm run build
-      - name: "Probe: repository registration and link"
+      - name: "B: a new skill and its agent, linked to the repo artifact"
         env:
           AIREG_TOKEN_ATLAN: ${{ secrets.REGISTRY_TOKEN }}
-        run: e2e1023/debug/probe2.sh
+        run: |
+          export AIREG_MAIN="$PWD/.aireg-src/cli/dist/main.mjs" LOGGER="$PWD/e2e1023/debug/fetch-log.mjs" ADAPTER="$PWD/e2e1023/debug/adapter.mjs"
+          e2e1023/debug/run.sh B e2e1023/debug/fresh
+      - name: "B again: nothing changed"
+        env:
+          AIREG_TOKEN_ATLAN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          export AIREG_MAIN="$PWD/.aireg-src/cli/dist/main.mjs" LOGGER="$PWD/e2e1023/debug/fetch-log.mjs" ADAPTER="$PWD/e2e1023/debug/adapter.mjs"
+          e2e1023/debug/run.sh B2 e2e1023/debug/fresh
