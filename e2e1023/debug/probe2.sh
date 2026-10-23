@@ -7,7 +7,7 @@ W=workspace_01m36rz0zdfc1ttjvtj0h9b87j
 REPO=repo_01m51yr5wxe7088jrz54tc6000
 S=skill_01m5ky9e2me14b7zdc32grfty1
 out=$(mktemp); trap 'rm -f "$out"' EXIT
-get() { code=$(printf 'header = "Authorization: Bearer %s"\n' "$AIREG_TOKEN_ATLAN" | curl -sS -o "$out" -w '%{http_code}' "$API$1" -K -); }
+get() { code=$(printf 'header = "Authorization: Bearer %s"\n' "$AIREG_TOKEN_ATLAN" | curl -gsS -o "$out" -w '%{http_code}' "$API$1" -K -); }
 uris='[paths(type == "string") as $p | select(($p | map(tostring) | join(".")) | test("uri|url|remote|name")) | {key: ($p | map(tostring) | join(".")), value: getpath($p)}] | from_entries'
 for path in "/repo/v1/repos/$REPO" "/registry/v1/artifacts/repo/$REPO" "/registry/v1/repos/$REPO"; do
   get "$path"; echo "GET $path -> $code"; echo "  keys: $(jq -c 'keys' "$out" 2>/dev/null)"; echo "  uri fields: $(jq -c "$uris" "$out" 2>/dev/null)"
