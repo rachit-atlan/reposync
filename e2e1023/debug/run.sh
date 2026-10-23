@@ -7,7 +7,15 @@ export HOME="$home" AIREG_HOME="$home/.aireg" AIREG_USER_SCOPE="$home/.registry"
 aireg() { node "$AIREG_MAIN" "$@"; }
 log="$RUNNER_TEMP/$name.log"; : > "$log"
 echo "::group::$name"
-(cd "$project" && aireg adapter install atlan --yes >/dev/null && aireg --version && \
+# The released aireg installs and verifies the adapter, as the Action does; the source build then runs it.
+released="$home/aireg-released"
+curl -fsSL --proto '=https' -o "$released" "https://aireg.sh/artifacts/v0.1.2/aireg-linux-amd64"
+echo "353c7ad92efea87d12e22bfdaba00f545317ea926791bd859eb8fe6407269785  $released" | sha256sum -c --quiet
+chmod 700 "$released"
+updated=$("$released" self update --json | jq -r '.data.bin // empty')
+[ -n "$updated" ] && released=$updated
+"$released" --version
+(cd "$project" && "$released" adapter install atlan --yes && aireg --version && \
   E2E_FETCH_LOG="$log" NODE_OPTIONS="--import=$LOGGER" aireg publish --yes 2>&1) || echo "exit $?"
 echo "--- requests"
 cat "$log"
