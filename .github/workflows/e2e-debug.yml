@@ -2,7 +2,9 @@ name: Registry Sync debug (temporary)
 
 # Runs aireg 0.1.7 and the released Atlan adapter with a request log (method, host, path, status),
 # to find which call fails when an agent publishes. Writes only to registry-cli-test; removed after.
-on: workflow_dispatch
+on:
+  push:
+    branches: [e2e1023/debug]
 
 permissions: {}
 
