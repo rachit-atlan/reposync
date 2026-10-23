@@ -1,0 +1,9 @@
+# Debug scenario B: a new skill and an agent that pins it, published in one run.
+registries:
+  atlan: { source: https://api.atlan.com, adapter: atlan }
+exports:
+  - skills/e2e1023-fresh
+  - path: agents/e2e1023-fresh-agent
+    depends_on: [./skills/e2e1023-fresh]
+publish:
+  to: atlan/registry-cli-test

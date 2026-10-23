@@ -1,0 +1,46 @@
+name: Registry Sync debug (temporary)
+
+# Runs aireg 0.1.7 and the released Atlan adapter with a request log (method, host, path, status),
+# to find which call fails when an agent publishes. Writes only to registry-cli-test; removed after.
+on: workflow_dispatch
+
+permissions: {}
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: registry
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: atlanai/ai-registry
+          ref: cf194ce64009d10c0d97ffedb24b821830b4cf4b # aireg-v0.1.7
+          path: .aireg-src
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Build aireg 0.1.7
+        working-directory: .aireg-src
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm -C cli run build
+      - name: "A: existing skills, new agents"
+        env:
+          AIREG_TOKEN_ATLAN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          export AIREG_MAIN="$PWD/.aireg-src/cli/dist/main.mjs" LOGGER="$PWD/e2e1023/debug/fetch-log.mjs"
+          e2e1023/debug/run.sh A .
+      - name: "B: a new skill and its agent in one run"
+        env:
+          AIREG_TOKEN_ATLAN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          export AIREG_MAIN="$PWD/.aireg-src/cli/dist/main.mjs" LOGGER="$PWD/e2e1023/debug/fetch-log.mjs"
+          e2e1023/debug/run.sh B e2e1023/debug/fresh
