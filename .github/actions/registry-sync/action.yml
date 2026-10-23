@@ -1,5 +1,5 @@
 name: Registry Sync
-description: Preview and publish Git-managed skills to Atlan Agent Registry.
+description: Preview on each pull request, and publish on merge, the skills, agents and other artifacts your aireg manifest exports.
 author: Atlan
 
 branding:
@@ -7,48 +7,54 @@ branding:
   color: purple
 
 inputs:
-  workspace:
-    description: Atlan workspace ID that artifacts publish to and preflight compares with. Leave it unset when the repository's `.registry/config.yml` names the workspace.
+  working-directory:
+    description: Directory inside the checkout that holds `.registry/manifest.yml`; aireg runs there.
     required: false
-  artifacts:
-    description: "Globs per kind, one line each, for example `skill: [\"skills/**\", \"team-b/skills/**\"]` and `agent: \"agents/**\"`. Only tracked files match. Leave it unset when the repository's `.registry/config.yml` lists the skills; setting both is an error."
+    default: .
+  github-token:
+    description: GitHub token that writes the preview comment, fetches the pull request's base commit for the preview, confirms a rerun's commit, reports a failed publish on the merged pull request, and reads pull requests and writes the comment for legacy preflight.
     required: false
+    default: ${{ github.token }}
+  publish:
+    description: Publish for real. Defaults to true on push and workflow_dispatch, and false on pull requests, where the step previews with a dry run.
+    required: false
+    default: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
   preflight:
-    description: Check pull requests before they merge. Preflight validates each changed skill and compares it with the Registry; publishing leaves validation to the Registry.
+    description: Check pull requests before they merge, with the `pull_request` preview or legacy preflight.
     required: false
     default: "true"
   allow-pr-commenting:
-    description: Post the preflight result as one pull request comment. A pull request that touches no listed folder gets no comment.
+    description: Post the pull-request check as one comment. A pull request from a fork never gets one; its job summary has the preview.
     required: false
     default: "true"
+  workspace:
+    description: Legacy `pull_request_target` preflight only; use the `pull_request` preview instead. The Atlan workspace ID it compares skills with. Publishing takes its target from `.registry/manifest.yml` and fails when this is set.
+    required: false
+  artifacts:
+    description: "Legacy `pull_request_target` preflight only; use the `pull_request` preview instead. Skill globs, one line per kind, such as `skill: [\"skills/**\"]`. Publishing takes its exports from `.registry/manifest.yml` and fails when this is set."
+    required: false
   fail-on-conflict:
-    description: Fail preflight after commenting when a confirmed Registry conflict exists.
+    description: Fail the preview, after commenting, when an artifact the pull request changes was changed in the registry since its base; legacy preflight fails the same way on a confirmed Registry conflict.
     required: false
     default: "true"
-  github-token:
-    description: GitHub token that reads pull requests, writes the preflight comment, and reports a failed publish on the merged pull request.
-    required: false
-    default: ${{ github.token }}
-  working-directory:
-    description: Repository directory the artifacts globs are relative to.
-    required: false
-    default: .
-  prune:
-    description: Not supported with aireg yet; publish fails unless it is "false".
-    required: false
-    default: "false"
 
 outputs:
   status:
-    description: success when the selected mode completes without a confirmed conflict; conflict when preflight reports one.
+    description: "`success`; `failed` when aireg refused the publish, its preview or its dry run; `conflict` when the preview or legacy preflight finds one."
   cli-version:
-    description: The CLI version installed and executed by this Action.
+    description: The aireg version this Action installed and ran.
+  published:
+    description: "JSON array of the artifacts published, or on a preview or dry run those that would be, each `{registry, namespace, kind, name, version}`."
+  unchanged:
+    description: JSON array of the exports already published at their current content, in the same shape.
+  skipped:
+    description: "JSON array of the exports the target does not take, such as a kind its adapter does not publish, each `{name, kind, path, reason}`."
   comment-id:
-    description: GitHub comment ID created or updated by preflight.
+    description: Pull-request comment created or updated by the preview or legacy preflight.
   conflict-count:
-    description: Number of confirmed workspace-level Registry conflicts found by preflight.
+    description: The artifacts the pull request changes that the registry changed since its base, on a preview; legacy preflight's confirmed workspace-level Registry conflicts.
   rejected-count:
-    description: Number of changed skills whose SKILL.md the Registry would reject on publish (HTTP 422).
+    description: Changed skills legacy preflight found the Registry would reject on publish (HTTP 422).
 
 runs:
   using: node24

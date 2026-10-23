@@ -4087,11 +4087,77 @@ class Request {
     }
   }
 
-  onUpgrade (statusCode, headers, socket) {
+  /**
+   * @param {number|null} statusCode
+   * @param {Buffer[]|null} headers
+   * @param {import('node:stream').Duplex} socket
+   * @param {string} [statusText]
+   */
+  onUpgrade (statusCode, headers, socket, statusText = '') {
+    this.onFinally()
+
     assert(!this.aborted)
     assert(!this.completed)
 
-    return this[kHandler].onUpgrade(statusCode, headers, socket)
+    if (statusCode !== null) {
+      this.#publishUpgradeHeaders(statusCode, headers, statusText)
+    }
+
+    const result = this[kHandler].onUpgrade(statusCode, headers, socket)
+
+    if (!this.aborted) {
+      this.completed = true
+      if (statusCode !== null) {
+        this.#publishUpgradeTrailers()
+      }
+    }
+
+    return result
+  }
+
+  /**
+   * @param {number} statusCode
+   * @param {import('node:http2').IncomingHttpHeaders} headers
+   * @param {(headers: import('node:http2').IncomingHttpHeaders) => Buffer[]} parseHeaders
+   * @param {string} [statusText]
+   */
+  onUpgradeResponse (statusCode, headers, parseHeaders, statusText = '') {
+    assert(!this.aborted)
+    assert(this.completed)
+
+    if (channels.headers.hasSubscribers) {
+      this.#publishUpgradeHeaders(statusCode, parseHeaders(headers), statusText)
+    }
+    this.#publishUpgradeTrailers()
+  }
+
+  /**
+   * @param {Error} error
+   */
+  onUpgradeError (error) {
+    assert(!this.aborted)
+    assert(this.completed)
+
+    if (channels.error.hasSubscribers) {
+      channels.error.publish({ request: this, error })
+    }
+  }
+
+  /**
+   * @param {number} statusCode
+   * @param {Buffer[]} headers
+   * @param {string} statusText
+   */
+  #publishUpgradeHeaders (statusCode, headers, statusText) {
+    if (channels.headers.hasSubscribers) {
+      channels.headers.publish({ request: this, response: { statusCode, headers, statusText } })
+    }
+  }
+
+  #publishUpgradeTrailers () {
+    if (channels.trailers.hasSubscribers) {
+      channels.trailers.publish({ request: this, trailers: [] })
+    }
   }
 
   onComplete (trailers) {
@@ -5229,7 +5295,7 @@ function defaultFactory (origin, opts) {
 }
 
 class Agent extends DispatcherBase {
-  constructor ({ factory = defaultFactory, maxRedirections = 0, connect, ...options } = {}) {
+  constructor ({ factory = defaultFactory, maxRedirections = 0, connect, tls, ...options } = {}) {
     if (typeof factory !== 'function') {
       throw new InvalidArgumentError('factory must be a function.')
     }
@@ -5248,11 +5314,15 @@ class Agent extends DispatcherBase {
       connect = { ...connect }
     }
 
+    if (tls && typeof tls !== 'function') {
+      tls = { ...tls }
+    }
+
     this[kInterceptors] = options.interceptors?.Agent && Array.isArray(options.interceptors.Agent)
       ? options.interceptors.Agent
       : [createRedirectInterceptor({ maxRedirections })]
 
-    this[kOptions] = { ...util.deepClone(options), connect }
+    this[kOptions] = { ...util.deepClone(options), connect, tls }
     this[kOptions].interceptors = options.interceptors
       ? { ...options.interceptors }
       : undefined
@@ -5990,7 +6060,7 @@ class Parser {
   }
 
   onUpgrade (head) {
-    const { upgrade, client, socket, headers, statusCode } = this
+    const { upgrade, client, socket, headers, statusCode, statusText } = this
 
     assert(upgrade)
     assert(client[kSocket] === socket)
@@ -6025,9 +6095,10 @@ class Parser {
     client.emit('disconnect', client[kUrl], [client], new InformationalError('upgrade'))
 
     try {
-      request.onUpgrade(statusCode, headers, socket)
-    } catch (err) {
-      util.destroy(socket, err)
+      request.onUpgrade(statusCode, headers, socket, statusText)
+    } catch (error) {
+      util.errorRequest(client, request, error)
+      util.destroy(socket, error)
     }
 
     client[kResume]()
@@ -6284,8 +6355,6 @@ async function connectH1 (client, socket) {
   socket[kParser] = new Parser(client, socket, llhttpInstance)
 
   addListener(socket, 'error', function (err) {
-    assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
-
     const parser = this[kParser]
 
     // On Mac OS, we get an ECONNRESET even if there is a full body to be forwarded
@@ -6434,7 +6503,7 @@ async function connectH1 (client, socket) {
 
 function clearIdleSocketValidation (socket) {
   if (socket[kIdleSocketValidationTimeout]) {
-    clearTimeout(socket[kIdleSocketValidationTimeout])
+    clearImmediate(socket[kIdleSocketValidationTimeout])
     socket[kIdleSocketValidationTimeout] = null
   }
 
@@ -6443,15 +6512,23 @@ function clearIdleSocketValidation (socket) {
 
 function scheduleIdleSocketValidation (client, socket) {
   socket[kIdleSocketValidation] = 1
-  socket[kIdleSocketValidationTimeout] = setTimeout(() => {
+  // Yield to the check phase (after poll) so unsolicited bytes / FIN / RST
+  // already pending on this idle keep-alive socket are processed before the
+  // next request is written (GHSA-35p6-xmwp-9g52).
+  //
+  // setTimeout(0) pays Node's ~1ms timer floor on every sequential reuse
+  // (#5493). setImmediate avoids that, but an *unref'd* Immediate lets poll
+  // block for ~500ms when the event loop is otherwise idle (#5600 / #5606).
+  // A ref'd Immediate both keeps the pending request alive and makes poll
+  // return immediately — the hybrid those issues asked for.
+  socket[kIdleSocketValidationTimeout] = setImmediate(() => {
     socket[kIdleSocketValidationTimeout] = null
     socket[kIdleSocketValidation] = 2
 
     if (client[kSocket] === socket && !socket.destroyed) {
       client[kResume]()
     }
-  }, 0)
-  socket[kIdleSocketValidationTimeout].unref?.()
+  })
 }
 
 /**
@@ -6600,12 +6677,22 @@ function writeH1 (client, request) {
   const socket = client[kSocket]
   clearIdleSocketValidation(socket)
 
-  const abort = (err) => {
-    if (request.aborted || request.completed) {
+  /**
+   * @param {Error} [error]
+   */
+  const abort = (error) => {
+    if (request.aborted) {
       return
     }
 
-    util.errorRequest(client, request, err || new RequestAbortedError())
+    if (request.completed) {
+      if (request.upgrade || request.method === 'CONNECT') {
+        util.destroy(socket, new InformationalError('aborted'))
+      }
+      return
+    }
+
+    util.errorRequest(client, request, error || new RequestAbortedError())
 
     util.destroy(body)
     util.destroy(socket, new InformationalError('aborted'))
@@ -7062,6 +7149,7 @@ module.exports = connectH1
 
 
 const assert = __nccwpck_require__(4589)
+const { errorMonitor } = __nccwpck_require__(8474)
 const { pipeline } = __nccwpck_require__(7075)
 const util = __nccwpck_require__(3440)
 const {
@@ -7138,6 +7226,15 @@ function parseH2Headers (headers) {
   return result
 }
 
+/**
+ * @param {import('node:http2').IncomingHttpHeaders} headers
+ * @returns {Buffer[]}
+ */
+function parseH2ResponseHeaders (headers) {
+  const { [HTTP2_HEADER_STATUS]: _statusCode, ...realHeaders } = headers
+  return parseH2Headers(realHeaders)
+}
+
 async function connectH2 (client, socket) {
   client[kSocket] = socket
 
@@ -7187,8 +7284,6 @@ async function connectH2 (client, socket) {
   socket[kHTTP2Session] = session
 
   util.addListener(socket, 'error', function (err) {
-    assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
-
     this[kError] = err
 
     this[kClient][kOnError](err)
@@ -7262,8 +7357,6 @@ function resumeH2 (client) {
 }
 
 function onHttp2SessionError (err) {
-  assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
-
   this[kSocket][kError] = err
   this[kClient][kOnError](err)
 }
@@ -7358,22 +7451,32 @@ function writeH2 (client, request) {
   headers[HTTP2_HEADER_AUTHORITY] = host || `${hostname}${port ? `:${port}` : ''}`
   headers[HTTP2_HEADER_METHOD] = method
 
-  const abort = (err) => {
-    if (request.aborted || request.completed) {
+  /**
+   * @param {Error} [error]
+   */
+  const abort = (error) => {
+    if (request.aborted) {
       return
     }
 
-    err = err || new RequestAbortedError()
+    if (request.completed) {
+      if (method === 'CONNECT' && stream != null) {
+        util.destroy(stream, error || new RequestAbortedError())
+      }
+      return
+    }
 
-    util.errorRequest(client, request, err)
+    error = error || new RequestAbortedError()
+
+    util.errorRequest(client, request, error)
 
     if (stream != null) {
-      util.destroy(stream, err)
+      util.destroy(stream, error)
     }
 
     // We do not destroy the socket as we can continue using the session
     // the stream get's destroyed and the session remains to create new streams
-    util.destroy(body, err)
+    util.destroy(body, error)
     client[kQueue][client[kRunningIdx]++] = null
     client[kResume]()
   }
@@ -7392,25 +7495,57 @@ function writeH2 (client, request) {
 
   if (method === 'CONNECT') {
     session.ref()
-    // We are already connected, streams are pending, first request
-    // will create a new stream. We trigger a request to create the stream and wait until
-    // `ready` event is triggered
     // We disabled endStream to allow the user to write to the stream
     stream = session.request(headers, { endStream: false, signal })
+    let upgradeResponseFinished = false
 
-    if (stream.id && !stream.pending) {
-      request.onUpgrade(null, null, stream)
-      ++session[kOpenStreams]
-      client[kQueue][client[kRunningIdx]++] = null
-    } else {
-      stream.once('ready', () => {
-        request.onUpgrade(null, null, stream)
-        ++session[kOpenStreams]
-        client[kQueue][client[kRunningIdx]++] = null
-      })
+    /**
+     * @param {import('node:http2').IncomingHttpHeaders} headers
+     */
+    const onResponse = (headers) => {
+      upgradeResponseFinished = true
+      stream.off(errorMonitor, onUpgradeError)
+      request.onUpgradeResponse(Number(headers[HTTP2_HEADER_STATUS]), headers, parseH2ResponseHeaders)
     }
 
+    /**
+     * @param {Error} error
+     */
+    const onUpgradeError = (error) => {
+      upgradeResponseFinished = true
+      stream.off('response', onResponse)
+      request.onUpgradeError(error)
+    }
+
+    const onReady = () => {
+      try {
+        request.onUpgrade(null, null, stream)
+      } catch (error) {
+        stream.off('response', onResponse)
+        abort(error)
+        return
+      }
+
+      if (request.aborted) {
+        return
+      }
+
+      stream.off('error', abort)
+      stream.once(errorMonitor, onUpgradeError)
+      client[kQueue][client[kRunningIdx]++] = null
+    }
+
+    stream.once('response', onResponse)
+    stream.once('error', abort)
+    ++session[kOpenStreams]
+    onReady()
+
     stream.once('close', () => {
+      if (!upgradeResponseFinished && request.completed) {
+        stream.off('response', onResponse)
+        stream.off(errorMonitor, onUpgradeError)
+        request.onUpgradeError(new InformationalError(`HTTP/2: "stream error" received - code ${stream.rstCode}`))
+      }
       session[kOpenStreams] -= 1
       if (session[kOpenStreams] === 0) session.unref()
     })
@@ -7919,9 +8054,10 @@ class Client extends DispatcherBase {
     // h2
     maxConcurrentStreams,
     allowH2,
-    webSocket
+    webSocket,
+    eventSource
   } = {}) {
-    super({ webSocket })
+    super({ webSocket, eventSource })
 
     if (keepAlive !== undefined) {
       throw new InvalidArgumentError('unsupported keepAlive, use pipelining=0 instead')
@@ -8442,6 +8578,7 @@ module.exports = Client
 
 
 
+const buffer = __nccwpck_require__(4573)
 const Dispatcher = __nccwpck_require__(883)
 const {
   ClientDestroyedError,
@@ -8454,6 +8591,7 @@ const kOnDestroyed = Symbol('onDestroyed')
 const kOnClosed = Symbol('onClosed')
 const kInterceptedDispatch = Symbol('Intercepted Dispatch')
 const kWebSocketOptions = Symbol('webSocketOptions')
+const kEventSourceOptions = Symbol('eventSourceOptions')
 
 class DispatcherBase extends Dispatcher {
   constructor (opts) {
@@ -8464,12 +8602,19 @@ class DispatcherBase extends Dispatcher {
     this[kClosed] = false
     this[kOnClosed] = []
     this[kWebSocketOptions] = opts?.webSocket ?? {}
+    this[kEventSourceOptions] = opts?.eventSource ?? {}
   }
 
   get webSocketOptions () {
     return {
       maxFragments: this[kWebSocketOptions].maxFragments ?? 131072,
       maxPayloadSize: this[kWebSocketOptions].maxPayloadSize ?? 128 * 1024 * 1024
+    }
+  }
+
+  get eventSourceOptions () {
+    return {
+      maxEventSize: this[kEventSourceOptions].maxEventSize ?? buffer.kStringMaxLength
     }
   }
 
@@ -10109,6 +10254,7 @@ class RetryHandler {
     this.end = null
     this.etag = null
     this.resume = null
+    this.headersSent = false
 
     // Handle possible onConnect duplication
     this.handler.onConnect(reason => {
@@ -10119,6 +10265,20 @@ class RetryHandler {
         this.reason = reason
       }
     })
+  }
+
+  checkpointResponseEnd (headers, resume) {
+    if (this.end == null && this.opts.method !== 'HEAD') {
+      const contentLength = headers['content-length']
+      this.end = contentLength != null ? Number(contentLength) - 1 : null
+
+      assert(
+        this.end == null || Number.isFinite(this.end),
+        'invalid content-length'
+      )
+    }
+
+    this.resume = this.end != null ? resume : null
   }
 
   onRequestSent () {
@@ -10209,7 +10369,12 @@ class RetryHandler {
     this.retryCount += 1
 
     if (statusCode >= 300) {
-      if (this.retryOpts.statusCodes.includes(statusCode) === false) {
+      // Only expose a response if no earlier attempt has reached the caller.
+      // Otherwise abort this attempt so the error settles the existing body
+      // instead of replacing it with a new response.
+      if (!this.headersSent && this.retryOpts.statusCodes.includes(statusCode) === false) {
+        this.headersSent = true
+        this.checkpointResponseEnd(headers, resume)
         return this.handler.onHeaders(
           statusCode,
           rawHeaders,
@@ -10278,8 +10443,15 @@ class RetryHandler {
 
       const { start, size, end = size - 1 } = contentRange
 
-      assert(this.start === start, 'content-range mismatch')
-      assert(this.end == null || this.end === end, 'content-range mismatch')
+      if (this.start !== start || (this.end != null && this.end !== end)) {
+        this.abort(
+          new RequestRetryError('Content-Range mismatch', statusCode, {
+            headers,
+            data: { count: this.retryCount }
+          })
+        )
+        return false
+      }
 
       this.resume = resume
       return true
@@ -10291,6 +10463,7 @@ class RetryHandler {
         const range = parseRangeHeader(headers['content-range'])
 
         if (range == null) {
+          this.headersSent = true
           return this.handler.onHeaders(
             statusCode,
             rawHeaders,
@@ -10329,6 +10502,7 @@ class RetryHandler {
       )
 
       this.resume = resume
+      this.headersSent = true
       this.etag = headers.etag != null ? headers.etag : null
 
       // Weak etags are not useful for comparison nor cache
@@ -10368,7 +10542,7 @@ class RetryHandler {
   }
 
   onError (err) {
-    if (this.aborted || isDisturbed(this.opts.body)) {
+    if (this.aborted || isDisturbed(this.opts.body) || (this.headersSent && this.resume == null)) {
       return this.handler.onError(err)
     }
 
@@ -14802,6 +14976,7 @@ module.exports = {
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
+const buffer = __nccwpck_require__(4573)
 const { Transform } = __nccwpck_require__(7075)
 const { isASCIINumber, isValidLastEventId } = __nccwpck_require__(4811)
 
@@ -14825,6 +15000,63 @@ const COLON = 0x3A
  * @type {32} SPACE
  */
 const SPACE = 0x20
+
+const defaultMaxEventSize = buffer.kStringMaxLength
+
+const DATA = Buffer.from('data')
+const EVENT = Buffer.from('event')
+const ID = Buffer.from('id')
+const RETRY = Buffer.from('retry')
+
+// Each data field creates a string node, and each unconsumed input chunk keeps
+// a Buffer wrapper. The absolute ceiling protects the large default byte limit.
+const minParserItems = 1024
+const maxParserItems = 131072
+const bytesPerParserItem = 128
+
+function isASCIINumberBytes (buffer, start) {
+  if (start >= buffer.length) {
+    return false
+  }
+
+  for (let i = start; i < buffer.length; i++) {
+    if (buffer[i] < 0x30 || buffer[i] > 0x39) {
+      return false
+    }
+  }
+
+  return true
+}
+
+function isValidLastEventIdBytes (buffer, start) {
+  for (let i = start; i < buffer.length; i++) {
+    if (buffer[i] === 0x00) {
+      return false
+    }
+  }
+
+  return true
+}
+
+function isFieldName (line, length, field) {
+  if (length !== field.length) {
+    return false
+  }
+
+  for (let i = 0; i < length; i++) {
+    if (line[i] !== field[i]) {
+      return false
+    }
+  }
+
+  return true
+}
+
+function createMaxEventSizeExceededError () {
+  const error = new Error('EventSource message size exceeded')
+  error.aborted = false
+  return error
+}
 
 /**
  * @typedef {object} EventSourceStreamEvent
@@ -14866,11 +15098,21 @@ class EventSourceStream extends Transform {
   eventEndCheck = false
 
   /**
-   * @type {Buffer}
+   * @type {Buffer[]}
    */
-  buffer = null
+  chunks = []
 
+  chunkIndex = 0
   pos = 0
+  lineChunkIndex = 0
+  linePos = 0
+  lineLength = 0
+  eventSize = 0
+  eventFieldSizes = { data: 0, event: 0, id: 0, retry: 0 }
+  dataLineCount = 0
+  maxEventSize
+  maxDataLines
+  maxBufferedChunks
 
   event = {
     data: undefined,
@@ -14881,6 +15123,7 @@ class EventSourceStream extends Transform {
 
   /**
    * @param {object} options
+   * @param {number} [options.maxEventSize]
    * @param {eventSourceSettings} options.eventSourceSettings
    * @param {Function} [options.push]
    */
@@ -14892,6 +15135,12 @@ class EventSourceStream extends Transform {
     super(options)
 
     this.state = options.eventSourceSettings || {}
+    this.maxEventSize = options.maxEventSize ?? defaultMaxEventSize
+    const parserItemLimit = this.maxEventSize > 0
+      ? Math.min(maxParserItems, Math.max(minParserItems, Math.floor(this.maxEventSize / bytesPerParserItem)))
+      : 0
+    this.maxDataLines = parserItemLimit
+    this.maxBufferedChunks = parserItemLimit
     if (options.push) {
       this.push = options.push
     }
@@ -14909,92 +15158,28 @@ class EventSourceStream extends Transform {
       return
     }
 
-    // Cache the chunk in the buffer, as the data might not be complete while
-    // processing it
-    // TODO: Investigate if there is a more performant way to handle
-    // incoming chunks
-    // see: https://github.com/nodejs/undici/issues/2630
-    if (this.buffer) {
-      this.buffer = Buffer.concat([this.buffer, chunk])
-    } else {
-      this.buffer = chunk
+    // A leading line ending can immediately release the currently buffered
+    // line, even when it uses the final allowed chunk slot.
+    if (this.maxEventSize > 0 &&
+        this.chunks.length >= this.maxBufferedChunks &&
+        chunk[0] !== LF && chunk[0] !== CR) {
+      callback(createMaxEventSizeExceededError())
+      return
     }
+    this.chunks.push(chunk)
 
     // Strip leading byte-order-mark if we opened the stream and started
     // the processing of the incoming data
     if (this.checkBOM) {
-      switch (this.buffer.length) {
-        case 1:
-          // Check if the first byte is the same as the first byte of the BOM
-          if (this.buffer[0] === BOM[0]) {
-            // If it is, we need to wait for more data
-            callback()
-            return
-          }
-          // Set the checkBOM flag to false as we don't need to check for the
-          // BOM anymore
-          this.checkBOM = false
-
-          // The buffer only contains one byte so we need to wait for more data
-          callback()
-          return
-        case 2:
-          // Check if the first two bytes are the same as the first two bytes
-          // of the BOM
-          if (
-            this.buffer[0] === BOM[0] &&
-            this.buffer[1] === BOM[1]
-          ) {
-            // If it is, we need to wait for more data, because the third byte
-            // is needed to determine if it is the BOM or not
-            callback()
-            return
-          }
-
-          // Set the checkBOM flag to false as we don't need to check for the
-          // BOM anymore
-          this.checkBOM = false
-          break
-        case 3:
-          // Check if the first three bytes are the same as the first three
-          // bytes of the BOM
-          if (
-            this.buffer[0] === BOM[0] &&
-            this.buffer[1] === BOM[1] &&
-            this.buffer[2] === BOM[2]
-          ) {
-            // If it is, we can drop the buffered data, as it is only the BOM
-            this.buffer = Buffer.alloc(0)
-            // Set the checkBOM flag to false as we don't need to check for the
-            // BOM anymore
-            this.checkBOM = false
-
-            // Await more data
-            callback()
-            return
-          }
-          // If it is not the BOM, we can start processing the data
-          this.checkBOM = false
-          break
-        default:
-          // The buffer is longer than 3 bytes, so we can drop the BOM if it is
-          // present
-          if (
-            this.buffer[0] === BOM[0] &&
-            this.buffer[1] === BOM[1] &&
-            this.buffer[2] === BOM[2]
-          ) {
-            // Remove the BOM from the buffer
-            this.buffer = this.buffer.subarray(3)
-          }
-
-          // Set the checkBOM flag to false as we don't need to check for the
-          this.checkBOM = false
-          break
+      if (this.handleBOM()) {
+        callback()
+        return
       }
     }
 
-    while (this.pos < this.buffer.length) {
+    while (this.hasCurrentByte()) {
+      const byte = this.currentByte()
+
       // If the previous line ended with an end-of-line, we need to check
       // if the next character is also an end-of-line.
       if (this.eventEndCheck) {
@@ -15007,10 +15192,9 @@ class EventSourceStream extends Transform {
         if (this.crlfCheck) {
           // If the current character is a line feed, we can remove it
           // from the buffer and reset the crlfCheck flag
-          if (this.buffer[this.pos] === LF) {
-            this.buffer = this.buffer.subarray(this.pos + 1)
-            this.pos = 0
+          if (byte === LF) {
             this.crlfCheck = false
+            this.consumeCurrentByte()
 
             // It is possible that the line feed is not the end of the
             // event. We need to check if the next character is an
@@ -15026,19 +15210,17 @@ class EventSourceStream extends Transform {
           this.crlfCheck = false
         }
 
-        if (this.buffer[this.pos] === LF || this.buffer[this.pos] === CR) {
+        if (byte === LF || byte === CR) {
           // If the current character is a carriage return, we need to
           // set the crlfCheck flag to true, as we need to check if the
           // next character is a line feed so we can remove it from the
           // buffer
-          if (this.buffer[this.pos] === CR) {
+          if (byte === CR) {
             this.crlfCheck = true
           }
 
-          this.buffer = this.buffer.subarray(this.pos + 1)
-          this.pos = 0
-          if (
-            this.event.data !== undefined || this.event.event || this.event.id || this.event.retry) {
+          this.consumeCurrentByte()
+          if (this.hasPendingEvent()) {
             this.processEvent(this.event)
           }
           this.clearEvent()
@@ -15052,22 +15234,23 @@ class EventSourceStream extends Transform {
 
       // If the current character is an end-of-line, we can process the
       // line
-      if (this.buffer[this.pos] === LF || this.buffer[this.pos] === CR) {
+      if (byte === LF || byte === CR) {
         // If the current character is a carriage return, we need to
         // set the crlfCheck flag to true, as we need to check if the
         // next character is a line feed
-        if (this.buffer[this.pos] === CR) {
+        if (byte === CR) {
           this.crlfCheck = true
         }
 
         // In any case, we can process the line as we reached an
         // end-of-line character
-        this.parseLine(this.buffer.subarray(0, this.pos), this.event)
-
-        // Remove the processed line from the buffer
-        this.buffer = this.buffer.subarray(this.pos + 1)
-        // Reset the position as we removed the processed line from the buffer
-        this.pos = 0
+        try {
+          this.parseLine(this.readLine(), this.event)
+        } catch (error) {
+          callback(error)
+          return
+        }
+        this.consumeCurrentByte()
         // A line was processed and this could be the end of the event. We need
         // to check if the next line is empty to determine if the event is
         // finished.
@@ -15075,15 +15258,28 @@ class EventSourceStream extends Transform {
         continue
       }
 
-      this.pos++
+      // readLine() is only called after CR or LF. Reject an unfinished line
+      // before it can retain an unbounded number of decoded chunks. The seven
+      // extra bytes allow the longest field prefix ("event: " or "retry: ").
+      if (this.maxEventSize > 0 && ++this.lineLength > this.maxEventSize + 7) {
+        callback(createMaxEventSizeExceededError())
+        return
+      }
+      this.advanceCursor()
     }
 
     callback()
   }
 
+  _destroy (error, callback) {
+    this.chunks.length = 0
+    this.clearEvent()
+    super._destroy(error, callback)
+  }
+
   /**
    * @param {Buffer} line
-   * @param {EventStreamEvent} event
+   * @param {EventSourceStreamEvent} event
    */
   parseLine (line, event) {
     // If the line is empty (a blank line)
@@ -15100,65 +15296,72 @@ class EventSourceStream extends Transform {
       return
     }
 
-    let field = ''
-    let value = ''
+    let fieldLength = line.length
+    let valueStart = line.length
 
     // If the line contains a U+003A COLON character (:)
     if (colonPosition !== -1) {
-      // Collect the characters on the line before the first U+003A COLON
-      // character (:), and let field be that string.
-      // TODO: Investigate if there is a more performant way to extract the
-      // field
-      // see: https://github.com/nodejs/undici/issues/2630
-      field = line.subarray(0, colonPosition).toString('utf8')
+      fieldLength = colonPosition
 
       // Collect the characters on the line after the first U+003A COLON
       // character (:), and let value be that string.
       // If value starts with a U+0020 SPACE character, remove it from value.
-      let valueStart = colonPosition + 1
+      valueStart = colonPosition + 1
       if (line[valueStart] === SPACE) {
         ++valueStart
       }
-      // TODO: Investigate if there is a more performant way to extract the
-      // value
-      // see: https://github.com/nodejs/undici/issues/2630
-      value = line.subarray(valueStart).toString('utf8')
-
-      // Otherwise, the string is not empty but does not contain a U+003A COLON
-      // character (:)
-    } else {
-      // Process the field using the steps described below, using the whole
-      // line as the field name, and the empty string as the field value.
-      field = line.toString('utf8')
-      value = ''
     }
 
-    // Modify the event with the field name and value. The value is also
-    // decoded as UTF-8
-    switch (field) {
-      case 'data':
-        if (event[field] === undefined) {
-          event[field] = value
-        } else {
-          event[field] += `\n${value}`
-        }
-        break
-      case 'retry':
-        if (isASCIINumber(value)) {
-          event[field] = value
-        }
-        break
-      case 'id':
-        if (isValidLastEventId(value)) {
-          event[field] = value
-        }
-        break
-      case 'event':
-        if (value.length > 0) {
-          event[field] = value
-        }
-        break
+    if (isFieldName(line, fieldLength, DATA)) {
+      if (this.maxEventSize > 0 && this.dataLineCount >= this.maxDataLines) {
+        throw createMaxEventSizeExceededError()
+      }
+      const valueBytes = line.length - valueStart
+      const dataSize = this.eventFieldSizes.data + (event.data === undefined ? 0 : 1) + valueBytes
+      this.setEventFieldSize('data', dataSize)
+
+      const value = line.toString('utf8', valueStart)
+
+      if (event.data === undefined) {
+        event.data = value
+      } else {
+        event.data += `\n${value}`
+      }
+      this.dataLineCount++
+      return
     }
+
+    if (isFieldName(line, fieldLength, RETRY)) {
+      if (isASCIINumberBytes(line, valueStart)) {
+        this.setEventFieldSize('retry', line.length - valueStart)
+        event.retry = line.toString('utf8', valueStart)
+      }
+      return
+    }
+
+    if (isFieldName(line, fieldLength, ID)) {
+      if (isValidLastEventIdBytes(line, valueStart)) {
+        this.setEventFieldSize('id', line.length - valueStart)
+        event.id = line.toString('utf8', valueStart)
+      }
+      return
+    }
+
+    if (isFieldName(line, fieldLength, EVENT)) {
+      if (valueStart < line.length) {
+        this.setEventFieldSize('event', line.length - valueStart)
+        event.event = line.toString('utf8', valueStart)
+      }
+    }
+  }
+
+  setEventFieldSize (field, size) {
+    const eventSize = this.eventSize - this.eventFieldSizes[field] + size
+    if (this.maxEventSize > 0 && eventSize > this.maxEventSize) {
+      throw createMaxEventSizeExceededError()
+    }
+    this.eventSize = eventSize
+    this.eventFieldSizes[field] = size
   }
 
   /**
@@ -15187,12 +15390,159 @@ class EventSourceStream extends Transform {
   }
 
   clearEvent () {
-    this.event = {
-      data: undefined,
-      event: undefined,
-      id: undefined,
-      retry: undefined
+    this.event.data = undefined
+    this.event.event = undefined
+    this.event.id = undefined
+    this.event.retry = undefined
+    this.eventSize = 0
+    this.dataLineCount = 0
+    this.eventFieldSizes.data = 0
+    this.eventFieldSizes.event = 0
+    this.eventFieldSizes.id = 0
+    this.eventFieldSizes.retry = 0
+  }
+
+  hasPendingEvent () {
+    return this.event.data !== undefined ||
+      this.event.event !== undefined ||
+      this.event.id !== undefined ||
+      this.event.retry !== undefined
+  }
+
+  hasCurrentByte () {
+    return this.chunkIndex < this.chunks.length &&
+      this.pos < this.chunks[this.chunkIndex].length
+  }
+
+  currentByte () {
+    return this.chunks[this.chunkIndex][this.pos]
+  }
+
+  consumeCurrentByte () {
+    this.advanceCursor()
+    this.syncLineStartToCursor()
+  }
+
+  advanceCursor () {
+    this.pos++
+
+    while (this.chunkIndex < this.chunks.length && this.pos >= this.chunks[this.chunkIndex].length) {
+      this.chunkIndex++
+      this.pos = 0
     }
+  }
+
+  syncLineStartToCursor () {
+    this.lineChunkIndex = this.chunkIndex
+    this.linePos = this.pos
+    this.lineLength = 0
+    this.dropConsumedChunks()
+  }
+
+  dropConsumedChunks () {
+    if (this.lineChunkIndex > 0) {
+      const consumed = this.lineChunkIndex
+      this.chunks.splice(0, consumed)
+      this.lineChunkIndex = 0
+      this.chunkIndex -= consumed
+    }
+
+    if (this.chunkIndex === this.chunks.length) {
+      this.chunks.length = 0
+      this.chunkIndex = 0
+      this.pos = 0
+      this.lineChunkIndex = 0
+      this.linePos = 0
+    }
+  }
+
+  readLine () {
+    if (this.lineChunkIndex === this.chunkIndex) {
+      return this.chunks[this.chunkIndex].subarray(this.linePos, this.pos)
+    }
+
+    const chunks = []
+    let length = 0
+
+    for (let i = this.lineChunkIndex; i <= this.chunkIndex; i++) {
+      const chunk = this.chunks[i]
+      const start = i === this.lineChunkIndex ? this.linePos : 0
+      const end = i === this.chunkIndex ? this.pos : chunk.length
+      const slice = chunk.subarray(start, end)
+      length += slice.length
+      chunks.push(slice)
+    }
+
+    return Buffer.concat(chunks, length)
+  }
+
+  peekBufferedByte (offset) {
+    let chunkIndex = this.lineChunkIndex
+    let pos = this.linePos
+
+    while (chunkIndex < this.chunks.length) {
+      const chunk = this.chunks[chunkIndex]
+      const remaining = chunk.length - pos
+
+      if (offset < remaining) {
+        return chunk[pos + offset]
+      }
+
+      offset -= remaining
+      chunkIndex++
+      pos = 0
+    }
+  }
+
+  discardLeadingBytes (count) {
+    while (count > 0 && this.lineChunkIndex < this.chunks.length) {
+      const chunk = this.chunks[this.lineChunkIndex]
+      const remaining = chunk.length - this.linePos
+
+      if (count < remaining) {
+        this.linePos += count
+        count = 0
+      } else {
+        count -= remaining
+        this.lineChunkIndex++
+        this.linePos = 0
+      }
+    }
+
+    this.chunkIndex = this.lineChunkIndex
+    this.pos = this.linePos
+    this.dropConsumedChunks()
+  }
+
+  handleBOM () {
+    const first = this.peekBufferedByte(0)
+    const second = this.peekBufferedByte(1)
+    const third = this.peekBufferedByte(2)
+
+    if (second === undefined) {
+      if (first === BOM[0]) {
+        return true
+      }
+
+      this.checkBOM = false
+      return true
+    }
+
+    if (third === undefined) {
+      if (first === BOM[0] && second === BOM[1]) {
+        return true
+      }
+
+      this.checkBOM = false
+      return false
+    }
+
+    if (first === BOM[0] && second === BOM[1] && third === BOM[2]) {
+      this.discardLeadingBytes(3)
+    }
+
+    this.checkBOM = false
+    return !this.hasCurrentByte()
   }
 }
 
@@ -15219,6 +15569,7 @@ const { isNetworkError } = __nccwpck_require__(9051)
 const { delay } = __nccwpck_require__(4811)
 const { kEnumerableProperty } = __nccwpck_require__(3440)
 const { environmentSettingsObject } = __nccwpck_require__(3168)
+const { getGlobalDispatcher } = __nccwpck_require__(2581)
 
 let experimentalWarned = false
 
@@ -15500,6 +15851,7 @@ class EventSource extends EventTarget {
 
       const eventSourceStream = new EventSourceStream({
         eventSourceSettings: this.#state,
+        maxEventSize: this.#dispatcher.eventSourceOptions?.maxEventSize,
         push: (event) => {
           this.dispatchEvent(createFastMessageEvent(
             event.type,
@@ -15678,7 +16030,8 @@ webidl.converters.EventSourceInitDict = webidl.dictionaryConverter([
   },
   {
     key: 'dispatcher', // undici only
-    converter: webidl.converters.any
+    converter: webidl.converters.any,
+    defaultValue: () => getGlobalDispatcher()
   }
 ])
 
@@ -20774,8 +21127,10 @@ async function httpNetworkFetch (
   // 19. Run these steps in parallel:
 
   //    1. Run these steps, but abort when fetchParams is canceled:
-  fetchParams.controller.onAborted = onAborted
-  fetchParams.controller.on('terminated', onAborted)
+  if (!fetchParams.controller.resume) {
+    fetchParams.controller.on('terminated', onAborted)
+  }
+
   fetchParams.controller.resume = async () => {
     // 1. While true
     while (true) {
@@ -20944,8 +21299,6 @@ async function httpNetworkFetch (
           }
           location = headersList.get('location', true)
 
-          this.body = new Readable({ read: resume })
-
           const decoders = []
 
           const willFollow = location && request.redirect === 'follow' &&
@@ -20963,7 +21316,7 @@ async function httpNetworkFetch (
             // CVE fix similar to urllib3 (GHSA-gm62-xv2j-4w53) and curl (CVE-2022-32206).
             const maxContentEncodings = 5
             if (codings.length > maxContentEncodings) {
-              reject(new Error(`too many content-encodings in response: ${codings.length}, maximum allowed is ${maxContentEncodings}`))
+              this.abort(new Error(`too many content-encodings in response: ${codings.length}, maximum allowed is ${maxContentEncodings}`))
               return true
             }
 
@@ -20995,6 +21348,8 @@ async function httpNetworkFetch (
               }
             }
           }
+
+          this.body = new Readable({ read: resume })
 
           const onError = this.onError.bind(this)
 
@@ -21040,10 +21395,6 @@ async function httpNetworkFetch (
         onComplete () {
           if (this.abort) {
             fetchParams.controller.off('terminated', this.abort)
-          }
-
-          if (fetchParams.controller.onAborted) {
-            fetchParams.controller.off('terminated', fetchParams.controller.onAborted)
           }
 
           fetchParams.controller.ended = true
@@ -26461,7 +26812,7 @@ function establishWebSocketConnection (url, protocols, client, ws, onEstablish, 
         // is specified, the server needs to include the same field and one of
         // the selected subprotocol values in its response for the connection to
         // be established.
-        if (!requestProtocols.includes(secProtocol)) {
+        if (requestProtocols === null || !requestProtocols.includes(secProtocol)) {
           failWebsocketConnection(ws, 'Protocol was not set in the opening handshake.')
           return
         }
@@ -27222,7 +27573,12 @@ class PerMessageDeflate {
 
         if (this.#maxPayloadSize > 0 && this.#inflate[kLength] > this.#maxPayloadSize) {
           callback(new MessageSizeExceededError())
+          // The inflater may still hold buffered input that can emit a late
+          // zlib error. Remove the data listener, then deterministically stop
+          // the stream so a subsequent 'error' cannot fire without a listener
+          // (which would terminate the process as an unhandled error event).
           this.#inflate.removeAllListeners()
+          this.#inflate.destroy()
           this.#inflate = null
           return
         }
@@ -27515,6 +27871,20 @@ class ByteParser extends Writable {
         if (isControlFrame(this.#info.opcode)) {
           this.#loop = this.parseControlFrame(body)
           this.#state = parserStates.INFO
+
+          // If the automatic PONG/CLOSE reply filled the socket's write buffer,
+          // stop parsing and resume on drain so a PING flood cannot grow the
+          // outbound queue without bound.
+          const socket = this.ws[kResponse].socket
+          if (this.#loop && socket.writableNeedDrain) {
+            this.#loop = false
+            socket.once('drain', () => {
+              if (this.destroyed) return
+              this.#loop = true
+              this.run(callback)
+            })
+            return
+          }
         } else {
           if (!this.#info.compressed) {
             if (!this.writeFragments(body)) {
@@ -29254,6 +29624,9 @@ function qstring(str) {
 /******/ }
 /******/
 /************************************************************************/
+/******/ /* webpack/runtime/asset-relocator-loader */
+/******/ if (typeof __nccwpck_require__ !== 'undefined') __nccwpck_require__.ab = decodeURIComponent(new URL('.', import.meta.url).pathname).slice(import.meta.url.match(/^file:\/\/\/\w:/) ? 1 : 0, -1) + "/";
+/******/
 /******/ /* webpack/runtime/define property getters */
 /******/ (() => {
 /******/ 	// define getter functions for harmony exports
@@ -29271,22 +29644,18 @@ function qstring(str) {
 /******/ 	__nccwpck_require__.o = (obj, prop) => (Object.prototype.hasOwnProperty.call(obj, prop))
 /******/ })();
 /******/
-/******/ /* webpack/runtime/compat */
-/******/
-/******/ if (typeof __nccwpck_require__ !== 'undefined') __nccwpck_require__.ab = new URL('.', import.meta.url).pathname.slice(import.meta.url.match(/^file:\/\/\/\w:/) ? 1 : 0, -1) + "/";
-/******/
 /************************************************************************/
 var __webpack_exports__ = {};
 
 // EXPORTS
 __nccwpck_require__.d(__webpack_exports__, {
-  K8: () => (/* reexport */ ADAPTER),
   Hj: () => (/* reexport */ CLI_SHA256),
   EQ: () => (/* reexport */ CLI_VERSION),
   MC: () => (/* reexport */ EVAL_MARKER),
   vK: () => (/* reexport */ GitHubRequestError),
   KJ: () => (/* reexport */ PREFLIGHT_COMMENT),
   Ts: () => (/* reexport */ PREFLIGHT_MARKER),
+  yf: () => (/* reexport */ PREVIEW_MARKER),
   nL: () => (/* reexport */ PUBLISH_GATEWAY),
   Af: () => (/* reexport */ cliArtifactURL),
   H6: () => (/* reexport */ githubRequest),
@@ -29299,6 +29668,7 @@ __nccwpck_require__.d(__webpack_exports__, {
   Cs: () => (/* binding */ runAction),
   wX: () => (/* reexport */ runEval),
   hg: () => (/* reexport */ runPreflight),
+  UE: () => (/* reexport */ runPreview),
   aC: () => (/* reexport */ validateCliURL)
 });
 
@@ -29335,7 +29705,7 @@ const MAX_GITHUB_COMMENT_BYTES = 65_000;
 // A larger SKILL.md is rejected without reading it: the Registry accepts instructions up to 500,000 characters,
 // so the bound sits above the largest skill it would accept.
 const MAX_SKILL_BYTES = 1024 * 1024;
-// The Registry's SKILL.md contract (agent-gateway extensions/skill validate_skill_md). A skill outside these limits is
+// The Registry's SKILL.md contract. A skill outside these limits is
 // rejected with HTTP 422 on publish, so preflight reports it before merge. Lengths are in characters.
 const MAX_SKILL_INSTRUCTION_CHARS = 500_000;
 const SKILL_NAME = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/;
@@ -29357,30 +29727,40 @@ const MAX_REMOTE_SKILLS = 500;
 const SHA256 = /^[a-f0-9]{64}$/;
 const COMMIT_SHA = /^[a-f0-9]{40}$/i;
 const RELEASE_VERSION = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
-const SAFE_PATH = /^(?=.{1,240}$)(?!\/)(?!.*\/$)(?!.*\/\/)(?!.*(?:^|\/)\.{1,2}(?:\/|$))[^`|\\\u0000-\u001F\u007F]+$/u;
+// No control, format (bidirectional overrides, zero-width), or line and paragraph separator characters: they can
+// hide or reorder what a reviewer reads in a comment or a handoff prompt.
+const SAFE_PATH = /^(?=.{1,240}$)(?!\/)(?!.*\/$)(?!.*\/\/)(?!.*(?:^|\/)\.{1,2}(?:\/|$))[^`|\\\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+$/u;
+// A path a handoff prompt may name: nothing that could close its untrusted-data block or read as an instruction.
+const PROMPT_PATH = /^[A-Za-z0-9._/-]{1,240}$/;
+// Changed skills preflight validates. More fails the check as unchecked, so the pull request cannot spend the
+// repository's shared GitHub API budget without limit.
+const MAX_VALIDATED_SKILLS = 200;
 
-// Registry Sync has one approved Registry endpoint. Keep it Action-owned so a
-// consumer workflow cannot redirect its scoped publish credential elsewhere.
 const PUBLISH_GATEWAY = "https://api.atlan.com";
-// One reviewed, version-addressed aireg release, pinned by SHA-256 as its SHA256SUMS and
-// installer list it. It only starts the install: `aireg self update` fetches the newest
-// release from the signed channel.
 const CLI_ORIGIN = "https://aireg.sh";
 const CLI_ARTIFACT_PATH = "/artifacts/v";
 const CLI_VERSION = "0.1.2";
+const MINIMUM_CLI_VERSION = "0.1.7";
 const CLI_SHA256 = Object.freeze({
   "darwin-amd64": "07a8f5c259ff13780db807543d279e4dbe535d8c8db5c7fe9263d47b166f783e",
   "darwin-arm64": "b2eb5347b3e92e55cf9e4758ab3aeba320899d44b408fc46e9b61ae9c38e139d",
   "linux-amd64": "353c7ad92efea87d12e22bfdaba00f545317ea926791bd859eb8fe6407269785",
   "linux-arm64": "0ca1cc37e8bf9559a7875ac27f740d179e60b20132e661a5a64a1923ee1d5d6c"
 });
-// Unversioned, so aireg installs the newest adapter; it verifies the signed release
-// before any token is present.
-const ADAPTER = "atlan";
+const MANIFEST_FILE = ".registry/manifest.yml";
+const BUILT_IN_ADAPTERS = Object.freeze(["git", "local", "well-known"]);
+const ADAPTER_ID = /^[a-z][a-z0-9-]{0,63}$/;
+const MAX_CLI_OUTPUT_BYTES = 1024 * 1024;
+const MAX_REGISTRIES = 50;
+const MAX_PUBLISHED_ARTIFACTS = 1000;
+const MAX_ARTIFACT_DEPENDENCIES = 100;
+const MAX_CHANGED_FILES = 1000;
+const MAX_CHANGED_PATH_CHARS = 1024;
 const GITHUB_API_BASE_URL = "https://api.github.com";
 const GITHUB_API_VERSION = "2026-03-10";
 const PREFLIGHT_MARKER = "<!-- atlan-skillsync-preflight -->";
 const PUBLISH_FAILURE_MARKER = "<!-- registry-sync-publish-failure -->";
+const PREVIEW_MARKER = "<!-- aireg-publish-preview -->";
 const EVAL_MARKER = "<!-- atlan-eval-report -->";
 const MAX_EXPERIMENTS = 10;
 const MAX_RESULTS_PER_EXPERIMENT = 10_000;
@@ -29399,7 +29779,7 @@ const MAX_EVAL_REQUESTS = MAX_EXPERIMENTS * EVAL_REQUESTS_PER_EXPERIMENT + 1;
 const MAX_EVAL_ERROR_MESSAGE_CHARS = 200;
 // Atlan's public brand asset, intended for compact profile-image contexts.
 const ATLAN_MARK_URL = "https://atlan.com/images/brand/atlan-favicon-blue.png";
-// Mirrored in assets/ for review; this private repository cannot serve comment images anonymously.
+// Mirrored in assets/ for review.
 const CLAUDE_BADGE_URL = "https://greptile-static-assets.s3.amazonaws.com/badges/FixInClaude.svg?v=6";
 const CLAUDE_BADGE_DARK_URL = CLAUDE_BADGE_URL;
 const CLAUDE_CODE_HANDOFF_URL = "https://releases.atlan.com/#claude-code";
@@ -29407,6 +29787,9 @@ const CLAUDE_WEB_HANDOFF_URL = "https://claude.ai/code/new";
 const CODEX_BADGE_URL = "https://greptile-static-assets.s3.amazonaws.com/badges/FixInCodex.svg?v=6";
 const CODEX_BADGE_DARK_URL = CODEX_BADGE_URL;
 const CODEX_DEEPLINK_URL = "https://chatgpt.com/codex/deeplink";
+
+const SYSTEM_PATH = "/usr/bin:/bin";
+const GIT_ENVIRONMENT = Object.freeze({ PATH: SYSTEM_PATH, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" });
 
 ;// CONCATENATED MODULE: external "node:fs"
 const external_node_fs_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:fs");
@@ -37091,6 +37474,13 @@ function maskSecret(value, environment = process.env) {
   if (environment === process.env && value) core_setSecret(value);
 }
 
+// GitHub log masking does not protect comments; redact credentials before rendering.
+function redact(text, environment = process.env) {
+  return Object.entries(environment)
+    .filter(([name, value]) => (name === "ATLANAI_TOKEN" || name.startsWith("AIREG_TOKEN_")) && typeof value === "string" && value.length >= 8)
+    .reduce((plain, [, secret]) => plain.replaceAll(secret, "***"), String(text));
+}
+
 function actionError(error) {
   const message = error instanceof Error ? error.message : "Agent Registry Action failed";
   setFailed(message.replace(/[\r\n]/g, " "));
@@ -37100,6 +37490,26 @@ function parseBoolean(name, raw) {
   if (raw === "true") return true;
   if (raw === "false") return false;
   throw new Error(`${name} must be true or false`);
+}
+
+function githubServerUrl(environment = process.env) {
+  const raw = environment.GITHUB_SERVER_URL || "";
+  try {
+    const url = new URL(raw);
+    if (url.protocol === "https:" && !url.username && !url.password && url.origin === raw.replace(/\/$/, "") &&
+        /^[A-Za-z0-9.-]+$/.test(url.hostname)) {
+      return url.origin;
+    }
+  } catch {
+  }
+  return "https://github.com";
+}
+
+function manifestGuide(environment = process.env) {
+  const repository = environment.GITHUB_ACTION_REPOSITORY || "";
+  return /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/.test(repository)
+    ? `${githubServerUrl(environment)}/${repository}#usage`
+    : "Usage in the Registry Sync README";
 }
 
 function isWithin(root, candidate) {
@@ -37171,8 +37581,32 @@ function parsePullRequestContext(environment = process.env, eventPayload, { allo
     headSha: typeof headSha === "string" && COMMIT_SHA.test(headSha) ? headSha : undefined,
     ...(typeof headRef === "string" && /^(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._/-]{1,200}$/.test(headRef) ? { headRef } : {}),
     ...(typeof headRepository === "string" && /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/.test(headRepository) ? { headRepository } : {}),
+    // A fork, or a head repository GitHub no longer names (a deleted fork), is someone else's code.
+    crossRepository: typeof headRepository !== "string" || headRepository.toLowerCase() !== repository.toLowerCase(),
     changedFiles: Number.isSafeInteger(changedFiles) && changedFiles >= 0 ? changedFiles : undefined
   };
+}
+
+// Break GitHub autolinks with a word joiner; put it before // because URL parsers strip it from hostnames.
+function breakGithubLinks(text) {
+  return text.replace(/[@#]|:(?=\/\/)|\bwww(?=\.)/gi, match => `${match}\u2060`);
+}
+
+function escapeText(value) {
+  return breakGithubLinks(String(value).replace(/[\r\n]+/g, " ").replace(/[\\`*_[\]<>!&|~]/g, "\\$&"));
+}
+
+function escapeHtml(value) {
+  return breakGithubLinks(String(value).replace(/[\r\n]+/g, " ")).replace(/[&<>"']/g, char => `&#${char.charCodeAt(0)};`);
+}
+
+function codeSpan(value, { table = false } = {}) {
+  let text = String(value).replace(/[\r\n]+/g, " ");
+  if (table) text = text.replaceAll("|", "\\|");
+  const longest = Math.max(0, ...(text.match(/`+/g) || []).map(run => run.length));
+  const fence = "`".repeat(longest + 1);
+  const pad = text.startsWith("`") || text.endsWith("`") ? " " : "";
+  return `${fence}${pad}${text}${pad}${fence}`;
 }
 
 function boundedFetch(maxResponseBytes, service = "GitHub") {
@@ -37371,11 +37805,877 @@ var external_node_crypto_ = __nccwpck_require__(7598);
 var external_node_stream_ = __nccwpck_require__(7075);
 ;// CONCATENATED MODULE: external "node:stream/promises"
 const external_node_stream_promises_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:stream/promises");
+;// CONCATENATED MODULE: ./src/publish-report.js
+
+
+
+// Redact raw values before Markdown escaping changes the credential text.
+
+function reportText(environment = process.env) {
+  return {
+    text: value => escapeText(redact(value, environment)),
+    code: (value, options) => codeSpan(redact(value, environment), options)
+  };
+}
+
+function exportMoved(item, dryRun) {
+  return dryRun ? item.from !== item.version : item.published;
+}
+
+function exportChanges(result) {
+  const entry = ({ registry, namespace, kind, name, version }) => ({ registry, namespace, kind, name, version });
+  return {
+    published: result.artifacts.filter(item => exportMoved(item, result.dryRun)).map(entry),
+    unchanged: result.artifacts.filter(item => !exportMoved(item, result.dryRun)).map(entry)
+  };
+}
+
+function count(value, noun) {
+  return `${value} ${noun}${value === 1 ? "" : "s"}`;
+}
+
+function artifactLabel(item, render = reportText()) {
+  return `${render.text(item.kind)} ${render.code(item.name, { table: true })}`;
+}
+
+const MAX_LISTED_CHANGES = 20;
+const MAX_COMMENT_NAMES = 3;
+function listed(items, label, limit = MAX_LISTED_CHANGES) {
+  const shown = items.slice(0, limit).map(label).join(", ");
+  return items.length > limit ? `${shown} and ${items.length - limit} more` : shown;
+}
+
+function filesLabel(item, limit, render) {
+  const files = item.filesChanged;
+  if (!files) return "";
+  if (item.from === null) return files.added.length > 0 ? ` · ${count(files.added.length, "file")}` : "";
+  return ["changed", "removed", "added"].filter(key => files[key].length > 0)
+    .map(key => ` · ${key} ${listed(files[key], render.text, limit)}`).join("");
+}
+
+function changeLabel(item, dryRun, mark = undefined, limit = MAX_LISTED_CHANGES, render = reportText()) {
+  if (!exportMoved(item, dryRun)) return "Unchanged";
+  if (item.from === null) return `🆕 New · ${render.text(item.version)}${filesLabel(item, limit, render)}`;
+  return `${mark ?? "🔄 Update"} · ${render.text(item.from)} → ${render.text(item.version)}${filesLabel(item, limit, render)}`;
+}
+
+const identity = item => JSON.stringify([item.registry, item.namespace, item.kind, item.name]);
+
+function registryMoved(head, base, untouched) {
+  const ahead = new Map(base.artifacts.filter(item => item.from !== null && item.from !== item.version).map(item => [identity(item), item]));
+  // Equal digests mean the pull request leaves the artifact as the base has it; without both, assume it changes it.
+  const leaves = (item, at) => item.digest !== undefined && item.digest === at.digest;
+  return head.artifacts.filter(item => exportMoved(item, true) && ahead.has(identity(item)) && leaves(item, ahead.get(identity(item))) === untouched);
+}
+
+const conflictsOf = (head, base) => registryMoved(head, base, false);
+const overwritesOf = (head, base) => registryMoved(head, base, true);
+
+function dependencyChanges(item, limit, render) {
+  const edges = item.dependsOnChanged;
+  if (!edges || item.from === null) return "";
+  const moved = [...changed("removes", edges.removed, render.text, limit), ...changed("adds", edges.added, render.text, limit)];
+  return ` (${moved.join("; ")})`;
+}
+
+function dependsLabel(item, limit = MAX_LISTED_CHANGES, render = reportText()) {
+  const dependency = entry => render.text(entry.to);
+  return `${item.dependsOn.length > 0 ? item.dependsOn.map(dependency).join(" · ") : "—"}${dependencyChanges(item, limit, render)}`;
+}
+
+function targetLabel(result, render = reportText()) {
+  if (result.target) return render.code(`${result.target.registry}/${result.target.namespace}`);
+  const targets = [...new Set(result.artifacts.map(item => `${item.registry}/${item.namespace}`))];
+  if (targets.length > 0) return targets.map(target => render.code(target)).join(", ");
+  return "the manifest's target";
+}
+
+function skippedRow(item, render) {
+  return `| ${artifactLabel(item, render)} | ⏭️ Skipped · ${render.text(item.reason)} | — |`;
+}
+
+function artifactTable(result, heading, rows = result.artifacts, skipped = result.skipped, marks = new Map(), limit = MAX_LISTED_CHANGES, render = reportText()) {
+  return [
+    `| Artifact | ${heading} | Depends on |`,
+    "| --- | --- | --- |",
+    ...rows.map(item => `| ${artifactLabel(item, render)} | ${changeLabel(item, result.dryRun, marks.get(identity(item)), limit, render)} | ${dependsLabel(item, limit, render)} |`),
+    ...skipped.map(item => skippedRow(item, render))
+  ];
+}
+
+const exportLabel = (item, render) => `${render.text(item.kind)} ${render.code(item.name)}`;
+
+function removing(result) {
+  return result.artifacts.filter(item => exportMoved(item, result.dryRun) && item.from !== null && item.filesChanged?.removed.length > 0);
+}
+
+function removalLines(result, verb, limit = MAX_LISTED_CHANGES, render = reportText()) {
+  const removals = removing(result);
+  if (removals.length === 0) return [];
+  const each = item => `${exportLabel(item, render)}: ${listed(item.filesChanged.removed, render.text, limit)}`;
+  const more = removals.length > MAX_LISTED_CHANGES ? `; and ${count(removals.length - MAX_LISTED_CHANGES, "more artifact")}` : "";
+  return ["", `⚠️ ${verb}: ${removals.slice(0, MAX_LISTED_CHANGES).map(each).join("; ")}${more}`];
+}
+
+function exportsNothing(result) {
+  return result.artifacts.length === 0 && result.skipped.length === 0;
+}
+
+function formatPublishSummary({ result, version }, environment = process.env) {
+  const render = reportText(environment);
+  const { published } = exportChanges(result);
+  const listed = result.artifacts.length + result.skipped.length > 0;
+  return [
+    `### Registry Sync ${result.dryRun ? "would publish" : "published"} ${count(published.length, "artifact")} to ${targetLabel(result, render)}`,
+    "",
+    ...(result.dryRun ? ["A dry run, with `publish` off: nothing was written to the registry.", ""] : []),
+    ...(listed ? [...artifactTable(result, result.dryRun ? "Change" : "Version", result.artifacts, result.skipped, new Map(), MAX_LISTED_CHANGES, render), ...removalLines(result, result.dryRun ? "Publishing removes" : "Removed", MAX_LISTED_CHANGES, render), ""]
+      : result.unread ? [] : ["The manifest exports nothing.", ""]),
+    ...(result.unread ? ["aireg published, but part of its answer could not be read, so this list may be incomplete; the run log has its full output.", ""] : []),
+    `aireg ${render.text(version)}`
+  ].join("\n");
+}
+
+function reasonLines(reason, render) {
+  return [render.text(reason.message), ...(reason.hint ? ["", `Hint: ${render.text(reason.hint)}`] : [])];
+}
+
+function changed(verb, items, label, limit = MAX_LISTED_CHANGES) {
+  return items.length > 0 ? [`${verb} ${listed(items, label, limit)}`] : [];
+}
+
+function destination(result) {
+  if (result.target) return `${result.target.registry}/${result.target.namespace}`;
+  const targets = [...new Set(result.artifacts.map(item => `${item.registry}/${item.namespace}`))];
+  return targets.length === 1 ? targets[0] : undefined;
+}
+
+function publishingChanges({ baseManifest, registryChanges, result, baseResult }, render) {
+  if (!registryChanges) return [];
+  const items = [];
+  if (baseManifest === false) items.push(`Adds \`${MANIFEST_FILE}\`, so everything it declares is new.`);
+  const registries = [
+    ...changed("adds", registryChanges.added, name => render.code(name)),
+    ...changed("changes", registryChanges.changed, name => render.code(name)),
+    ...changed("removes", registryChanges.removed, name => render.code(name))
+  ];
+  if (registries.length > 0) items.push(`Registries: ${registries.join("; ")}.`);
+  if (result && baseResult) {
+    const before = destination(baseResult);
+    const after = destination(result);
+    if (before && after && before !== after) items.push(`Target: ${render.code(before)} → ${render.code(after)}.`);
+    const exportsOf = dryRun => new Map([...dryRun.artifacts, ...dryRun.skipped].map(item => [JSON.stringify([item.kind, item.name]), item]));
+    const headExports = exportsOf(result);
+    const baseExports = exportsOf(baseResult);
+    const exportChanges = [
+      ...changed("adds", [...headExports].filter(([key]) => !baseExports.has(key)).map(([, item]) => item), item => exportLabel(item, render)),
+      ...changed("removes", [...baseExports].filter(([key]) => !headExports.has(key)).map(([, item]) => item), item => exportLabel(item, render))
+    ];
+    if (exportChanges.length > 0) items.push(`Exports: ${exportChanges.join("; ")}.`);
+  }
+  if (items.length === 0) return [];
+  return ["> [!IMPORTANT]", "> **This pull request changes what publishes, or where.**", ...items.map(item => `> - ${item}`), ""];
+}
+
+function withheldLines(withheld, baseError, refused, render) {
+  if (withheld.length === 0) return [];
+  const names = withheld.map(name => render.code(name)).join(", ");
+  const theirs = withheld.length === 1 ? "its token" : "their tokens";
+  if (baseError) {
+    const why = `the base commit could not be read (${render.text(baseError)}), so the preview cannot tell whether this pull request changes \`registries:\``;
+    return [refused ? `Not compared with ${names}: ${why}, and ran without ${theirs}.` : `⚠️ The preview ran without the token for ${names}: ${why}.`];
+  }
+  return [refused
+    ? `Not compared with ${names}: this pull request changes \`registries:\`, so the preview ran without ${theirs}.`
+    : `⚠️ The preview ran without the token for ${names}: this pull request changes \`registries:\`.`];
+}
+
+function previewLines(preview, compact = false, limit = MAX_LISTED_CHANGES, render = reportText()) {
+  const { result, reason, unauthorized, version, withheld = [], baseError, baseFailure, conflicts = [], overwrites = [], failOnConflict = true } = preview;
+  const lines = publishingChanges(preview, render);
+  const kept = withheldLines(withheld, baseError, unauthorized, render);
+  if (unauthorized) {
+    lines.push(
+      "### ⚠️ Not compared with the registry",
+      "",
+      ...(kept.length > 0 ? [...kept, "", "Merging still publishes from the default branch, with the registries it declares then."]
+        : ["No registry credential was available to this run, so aireg could not compare this pull request with the registry. Pull requests from forks get no secrets; on any other, pass the registry's token to this step as `AIREG_TOKEN_<NAME>`. Merging still publishes from the default branch."]),
+      "",
+      ...reasonLines(reason, render)
+    );
+  } else if (reason) {
+    lines.push("### ❌ aireg can't publish this", "", ...reasonLines(reason, render), "", "The check fails until it is fixed.", ...(kept.length > 0 ? ["", ...kept] : []));
+  } else {
+    const { published } = exportChanges(result);
+    if (conflicts.length > 0) {
+      const one = conflicts.length === 1;
+      lines.push(
+        `### ❗ ${count(conflicts.length, "conflict")}`,
+        "",
+        `The registry changed ${one ? "an artifact" : `${conflicts.length} artifacts`} this pull request also changes since its base, so merging would publish over ${one ? "that change" : "those changes"}. Bring the registry's changes into the repository first, or merge to replace them.`,
+        "",
+        failOnConflict ? "The check fails while `fail-on-conflict` is on." : "`fail-on-conflict` is off, so the check passes.",
+        ""
+      );
+    } else {
+      lines.push("### ✅ Ready to merge", "");
+    }
+    lines.push(exportsNothing(result) ? "Merging publishes nothing: the manifest exports nothing."
+      : published.length === 0 ? `Merging publishes nothing to ${targetLabel(result, render)}: ${result.artifacts.length === 0 ? "it takes none of the exports" : "every export it takes is unchanged"}.`
+        : `Merging publishes ${count(published.length, "artifact")} to ${targetLabel(result, render)}.`);
+    if (overwrites.length > 0) {
+      lines.push("", `⚠️ Merging also publishes ${listed(overwrites, item => exportLabel(item, render), limit)}, which this pull request leaves unchanged, over the registry's current version, which differs from the base.`);
+    }
+    if (kept.length > 0) lines.push("", ...kept);
+    if (baseFailure) lines.push("", `Conflicts were not checked: the base commit's dry run failed: ${render.text(baseFailure)}`);
+    else if (baseError && kept.length === 0) lines.push("", `Conflicts were not checked: the base commit could not be read (${render.text(baseError)}).`);
+    if (compact === "minimal") {
+      lines.push("", "The table was left out to keep this comment within GitHub's size limit; the job summary lists every artifact.");
+      const removals = removing(result);
+      const files = removals.reduce((total, item) => total + item.filesChanged.removed.length, 0);
+      if (files > 0) lines.push("", `⚠️ Merging removes ${count(files, "file")} from ${count(removals.length, "artifact")}; the job summary lists them.`);
+    } else if (!exportsNothing(result)) {
+      const rows = compact ? result.artifacts.filter(item => exportMoved(item, true)) : result.artifacts;
+      const skipped = compact ? [] : result.skipped;
+      const marks = new Map([...overwrites.map(item => [identity(item), "⚠️ Replaces registry version"]), ...conflicts.map(item => [identity(item), "❗ Conflict"])]);
+      if (rows.length + skipped.length > 0) lines.push("", ...artifactTable(result, "Change", rows, skipped, marks, limit, render));
+      lines.push(...removalLines(result, "Merging removes", limit, render));
+      if (rows.length < result.artifacts.length) lines.push("", `${count(result.artifacts.length - rows.length, "unchanged export")} not shown.`);
+      if (skipped.length < result.skipped.length) lines.push("", `${count(result.skipped.length, "skipped export")} not shown; the job summary says why.`);
+    }
+  }
+  if (version) lines.push("", `Checked with aireg ${render.text(version)}.`);
+  return lines;
+}
+
+function formatPreviewSummary(preview, environment = process.env) {
+  return previewLines(preview, false, MAX_LISTED_CHANGES, reportText(environment)).join("\n");
+}
+
+function formatPreviewComment(preview, marker = PREVIEW_MARKER, environment = process.env) {
+  const render = reportText(environment);
+  for (const compact of [false, true]) {
+    const comment = [marker, ...previewLines(preview, compact, MAX_COMMENT_NAMES, render)].join("\n");
+    if (Buffer.byteLength(comment, "utf8") <= MAX_GITHUB_COMMENT_BYTES) return comment;
+  }
+  return [marker, ...previewLines(preview, "minimal", MAX_LISTED_CHANGES, render)].join("\n");
+}
+
+;// CONCATENATED MODULE: ./src/cli.js
+
+
+
+
+
+
+
+
+
+
+
+
+
+const INSTALL_ENVIRONMENT_KEYS = [
+  "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL",
+  "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY",
+  "https_proxy", "http_proxy", "all_proxy", "no_proxy",
+  "SSL_CERT_FILE", "SSL_CERT_DIR", "RUNNER_OS", "RUNNER_ARCH"
+];
+
+const PUBLISH_ENVIRONMENT_KEYS = [
+  "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL",
+  "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY",
+  "https_proxy", "http_proxy", "all_proxy", "no_proxy",
+  "RUNNER_OS", "RUNNER_ARCH", "CI", "GITHUB_ACTIONS", "GITHUB_ACTOR", "GITHUB_JOB",
+  "GITHUB_REF", "GITHUB_REF_NAME", "GITHUB_REF_TYPE", "GITHUB_REPOSITORY",
+  "GITHUB_RUN_ATTEMPT", "GITHUB_RUN_ID", "GITHUB_SHA", "GITHUB_WORKFLOW"
+];
+
+
+const SELF_UPDATE_ARGUMENTS = Object.freeze(["self", "update", "--json"]);
+const REGISTRY_LIST_ARGUMENTS = Object.freeze(["registry", "list", "--json"]);
+const MAX_CLI_STDERR_CHARS = 8 * 1024;
+const TOKEN_PREFIX = "AIREG_TOKEN_";
+const TOKEN_NAME = /^AIREG_TOKEN_[A-Z0-9_]{1,128}$/;
+const REGISTRY_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
+
+const CLI_OS = { linux: "linux", darwin: "darwin" };
+const CLI_ARCH = { x64: "amd64", arm64: "arm64" };
+
+function assertSupportedPublishPlatform(platform = process.platform) {
+  if (!Object.hasOwn(CLI_OS, platform)) {
+    throw new Error("aireg runs on Linux and macOS runners here; use ubuntu-latest or macos-latest");
+  }
+}
+
+// Maps the Node runtime platform onto the pinned CLI artifact name.
+function resolveCliPlatform(platform = process.platform, arch = process.arch) {
+  assertSupportedPublishPlatform(platform);
+  if (!Object.hasOwn(CLI_ARCH, arch)) {
+    throw new Error("aireg runs on amd64 and arm64 runners only");
+  }
+  const target = `${CLI_OS[platform]}-${CLI_ARCH[arch]}`;
+  if (!Object.hasOwn(CLI_SHA256, target)) {
+    throw new Error(`the Action does not pin aireg for ${target}`);
+  }
+  return target;
+}
+
+function assertNoSymlinks(root, candidate) {
+  const relative = external_node_path_namespaceObject.relative(root, candidate);
+  let current = root;
+  for (const part of relative ? relative.split(external_node_path_namespaceObject.sep) : []) {
+    current = external_node_path_namespaceObject.join(current, part);
+    if (external_node_fs_namespaceObject.lstatSync(current).isSymbolicLink()) throw new Error("working-directory cannot contain symbolic links");
+  }
+}
+
+function resolveWorkingDirectory(environment = process.env) {
+  const workspaceInput = external_node_path_namespaceObject.resolve(environment.GITHUB_WORKSPACE || process.cwd());
+  const workspace = external_node_fs_namespaceObject.realpathSync(workspaceInput);
+  const requested = external_node_path_namespaceObject.resolve(common_getInput("working-directory", environment) || workspaceInput);
+  const lexicalRoot = isWithin(workspaceInput, requested) ? workspaceInput : workspace;
+  if (!isWithin(lexicalRoot, requested) || !external_node_fs_namespaceObject.existsSync(requested)) {
+    throw new Error("working-directory must be an existing directory inside GITHUB_WORKSPACE");
+  }
+  assertNoSymlinks(lexicalRoot, requested);
+  const resolved = external_node_fs_namespaceObject.realpathSync(requested);
+  if (!isWithin(workspace, resolved)) {
+    throw new Error("working-directory must be an existing directory inside GITHUB_WORKSPACE");
+  }
+  if (!external_node_fs_namespaceObject.statSync(resolved).isDirectory()) {
+    throw new Error("working-directory must be an existing directory inside GITHUB_WORKSPACE");
+  }
+  return resolved;
+}
+
+function writeBoundedCli(response, destination, createDestination = external_node_fs_namespaceObject.createWriteStream) {
+  let received = 0;
+  const limiter = new external_node_stream_.Transform({
+    transform(chunk, _encoding, callback) {
+      received += chunk.length;
+      callback(received > MAX_CLI_BYTES
+        ? new Error("aireg download exceeds the size limit")
+        : null, chunk);
+    }
+  });
+  return (0,external_node_stream_promises_namespaceObject.pipeline)(response, limiter, createDestination(destination, { mode: 0o700 }));
+}
+
+async function verifyCliDigest(binary, expectedDigest) {
+  if (typeof expectedDigest !== "string" || !SHA256.test(expectedDigest)) {
+    throw new Error("Action-pinned CLI digest is invalid");
+  }
+  const metadata = await promises_namespaceObject.lstat(binary);
+  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > MAX_CLI_BYTES) {
+    throw new Error("aireg is not a bounded regular file");
+  }
+  const hash = (0,external_node_crypto_.createHash)("sha256");
+  for await (const chunk of external_node_fs_namespaceObject.createReadStream(binary)) hash.update(chunk);
+  if (!(0,external_node_crypto_.timingSafeEqual)(hash.digest(), Buffer.from(expectedDigest, "hex"))) {
+    throw new Error("aireg digest does not match the Action-pinned digest");
+  }
+}
+
+function cliArtifactURL(target, version = CLI_VERSION) {
+  if (!Object.hasOwn(CLI_SHA256, target)) throw new Error("aireg platform is not pinned");
+  if (!RELEASE_VERSION.test(version)) throw new Error("Action-pinned CLI version is invalid");
+  return `${CLI_ORIGIN}${CLI_ARTIFACT_PATH}${version}/aireg-${target}`;
+}
+
+const CLI_URL_PATHNAME = new RegExp(
+  `^${CLI_ARTIFACT_PATH}(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)/aireg-(?:darwin|linux)-(?:amd64|arm64)$`
+);
+
+function validateCliURL(cliURL) {
+  let url;
+  try {
+    url = new URL(cliURL);
+  } catch {
+    throw new Error("aireg URL must be valid HTTPS");
+  }
+  if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash || !CLI_URL_PATHNAME.test(url.pathname)) {
+    throw new Error("aireg URL must be a clean HTTPS version-addressed artifact URL");
+  }
+  if (url.origin !== CLI_ORIGIN) {
+    throw new Error("aireg host is not approved");
+  }
+}
+
+function downloadCli(url, destination) {
+  validateCliURL(url);
+  return new Promise((resolve, reject) => {
+    const request = external_node_https_namespaceObject.get(url, {
+      timeout: 60_000,
+      headers: { "User-Agent": "atlan-agent-registry-action" }
+    }, response => {
+      if (response.statusCode >= 300 && response.statusCode < 400) {
+        response.resume();
+        reject(new Error("aireg download redirected; refusing an unapproved source"));
+        return;
+      }
+      if (response.statusCode !== 200) {
+        response.resume();
+        reject(new Error(`aireg download failed with HTTP ${response.statusCode}`));
+        return;
+      }
+      const declaredSize = Number(response.headers["content-length"] || 0);
+      if (declaredSize > MAX_CLI_BYTES) {
+        response.resume();
+        reject(new Error("aireg download exceeds the size limit"));
+        return;
+      }
+      void writeBoundedCli(response, destination).then(resolve, reject);
+    });
+    request.on("timeout", () => request.destroy(new Error("aireg download timed out")));
+    request.on("error", reject);
+  });
+}
+
+function runtimeEnvironment(environment, keys, runtimeDirectory) {
+  if (!external_node_path_namespaceObject.isAbsolute(runtimeDirectory)) throw new Error("Action-owned CLI home must be an absolute path");
+  const allowed = Object.fromEntries(keys
+    .filter(key => environment[key] !== undefined)
+    .map(key => [key, environment[key]]));
+  return {
+    ...allowed,
+    HOME: runtimeDirectory,
+    AIREG_HOME: external_node_path_namespaceObject.join(runtimeDirectory, ".aireg"),
+    AIREG_USER_SCOPE: external_node_path_namespaceObject.join(runtimeDirectory, "registry"),
+    PATH: SYSTEM_PATH
+  };
+}
+
+function installEnvironment(environment, runtimeDirectory) {
+  return runtimeEnvironment(environment, INSTALL_ENVIRONMENT_KEYS, runtimeDirectory);
+}
+
+function tokenVariable(alias) {
+  return `${TOKEN_PREFIX}${alias.toUpperCase().replaceAll(/[^A-Z0-9]/g, "_")}`;
+}
+
+function suppliedTokens(environment, mask = value => maskSecret(value, environment)) {
+  const read = (name, value) => {
+    if (typeof value !== "string" || /[\r\n]/.test(value)) throw new Error(`${name} is invalid`);
+    mask(value);
+    return value;
+  };
+  const tokens = {};
+  for (const [name, value] of Object.entries(environment)) {
+    if (!name.startsWith(TOKEN_PREFIX) || value === undefined || value === "") continue;
+    if (!TOKEN_NAME.test(name)) {
+      throw new Error(`${/^\w{1,160}$/.test(name) ? name : "a registry token variable"} is not a name aireg reads: use AIREG_TOKEN_ and the registry's name in capitals, with any other character as _`);
+    }
+    tokens[name] = read(name, value);
+  }
+  const legacy = environment.ATLANAI_TOKEN ? read("ATLANAI_TOKEN", environment.ATLANAI_TOKEN) : undefined;
+  return { tokens, legacy };
+}
+
+async function legacyRegistry(registries, dryRun) {
+  if (registries.length === 1) return registries[0].registry;
+  const declared = name => registries.some(entry => entry.registry === name);
+  const result = await dryRun().catch(() => undefined);
+  const destinations = [...new Set(result?.artifacts.map(item => item.registry) ?? [])];
+  const named = result?.target?.registry ?? (destinations.length === 1 ? destinations[0] : undefined);
+  if (named !== undefined && declared(named)) return named;
+  const atlan = registries.filter(entry => entry.adapter === "atlan");
+  return atlan.length === 1 ? atlan[0].registry : undefined;
+}
+
+function publishTokens({ tokens, legacy }, registry) {
+  if (legacy === undefined) return tokens;
+  if (registry === undefined) {
+    throw new Error(`ATLANAI_TOKEN cannot tell which registry ${MANIFEST_FILE} publishes to; pass it as AIREG_TOKEN_<NAME>, the target registry's name in capitals`);
+  }
+  const name = tokenVariable(registry);
+  return Object.hasOwn(tokens, name) ? tokens : { ...tokens, [name]: legacy };
+}
+
+function publisherEnvironment(environment, tokens, runtimeDirectory) {
+  return {
+    ...runtimeEnvironment(environment, PUBLISH_ENVIRONMENT_KEYS, runtimeDirectory),
+    ...GIT_ENVIRONMENT,
+    ...tokens
+  };
+}
+
+function trackedManifest(cwd) {
+  const listed = (0,external_node_child_process_namespaceObject.spawnSync)("git", ["ls-files", "-s", "-z", "--", MANIFEST_FILE], {
+    cwd, encoding: "utf8", env: { ...GIT_ENVIRONMENT }
+  });
+  if (listed.status !== 0) throw new Error("could not list the repository's files; check it out before this step");
+  const entry = listed.stdout.split("\0").find(item => item.endsWith(`\t${MANIFEST_FILE}`));
+  if (!entry) return false;
+  const folder = external_node_fs_namespaceObject.lstatSync(external_node_path_namespaceObject.join(cwd, external_node_path_namespaceObject.dirname(MANIFEST_FILE)), { throwIfNoEntry: false });
+  const found = external_node_fs_namespaceObject.lstatSync(external_node_path_namespaceObject.join(cwd, MANIFEST_FILE), { throwIfNoEntry: false });
+  if (!["100644", "100755"].includes(entry.slice(0, entry.indexOf(" "))) || !folder?.isDirectory() || !found?.isFile() ||
+      found.size > MAX_CONFIG_BYTES) {
+    throw new Error(`${MANIFEST_FILE} must be a tracked regular file of at most ${MAX_CONFIG_BYTES} bytes`);
+  }
+  return true;
+}
+
+function assertManifest(cwd, environment) {
+  if (!trackedManifest(cwd)) {
+    throw new Error(`add ${MANIFEST_FILE} with exports and publish.to to the repository; see ${manifestGuide(environment)}`);
+  }
+}
+
+function publishArguments(dryRun = false) {
+  return ["publish", "--yes", "--json", ...(dryRun ? ["--dry-run"] : [])];
+}
+
+function parseCliVersion(raw) {
+  const match = /^v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\s*$/.exec(raw.split("\n")[0] ?? "");
+  if (!match) throw new Error("installed aireg did not return a valid version");
+  return match[1];
+}
+
+function assertCompatibleCli(version) {
+  const current = version.split("-")[0].split(".").map(Number);
+  const minimum = MINIMUM_CLI_VERSION.split(".").map(Number);
+  const difference = current.findIndex((part, index) => part !== minimum[index]);
+  const older = difference === -1 ? version.includes("-") : current[difference] < minimum[difference];
+  if (older) {
+    throw new Error(`Registry Sync requires aireg ${MINIMUM_CLI_VERSION} or newer; the signed channel supplied ${version}. Release aireg ${MINIMUM_CLI_VERSION} or newer to the signed channel before using this Action.`);
+  }
+}
+
+function updatedCli(raw, binary, directory) {
+  let data;
+  try {
+    data = JSON.parse(raw)?.data;
+  } catch {
+    data = undefined;
+  }
+  if (data?.action === "already-latest") return binary;
+  if (data?.action !== "updated" || typeof data.bin !== "string" || !external_node_path_namespaceObject.isAbsolute(data.bin) || !isWithin(directory, data.bin)) {
+    throw new Error("aireg returned an unreadable self update result");
+  }
+  return data.bin;
+}
+
+function airegAnswer(raw) {
+  const line = raw.split("\n").map(item => item.trim()).filter(Boolean).at(-1);
+  try {
+    const answer = JSON.parse(line ?? "");
+    return answer && typeof answer === "object" && !Array.isArray(answer) ? answer : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+function declaredRegistries(raw) {
+  const answer = airegAnswer(raw);
+  const registries = answer?.data?.registries;
+  if (answer?.ok !== true || answer.data.scope !== "project" || !Array.isArray(registries) || registries.length > MAX_REGISTRIES ||
+      !registries.every(entry => typeof entry?.registry === "string" && REGISTRY_NAME.test(entry.registry) &&
+        (entry.adapter === undefined || (typeof entry.adapter === "string" && ADAPTER_ID.test(entry.adapter))))) {
+    throw new Error(`aireg could not list the registries ${MANIFEST_FILE} declares`);
+  }
+  return registries.map(entry => ({
+    registry: entry.registry,
+    ...(entry.adapter === undefined ? {} : { adapter: entry.adapter }),
+    declaration: canonicalJson(entry)
+  }));
+}
+
+function registryChanges(head, base) {
+  const declarations = list => new Map(list.map(entry => [entry.registry, entry.declaration]));
+  const after = declarations(head);
+  const before = declarations(base);
+  return {
+    added: [...after.keys()].filter(name => !before.has(name)),
+    removed: [...before.keys()].filter(name => !after.has(name)),
+    changed: [...after.keys()].filter(name => before.has(name) && before.get(name) !== after.get(name))
+  };
+}
+
+// Every registry sharing a token variable must match the base declaration, so alias collisions cannot leak it.
+// An unreadable base releases no token.
+function unchangedRegistryTokens(tokens, head, base) {
+  const kept = {};
+  const withheld = [];
+  for (const [name, value] of Object.entries(tokens)) {
+    const reading = list => list.filter(entry => tokenVariable(entry.registry) === name);
+    const after = reading(head);
+    if (after.length === 0) continue;
+    const declared = list => JSON.stringify(list.map(entry => [entry.registry, entry.declaration]).sort());
+    if (base !== undefined && declared(after) === declared(reading(base))) kept[name] = value;
+    else withheld.push(...after.map(entry => entry.registry));
+  }
+  return { tokens: kept, withheld: [...new Set(withheld)].sort() };
+}
+
+function adaptersToInstall(registries) {
+  return [...new Set(registries.map(entry => entry.adapter).filter(adapter => adapter && !BUILT_IN_ADAPTERS.includes(adapter)))];
+}
+
+function prose(value, limit) {
+  return String(value).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, " ").trim().slice(0, limit);
+}
+
+function cliFailure(stderr, stdout, cwd) {
+  const answer = airegAnswer(stdout);
+  const error = answer?.ok === false ? answer.error : undefined;
+  let reason;
+  if (typeof error?.message === "string") {
+    reason = {
+      ...(typeof error.code === "string" && /^[a-z][a-z0-9_-]{0,63}$/.test(error.code) ? { code: error.code } : {}),
+      message: prose(error.message, 1000),
+      ...(typeof error.hint === "string" && error.hint.trim() ? { hint: prose(error.hint, 1000) } : {})
+    };
+  } else {
+    const lines = stderr.split(/\r?\n/);
+    const at = lines.findLastIndex(line => line.startsWith("error: "));
+    if (at < 0) return undefined;
+    const hint = lines.slice(at + 1).find(line => line.startsWith("hint: "));
+    reason = { message: prose(lines[at].slice(7), 1000), ...(hint ? { hint: prose(hint.slice(6), 1000) } : {}) };
+  }
+  const local = text => (cwd ? text.replaceAll(`${cwd}/`, "") : text);
+  return { ...reason, message: local(reason.message), ...(reason.hint ? { hint: local(reason.hint) } : {}) };
+}
+
+// Spawn directly so repository-controlled input cannot become shell syntax.
+function runCli(binary, args, cwd, environment, capture = false) {
+  return new Promise((resolve, reject) => {
+    const child = (0,external_node_child_process_namespaceObject.spawn)(binary, [...args], {
+      cwd,
+      env: environment,
+      shell: false,
+      stdio: [capture ? "ignore" : "inherit", capture ? "pipe" : "inherit", "pipe"]
+    });
+    let stderr = "";
+    child.stderr.on("data", chunk => {
+      process.stderr.write(chunk);
+      stderr = (stderr + chunk.toString("utf8")).slice(-MAX_CLI_STDERR_CHARS);
+    });
+    // Drain oversized output instead of interrupting a publish halfway through.
+    const chunks = [];
+    let size = 0;
+    child.stdout?.on("data", chunk => {
+      size += chunk.length;
+      if (size <= MAX_CLI_OUTPUT_BYTES) chunks.push(chunk);
+    });
+    child.on("error", reject);
+    // "close" waits for stdout to drain; "exit" can fire first and lose the tail of it.
+    child.on("close", code => {
+      const stdout = size > MAX_CLI_OUTPUT_BYTES ? "" : Buffer.concat(chunks).toString("utf8");
+      if (code === 0 && size > MAX_CLI_OUTPUT_BYTES) {
+        return reject(Object.assign(new Error("aireg output exceeds the size limit"), { succeeded: true }));
+      }
+      if (code !== 0) {
+        const reason = cliFailure(stderr, stdout, cwd);
+        const text = reason ? `: ${reason.message}${reason.hint ? ` Hint: ${reason.hint}` : ""}` : "";
+        return reject(Object.assign(new Error(`aireg ${args[0]} exited with status ${code}${text}`), reason ? { aireg: reason } : {}));
+      }
+      resolve(stdout);
+    });
+  });
+}
+
+async function installCli({
+  environment = process.env,
+  cwd,
+  baseCwd,
+  download = downloadCli,
+  verifyCli = verifyCliDigest,
+  execute = runCli
+} = {}) {
+  const target = resolveCliPlatform();
+  const directory = await promises_namespaceObject.realpath(await promises_namespaceObject.mkdtemp(external_node_path_namespaceObject.join(external_node_os_namespaceObject.tmpdir(), "registry-skill-sync-")));
+  const binary = external_node_path_namespaceObject.join(directory, "aireg");
+  try {
+    await download(cliArtifactURL(target), binary);
+    await verifyCli(binary, CLI_SHA256[target]);
+    await promises_namespaceObject.chmod(binary, 0o700);
+    const safeEnvironment = installEnvironment(environment, directory);
+    const updated = await execute(binary, SELF_UPDATE_ARGUMENTS, directory, safeEnvironment, true);
+    const newest = updatedCli(updated, binary, directory);
+    const version = parseCliVersion(await execute(newest, ["--version"], directory, safeEnvironment, true));
+    assertCompatibleCli(version);
+    const listing = { ...safeEnvironment, ...GIT_ENVIRONMENT };
+    const registries = declaredRegistries(await execute(newest, REGISTRY_LIST_ARGUMENTS, cwd, listing, true));
+    let base;
+    if (baseCwd !== undefined) {
+      try {
+        base = { registries: declaredRegistries(await execute(newest, REGISTRY_LIST_ARGUMENTS, baseCwd, listing, true)) };
+      } catch {
+        base = { error: `aireg could not list the registries the base commit's ${MANIFEST_FILE} declares` };
+      }
+    }
+    for (const adapter of adaptersToInstall([...registries, ...(base?.registries ?? [])])) {
+      await execute(newest, ["adapter", "install", adapter, "--yes"], directory, safeEnvironment);
+    }
+    return { binary: newest, directory, version, registries, ...(base ? { base } : {}) };
+  } catch (error) {
+    await promises_namespaceObject.rm(directory, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+const FIELD = /^[^\p{Cc}\p{Cf}\p{Zl}\p{Zp}]{1,200}$/u;
+const field = value => typeof value === "string" && FIELD.test(value);
+
+function dependency(entry) {
+  return field(entry?.to) ? { to: entry.to } : undefined;
+}
+
+const STORED_PATH = new RegExp(`^[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}]{1,${MAX_CHANGED_PATH_CHARS}}$`, "u");
+const storedPath = value => typeof value === "string" && STORED_PATH.test(value);
+
+function changeLists(value, keys, valid, limit) {
+  if (value === undefined) return null;
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const lists = Object.fromEntries(keys.map(key => [key, value[key] === undefined ? [] : value[key]]));
+  const read = Object.values(lists).every(list => Array.isArray(list) && list.length <= limit && list.every(valid));
+  if (!read) return undefined;
+  return Object.values(lists).some(list => list.length > 0) ? lists : null;
+}
+
+const DIGEST = /^sha256:[a-f0-9]{64}$/;
+
+function artifact(entry) {
+  const dependsOn = entry?.dependsOn ?? [];
+  if (!["name", "kind", "registry", "namespace", "version"].every(key => field(entry?.[key])) ||
+      (entry.from !== null && !field(entry.from)) || typeof entry.published !== "boolean" ||
+      (entry.digest !== undefined && !DIGEST.test(entry.digest)) ||
+      !Array.isArray(dependsOn) || dependsOn.length > MAX_ARTIFACT_DEPENDENCIES) {
+    return undefined;
+  }
+  const dependencies = dependsOn.map(dependency);
+  const filesChanged = changeLists(entry.filesChanged, ["added", "changed", "removed"], storedPath, MAX_CHANGED_FILES);
+  const dependsOnChanged = changeLists(entry.dependsOnChanged, ["added", "removed"], field, MAX_ARTIFACT_DEPENDENCIES);
+  if (dependencies.includes(undefined) || filesChanged === undefined || dependsOnChanged === undefined) return undefined;
+  const { name, kind, registry, namespace, from, version, digest, published } = entry;
+  return {
+    name, kind, registry, namespace, from, version, ...(digest ? { digest } : {}), published, dependsOn: dependencies,
+    ...(filesChanged ? { filesChanged } : {}), ...(dependsOnChanged ? { dependsOnChanged } : {})
+  };
+}
+
+function skip(entry) {
+  if (!field(entry?.name) || !field(entry.kind) || typeof entry.reason !== "string" || (entry.path !== undefined && !field(entry.path))) {
+    return undefined;
+  }
+  return { name: entry.name, kind: entry.kind, ...(entry.path === undefined ? {} : { path: entry.path }), reason: prose(entry.reason, 500) };
+}
+
+const namesTarget = data => data?.target !== undefined && data.target !== null;
+function publishTo(entry) {
+  return field(entry?.registry) && field(entry.namespace) ? { registry: entry.registry, namespace: entry.namespace } : undefined;
+}
+
+function dryRunResult(raw) {
+  const answer = airegAnswer(raw);
+  const data = answer?.ok === true ? answer.data : undefined;
+  const bounded = list => Array.isArray(list) && list.length <= MAX_PUBLISHED_ARTIFACTS;
+  const artifacts = bounded(data?.artifacts) ? data.artifacts.map(artifact) : undefined;
+  const skipped = data?.skipped === undefined ? [] : bounded(data.skipped) ? data.skipped.map(skip) : undefined;
+  const target = namesTarget(data) ? publishTo(data.target) : undefined;
+  if (data?.dryRun !== true || !artifacts || artifacts.includes(undefined) || !skipped || skipped.includes(undefined) ||
+      (namesTarget(data) && !target)) {
+    throw new Error("aireg returned an unreadable publish result");
+  }
+  return { dryRun: true, ...(target ? { target } : {}), artifacts, skipped };
+}
+
+function publishedResult(raw) {
+  const answer = airegAnswer(raw ?? "");
+  const data = answer?.ok === true && answer.data && typeof answer.data === "object" ? answer.data : undefined;
+  const read = (list, parse) => (Array.isArray(list) ? list.slice(0, MAX_PUBLISHED_ARTIFACTS).map(parse) : []);
+  const artifacts = read(data?.artifacts, artifact);
+  const skipped = read(data?.skipped, skip);
+  const target = publishTo(data?.target);
+  const complete = data?.dryRun === false && Array.isArray(data.artifacts) && artifacts.length === data.artifacts.length &&
+    (data.skipped === undefined || (Array.isArray(data.skipped) && skipped.length === data.skipped.length)) &&
+    !artifacts.includes(undefined) && !skipped.includes(undefined) && (!namesTarget(data) || target !== undefined);
+  const withoutChanges = (item, at) => item ?? artifact({ ...data.artifacts[at], digest: undefined, filesChanged: undefined, dependsOnChanged: undefined });
+  return {
+    dryRun: false,
+    ...(target ? { target } : {}),
+    artifacts: artifacts.map(withoutChanges).filter(Boolean),
+    skipped: skipped.filter(Boolean),
+    ...(complete ? {} : { unread: true })
+  };
+}
+
+function setPublishOutputs(environment, result) {
+  const { published, unchanged } = result ? exportChanges(result) : { published: [], unchanged: [] };
+  const serialize = value => JSON.stringify(value, (_key, item) => typeof item === "string" ? redact(item, environment) : item);
+  common_setOutput("published", serialize(published), environment);
+  common_setOutput("unchanged", serialize(unchanged), environment);
+  common_setOutput("skipped", serialize(result?.skipped ?? []), environment);
+}
+
+function writeStepSummary(environment, text) {
+  if (!environment.GITHUB_STEP_SUMMARY) return;
+  try {
+    external_node_fs_namespaceObject.appendFileSync(environment.GITHUB_STEP_SUMMARY, `${text}\n`);
+  } catch {
+  }
+}
+
+async function dryRun({ binary, directory }, cwd, environment, tokens, execute = runCli) {
+  return dryRunResult(await execute(binary, publishArguments(true), cwd, publisherEnvironment(environment, tokens, directory), true));
+}
+
+async function runAireg({ environment, install = installCli, execute = runCli, dryRun: dry = false }) {
+  const supplied = suppliedTokens(environment);
+  const cwd = resolveWorkingDirectory(environment);
+  assertManifest(cwd, environment);
+  const installed = await install({ environment, cwd });
+  const { binary, directory, version, registries } = installed;
+  try {
+    const target = supplied.legacy === undefined ? undefined
+      : await legacyRegistry(registries, () => dryRun(installed, cwd, environment, supplied.tokens, execute));
+    const tokens = publishTokens(supplied, target);
+    const run = { version, credentialed: Object.keys(tokens).length > 0 };
+    try {
+      const raw = await execute(binary, publishArguments(dry), cwd, publisherEnvironment(environment, tokens, directory), true);
+      return { ...run, result: dry ? dryRunResult(raw) : publishedResult(raw) };
+    } catch (error) {
+      if (error?.succeeded && !dry) return { ...run, result: publishedResult("") };
+      if (!error?.aireg) throw error;
+      return { ...run, failure: error };
+    }
+  } finally {
+    await promises_namespaceObject.rm(directory, { recursive: true, force: true });
+  }
+}
+
+async function runPublishAction({ environment = process.env, install, execute, dryRun = false } = {}) {
+  let run;
+  try {
+    run = await runAireg({ environment, install, execute, dryRun });
+  } catch (error) {
+    setPublishOutputs(environment);
+    common_setOutput("status", "failed", environment);
+    throw error;
+  }
+  setPublishOutputs(environment, run.result);
+  common_setOutput("status", run.failure ? "failed" : "success", environment);
+  common_setOutput("cli-version", run.version, environment);
+  if (run.failure) throw run.failure;
+  writeStepSummary(environment, formatPublishSummary(run, environment));
+  const { published, unchanged } = exportChanges(run.result);
+  const counts = `${published.length}, unchanged ${unchanged.length}, skipped ${run.result.skipped.length}`;
+  process.stdout.write(`::notice title=Registry Sync::${dryRun ? `would publish ${counts} (dry run)` : `published ${counts}`}\n`);
+}
+
 ;// CONCATENATED MODULE: ./src/inputs.js
 
 
-// Beside aireg's own manifest.yml, which refuses keys it does not know; aireg itself never reads this file.
-const CONFIG_FILE = ".registry/config.yml";
+
 const KINDS = new Set(["skill", "agent"]);
 const WORKSPACE = /^[A-Za-z0-9_.-]{1,128}$/;
 const MAX_GLOBS = 100;
@@ -37399,186 +38699,45 @@ function globList(raw) {
     .filter(item => item !== "");
 }
 
-// Flat `key: value` lines, each optionally followed by `- value` lines; each key appears once.
-function keyedLists(text, keys, usage) {
-  const lists = {};
+function assertCurrentInputs(environment, event) {
+  const replaced = `\`exports:\` and \`publish.to\` in ${MANIFEST_FILE}; see ${manifestGuide(environment)}`;
+  const prune = common_getInput("prune", environment);
+  if (prune && prune !== "false") throw new Error(`prune is no longer an input: publishing follows ${replaced}`);
+  if (event === "pull_request_target") return;
+  for (const name of ["artifacts", "workspace"]) {
+    if (common_getInput(name, environment)) {
+      throw new Error(`${name} only drives the legacy pull_request_target preflight; what publishes and where comes from ${replaced}`);
+    }
+  }
+}
+
+// `artifacts` maps a kind to globs, one line each: `skill: ["skills/**", "team-b/skills/**"]`
+// or `agent: "agents/**"`. A `- glob` list under the kind reads too.
+function parseRegistryInputs(environment = process.env) {
+  const workspace = common_getInput("workspace", environment);
+  if (!WORKSPACE.test(workspace)) throw new Error("workspace must be the Atlan workspace ID artifacts publish to");
+  const artifacts = {};
   let current;
-  for (const raw of text.split("\n")) {
+  for (const raw of common_getInput("artifacts", environment).split("\n")) {
     const line = raw.trim();
     if (!line || line.startsWith("#")) continue;
     const item = /^-\s*(.+)$/.exec(line);
     if (item && current) {
-      lists[current].push(...globList(item[1].trim()));
+      artifacts[current].push(...globList(item[1].trim()));
       continue;
     }
     const match = /^([a-z]+)\s*:\s*(.*)$/.exec(line);
-    if (!match || !keys.has(match[1]) || lists[match[1]]) throw new Error(usage);
+    if (!match || !KINDS.has(match[1]) || artifacts[match[1]]) {
+      throw new Error("each artifacts line names skill or agent once, as in `skill: [\"skills/**\"]`");
+    }
     current = match[1];
-    lists[current] = match[2] ? globList(match[2]) : [];
-  }
-  return lists;
-}
-
-const CONFIG_USAGE = `${CONFIG_FILE} takes \`version: 1\`, \`workspace\`, \`skills\`, a list of globs such as "skills/**", and \`agents\``;
-const AGENTS_USAGE = `each entry under \`agents\` in ${CONFIG_FILE} is \`- id: agent_…\` with \`path\` and \`skills\` below it`;
-const AGENT_ID = /^agent_[A-Za-z0-9]{1,64}$/;
-const SKILL_ID = /^skill_[A-Za-z0-9]{1,64}$/;
-const MAX_AGENTS = 100;
-const MAX_AGENT_SKILLS = 100;
-
-// The config's lines with their indent, past blank lines and comments. Tabs would make the nesting ambiguous.
-function indentedLines(text) {
-  const lines = [];
-  for (const raw of text.split("\n")) {
-    const body = raw.replace(/\s+#.*$/, "").trimEnd();
-    if (!body.trim() || body.trim().startsWith("#")) continue;
-    const indent = /^ */.exec(body)[0].length;
-    if (body[indent] === "\t") throw new Error(`${CONFIG_FILE} must be indented with spaces, not tabs`);
-    lines.push({ indent, text: body.slice(indent) });
-  }
-  return lines;
-}
-
-function scalar(value, usage) {
-  const values = globList(value);
-  if (values.length !== 1 || typeof values[0] !== "string") throw new Error(usage);
-  return values[0];
-}
-
-// `agents:` is a list of entries: `- id: …` opens one, and `path` and `skills` follow, deeper than its dash.
-function agentEntries(block) {
-  const entries = [];
-  let current;
-  let listing = false;
-  for (const line of block) {
-    let { text } = line;
-    if (line.indent === block[0].indent && text.startsWith("- ")) {
-      current = {};
-      entries.push(current);
-      listing = false;
-      text = text.slice(2).trim();
-    } else if (!current || line.indent <= block[0].indent) {
-      throw new Error(AGENTS_USAGE);
-    }
-    const item = /^-\s+(.+)$/.exec(text);
-    if (item) {
-      if (!listing) throw new Error(AGENTS_USAGE);
-      current.skills.push(...globList(item[1]));
-      continue;
-    }
-    const match = /^([a-z]+)\s*:\s*(.*)$/.exec(text);
-    if (!match || !["id", "path", "skills"].includes(match[1]) || match[1] in current) throw new Error(AGENTS_USAGE);
-    listing = match[1] === "skills" && !match[2];
-    current[match[1]] = match[1] === "skills" ? (match[2] ? globList(match[2]) : []) : scalar(match[2], AGENTS_USAGE);
-  }
-  return entries;
-}
-
-function checkAgents(agents) {
-  if (agents.length > MAX_AGENTS) throw new Error(`${CONFIG_FILE} lists more than ${MAX_AGENTS} agents`);
-  const ids = new Set();
-  const paths = new Set();
-  for (const agent of agents) {
-    if (!AGENT_ID.test(agent.id ?? "")) throw new Error(`${CONFIG_FILE}: every agent needs an \`id\` such as agent_01abc`);
-    if (!safeGlob(agent.path) || /[*?]/.test(agent.path)) {
-      throw new Error(`${CONFIG_FILE}: agent ${agent.id} needs a \`path\`, the repository-relative file or folder it lives in`);
-    }
-    if (ids.has(agent.id) || paths.has(agent.path)) {
-      throw new Error(`${CONFIG_FILE} lists agent ${ids.has(agent.id) ? agent.id : agent.path} twice`);
-    }
-    ids.add(agent.id);
-    paths.add(agent.path);
-    const skills = agent.skills ?? [];
-    if (skills.length > MAX_AGENT_SKILLS || new Set(skills).size !== skills.length ||
-        !skills.every(skill => SKILL_ID.test(skill) || safeGlob(skill))) {
-      throw new Error(`${CONFIG_FILE}: agent ${agent.id} lists up to ${MAX_AGENT_SKILLS} different skills, each a skill folder, a glob, or a skill_ ID`);
-    }
-  }
-  return agents.map(agent => ({ id: agent.id, path: agent.path, skills: agent.skills ?? [] }));
-}
-
-// The repository's own config: `version: 1`, its one `workspace`, `skills:` as a list of globs, and `agents`,
-// each with its Atlan `id`, the `path` it lives at, and the `skills` it uses.
-function configSettings(text) {
-  const lines = indentedLines(text);
-  const settings = {};
-  for (let index = 0; index < lines.length;) {
-    const match = /^([a-z]+)\s*:\s*(.*)$/.exec(lines[index].text);
-    if (lines[index].indent !== 0 || !match || !["version", "workspace", "skills", "agents"].includes(match[1]) ||
-        match[1] in settings) {
-      throw new Error(CONFIG_USAGE);
-    }
-    const block = [];
-    for (index += 1; index < lines.length && lines[index].indent > 0; index += 1) block.push(lines[index]);
-    if (match[1] === "agents") {
-      if (match[2]) throw new Error(AGENTS_USAGE);
-      settings.agents = agentEntries(block);
-    } else if (match[2]) {
-      if (block.length > 0) throw new Error(CONFIG_USAGE);
-      settings[match[1]] = globList(match[2]);
-    } else {
-      settings[match[1]] = block.map(line => {
-        const item = /^-\s+(.+)$/.exec(line.text);
-        if (!item) throw new Error(CONFIG_USAGE);
-        return globList(item[1]);
-      }).flat();
-    }
-  }
-  if (settings.version?.length !== 1 || settings.version[0] !== 1) throw new Error(`${CONFIG_FILE} must set \`version: 1\``);
-  if (settings.workspace?.length !== 1) {
-    throw new Error(`${CONFIG_FILE} must name exactly one workspace: a repository syncs with one workspace`);
-  }
-  return {
-    workspace: settings.workspace[0],
-    artifacts: { skill: settings.skills ?? [] },
-    agents: checkAgents(settings.agents ?? [])
-  };
-}
-
-// An agent's skills as Atlan IDs and as this repository's skill folders, which must be ones the config publishes.
-// How messages name an agent: by the path a reader knows, then the ID Atlan knows it by.
-const agentName = agent => `Agent \`${agent.path}\` (${agent.id})`;
-
-function agentSkills(agent, folders) {
-  const ids = [];
-  const own = [];
-  for (const entry of agent.skills) {
-    if (SKILL_ID.test(entry)) {
-      ids.push(entry);
-      continue;
-    }
-    const matched = skillFolders(folders.map(folder => `${folder}/SKILL.md`), [entry]);
-    if (matched.length === 0) {
-      throw new Error(`${agentName(agent)}: \`${entry}\` matches no skill folder that \`skills\` in ${CONFIG_FILE} covers; add its folder to \`skills\`, or take it out of the agent's list`);
-    }
-    own.push(...matched);
-  }
-  return { ids: [...new Set(ids)], folders: [...new Set(own)] };
-}
-
-// `config` is the text of the repository's CONFIG_FILE, read by the caller from the commit it trusts. Without
-// one, the `workspace` and `artifacts` inputs say the same: `artifacts` maps a kind to globs, one line each,
-// `skill: ["skills/**", "team-b/skills/**"]` or `agent: "agents/**"`, or as a `- glob` list under the kind.
-function parseRegistryInputs(environment = process.env, config) {
-  const input = common_getInput("artifacts", environment);
-  const named = common_getInput("workspace", environment);
-  if (config !== undefined && (input || named)) {
-    throw new Error(`${CONFIG_FILE} names the workspace and skills, so leave the workspace and artifacts inputs unset`);
-  }
-  if (config === undefined && !input) {
-    throw new Error(`add ${CONFIG_FILE} with your workspace and skill folders, or set the workspace and artifacts inputs`);
-  }
-  const { workspace, artifacts, agents } = config === undefined
-    ? { workspace: named, artifacts: keyedLists(input, KINDS, "each artifacts line names skill or agent once, as in `skill: [\"skills/**\"]`"), agents: [] }
-    : configSettings(config);
-  if (typeof workspace !== "string" || !WORKSPACE.test(workspace)) {
-    throw new Error("workspace must be the Atlan workspace ID artifacts publish to");
+    artifacts[current] = match[2] ? globList(match[2]) : [];
   }
   const globs = Object.values(artifacts).flat();
   if (globs.length === 0 || globs.length > MAX_GLOBS || !globs.every(safeGlob)) {
-    throw new Error(`${input ? "artifacts" : CONFIG_FILE} must list 1-${MAX_GLOBS} repository-relative globs such as "skills/**"; brackets, braces and a trailing / are not supported`);
+    throw new Error(`artifacts must list 1-${MAX_GLOBS} repository-relative globs such as "skills/**"; brackets, braces and a trailing / are not supported`);
   }
-  return { workspace, artifacts, agents };
+  return { workspace, artifacts };
 }
 
 // `**` crosses folders; `*` and `?` stay inside one.
@@ -37615,12 +38774,17 @@ function skillFolders(files, globs = []) {
     const folder = file.slice(0, -"/SKILL.md".length);
     if (patterns.some(pattern => pattern.test(folder) || pattern.test(file))) folders.add(folder);
   }
-  const sorted = [...folders].sort();
-  return sorted.filter(folder => !sorted.some(outer => folder.startsWith(`${outer}/`)));
+  const nested = folder => {
+    for (let end = folder.indexOf("/"); end > 0; end = folder.indexOf("/", end + 1)) {
+      if (folders.has(folder.slice(0, end))) return true;
+    }
+    return false;
+  };
+  return [...folders].filter(folder => !nested(folder)).sort();
 }
 
 // Preflight's view of the inputs: the skill folders, found in the pull request's trees.
-function preflightConfig({ workspace, artifacts, agents }, files) {
+function preflightConfig({ workspace, artifacts }, files) {
   const folders = skillFolders(files, artifacts.skill);
   return {
     valid: true,
@@ -37628,43 +38792,7 @@ function preflightConfig({ workspace, artifacts, agents }, files) {
     folders: new Set(folders),
     exclude: new Set(),
     workspaces: new Set([workspace]),
-    workspaceCount: 1,
-    agentCount: agents?.length ?? 0
-  };
-}
-
-;// CONCATENATED MODULE: ./src/agent-definition.js
-
-
-
-
-function unquote(value) {
-  const single = /^'(.*)'$/.exec(value);
-  if (single) return single[1].replace(/''/g, "'");
-  const double = /^"(.*)"$/.exec(value);
-  if (double) return double[1].replace(/\\(["\\])/g, "$1");
-  return value;
-}
-
-// An agent file's `description`, from its front matter on one line, and its instructions, the body after it. A
-// folder or code entry point carries neither, so that agent's text is left as Atlan has it. Only a regular file is
-// read: a symlink could point the instructions at anything on the runner.
-function agentDefinition(cwd, agentPath) {
-  if (!agentPath.endsWith(".md")) return {};
-  const file = external_node_path_namespaceObject.join(cwd, agentPath);
-  const stat = external_node_fs_namespaceObject.lstatSync(file, { throwIfNoEntry: false });
-  if (!stat?.isFile() || stat.size > MAX_SKILL_BYTES) return {};
-  const text = external_node_fs_namespaceObject.readFileSync(file, "utf8").replace(/\r\n?/g, "\n");
-  const head = /^---\n([\s\S]*?)\n---(?:\n|$)/.exec(text);
-  if (!head) return {};
-  const line = head[1].split("\n").find(entry => /^description\s*:/.test(entry));
-  const raw = line?.replace(/^description\s*:\s*/, "").trim() ?? "";
-  // A block scalar (`|` or `>`) spans lines this reader does not follow, so it is left alone rather than guessed.
-  const description = raw === "" || /^[|>]/.test(raw) ? undefined : unquote(raw);
-  const instructions = text.slice(head[0].length).trim();
-  return {
-    ...(description ? { description } : {}),
-    ...(instructions ? { instructions } : {})
+    workspaceCount: 1
   };
 }
 
@@ -37717,142 +38845,7 @@ function canonicalSkillName(raw) {
   return undefined;
 }
 
-;// CONCATENATED MODULE: ./src/preflight-agents.js
-
-
-// The repository identity aireg stamps on a skill it publishes from this checkout.
-function repositoryUri(repository) {
-  return `https://github.com/${repository}`.toLowerCase();
-}
-
-// This repository's Atlan skills at `folder`: another repository's skill at the same path is not one of them.
-// A skill published from a laptop has no lineage; as skill preflight adopts it, its name stands in when no
-// repository claims it.
-function ownSkills(remote, folder, repository) {
-  const uri = repositoryUri(repository);
-  const linked = remote.filter(skill => skill.sourceId === folder && skill.sourceUri?.toLowerCase().replace(/\.git$/, "") === uri);
-  if (linked.length > 0) return linked;
-  const name = folder.split("/").at(-1);
-  return remote.filter(skill => skill.name === name && !skill.repoId && !skill.sourceUri);
-}
-
-const notFound = error => error?.status === 404;
-
-async function agentInAtlan({ row, workspace, registryToken, registry }) {
-  const read = requestPath => registry({ token: registryToken, requestPath });
-  const found = await read(`/registry/v1/artifacts/agent/${encodeURIComponent(row.agent.id)}`);
-  if (found?.workspace_id !== workspace) return `${agentName(row.agent)} is in another workspace; list only agents in the workspace ${CONFIG_FILE} names`;
-  if (found.artifact_status === "archived") return `${agentName(row.agent)} is archived in Atlan; take it out of ${CONFIG_FILE}, or link a new agent`;
-  row.name = typeof found.name === "string" ? found.name : undefined;
-  row.unreleased = [];
-  row.labels = {};
-  for (const id of row.ids) {
-    const skill = await read(`/registry/v1/artifacts/skill/${encodeURIComponent(id)}`).catch(error => {
-      if (notFound(error)) return undefined;
-      throw error;
-    });
-    if (!skill || skill.artifact_status === "archived") return `${agentName(row.agent)}: skill ${id} is not in Atlan; correct the ID or take it out of the agent's \`skills\``;
-    if (skill.is_released === false) row.unreleased.push(id);
-    if (typeof skill.name === "string") row.labels[id] = skill.name;
-  }
-  const edges = await read(`/registry/v1/artifacts/agent/${encodeURIComponent(row.agent.id)}/relationships`);
-  row.current = (Array.isArray(edges?.items) ? edges.items : [])
-    .filter(edge => edge?.rel_type === "uses_skill" && edge.relationship_status === "active" && typeof edge.to?.id === "string")
-    .map(edge => edge.to.id);
-  return undefined;
-}
-
-// Each agent's skills resolved against a tree: its path must be there, and each skill entry a skill folder the
-// config publishes or a skill ID. Local only, so a pull request that changes only skills can afford it.
-function resolveAgents({ agents, tree, globs }) {
-  const files = [...tree];
-  const folders = skillFolders(files, globs);
-  const rows = [];
-  for (const agent of agents) {
-    if (!files.some(file => file === agent.path || file.startsWith(`${agent.path}/`))) {
-      return { error: `${agentName(agent)} is not in this pull request's files; update its \`path\` in ${CONFIG_FILE}` };
-    }
-    try {
-      rows.push({ agent, ...agentSkills(agent, folders) });
-    } catch (error) {
-      return { error: error instanceof Error ? error.message : `${agentName(agent)} lists skills that cannot be resolved` };
-    }
-  }
-  return { rows };
-}
-
-// The skill folders an agent loses or gains between base and head, as a skill-only pull request can do through a
-// glob: merging changes its pins either way.
-function pinChanges(rows, baseRows) {
-  for (const row of rows) {
-    const before = baseRows.find(item => item.agent.id === row.agent.id)?.folders ?? [];
-    row.lost = before.filter(folder => !row.folders.includes(folder));
-    row.gained = row.folders.filter(folder => !before.includes(folder));
-  }
-  return rows;
-}
-
-// For a pull request that changes an agent: each must be in the config's one workspace, and what merging pins
-// is shown against what Atlan pins now, since the repository's list replaces it. An agent Atlan has no record
-// of fails; a Registry that cannot answer leaves the rows not compared.
-async function compareAgents({ rows, workspace, repository, registryToken, registry, inventory }) {
-  if (!registryToken) return { compared: false };
-  try {
-    const remote = (await inventory()) ?? [];
-    const named = id => remote.find(skill => skill.id === id)?.name;
-    for (const row of rows) {
-      const missing = await agentInAtlan({ row, workspace, registryToken, registry }).catch(error => {
-        if (notFound(error)) return `${agentName(row.agent)} is not in Atlan; link it with the atlan-link-agent skill, or correct its \`id\``;
-        throw error;
-      });
-      if (missing) return { compared: false, error: missing };
-      if (row.agent.skills.length === 0) continue;
-      const desired = new Set(row.ids);
-      row.added = row.ids.filter(id => !row.current.includes(id));
-      for (const folder of row.folders) {
-        const [skill] = ownSkills(remote, folder, repository);
-        if (skill) desired.add(skill.id);
-        if (skill?.released === false) row.unreleased.push(folder);
-        if (!skill || !row.current.includes(skill.id)) row.added.push(folder);
-      }
-      row.removed = row.current.filter(id => !desired.has(id));
-      for (const id of row.removed) row.labels[id] ??= named(id);
-    }
-    return { compared: true };
-  } catch {
-    return { compared: false };
-  }
-}
-
-const code = value => `\`${String(value).replaceAll("`", "'")}\``;
-// A skill ID reads as its name when Atlan gave one.
-const skillLabel = (row, skill) => row.labels?.[skill] ? `${code(row.labels[skill])} (${skill})` : code(skill);
-
-// One row per agent: how many skills it pins after merge, and what changes in Atlan.
-function agentLines(agents) {
-  if (!agents?.rows?.length) return [];
-  const change = row => {
-    if (row.agent.skills.length === 0) return "Skills not managed by this repository";
-    const parts = [
-      ...(row.lost ?? []).map(skill => `− ${code(skill)} (removed in this pull request; merging unpins it)`),
-      ...(row.gained ?? []).map(skill => `+ ${code(skill)} (added in this pull request; merging pins it)`),
-      ...(row.added ?? []).map(skill => `+ ${skillLabel(row, skill)}`),
-      ...(row.removed ?? []).map(skill => `− ${skillLabel(row, skill)} (pinned in Atlan only; merging removes it)`),
-      // Not a failure here: this pull request may be what releases it.
-      ...(row.unreleased ?? []).map(skill => `⚠️ ${skillLabel(row, skill)} has no release in Atlan yet; merging cannot pin it until it has one`)
-    ];
-    if (parts.length > 0) return parts.join("<br>");
-    return agents.changed && !agents.compared ? "Not compared with Atlan" : "No change";
-  };
-  return [
-    "| Agent | Skills after merge | Change in Atlan |",
-    "| --- | --- | --- |",
-    ...agents.rows.map(row => `| ${row.name ? `${code(row.name)} (${code(row.agent.path)})` : code(row.agent.path)} | ${row.agent.skills.length === 0 ? "—" : row.ids.length + row.folders.length} | ${change(row)} |`)
-  ];
-}
-
 ;// CONCATENATED MODULE: ./src/preflight.js
-
 
 
 
@@ -37979,8 +38972,11 @@ function parseSkillSyncConfig(raw, source = "base") {
 function classifySkillFile(filename, config) {
   if (!config?.valid || typeof filename !== "string") return { kind: "unknown" };
   if (config.folders) {
-    const directory = [...config.folders].filter(folder => filename.startsWith(`${folder}/`))
-      .reduce((deepest, folder) => (folder.length > (deepest?.length ?? 0) ? folder : deepest), undefined);
+    // The folders hold no nesting, so at most one ancestor of the file is a skill folder.
+    let directory;
+    for (let end = filename.indexOf("/"); end > 0 && !directory; end = filename.indexOf("/", end + 1)) {
+      if (config.folders.has(filename.slice(0, end))) directory = filename.slice(0, end);
+    }
     if (!directory) return { kind: "outside" };
     const manifest = `${directory}/SKILL.md`;
     return { kind: "eligible", skill: directory.split("/").at(-1), directory, manifest, definition: filename === manifest };
@@ -38098,6 +39094,10 @@ function pathForComment(filename) {
   return typeof filename === "string" && SAFE_PATH.test(filename) ? filename : "untrusted path omitted";
 }
 
+function pathForPrompt(filename) {
+  return typeof filename === "string" && SAFE_PATH.test(filename) && PROMPT_PATH.test(filename) ? filename : "untrusted path omitted";
+}
+
 function fileStatus(status) {
   return ["added", "modified", "removed", "renamed"].includes(status) ? status : "changed";
 }
@@ -38110,7 +39110,7 @@ function withRequestBudget(request) {
     remaining -= 1;
     return request(options);
   };
-  // Validation reads every changed SKILL.md, so the pull request bounds it, not this count.
+  // Validation reads every changed SKILL.md, so MAX_VALIDATED_SKILLS bounds it, not this count.
   budgeted.unbudgeted = request;
   return budgeted;
 }
@@ -38157,21 +39157,6 @@ async function readRepositoryFile({ token, context, request, filename, ref, maxB
   return decodeBase64Content(response, maxBytes);
 }
 
-// The repository's CONFIG_FILE at `ref`: undefined when that commit has none, else its settings or why they are invalid.
-async function readSyncConfig({ token, context, request, ref, environment, source }) {
-  let text;
-  try {
-    text = await readRepositoryFile({ token, context, request, filename: CONFIG_FILE, ref, maxBytes: MAX_CONFIG_BYTES });
-  } catch (error) {
-    return error?.status === 404 ? undefined : { error: `The ${source} ${CONFIG_FILE} could not be read` };
-  }
-  try {
-    return { inputs: parseRegistryInputs(environment, text) };
-  } catch (error) {
-    return { error: `In the ${source} commit, ${error instanceof Error ? error.message : "the config is invalid"}` };
-  }
-}
-
 async function readRepositoryTree({ token, context, request, ref = context.headSha }) {
   const response = await request({
     token,
@@ -38183,7 +39168,8 @@ async function readRepositoryTree({ token, context, request, ref = context.headS
     throw new Error("GitHub repository tree is incomplete");
   }
   return new Map(response.tree
-    .filter(entry => entry?.type === "blob" && typeof entry.path === "string")
+    // Submodules are kept so a skill folder holding one is rejected, not silently missing an entry.
+    .filter(entry => (entry?.type === "blob" || entry?.type === "commit") && typeof entry.path === "string")
     .map(entry => [entry.path, {
       path: entry.path,
       sha: entry.sha,
@@ -38202,6 +39188,19 @@ async function readRepositoryBlob({ token, context, request, sha, maxBytes }) {
     maxResponseBytes: Math.ceil(maxBytes * 4 / 3) + 4096
   });
   return decodeBase64Bytes(response, maxBytes);
+}
+
+// Where the pull request branched from its base, so a skill the base branch changed since is not counted as the PR's.
+async function forkPointTree({ token, context, request }) {
+  const compared = await request({
+    token,
+    method: "GET",
+    requestPath: `/repos/${encodeURIComponent(context.owner)}/${encodeURIComponent(context.repo)}/compare/${context.baseSha}...${context.headSha}?per_page=1`,
+    expectedStatus: 200
+  });
+  const sha = compared?.merge_base_commit?.sha;
+  if (typeof sha !== "string" || !/^[a-f0-9]{40}$/i.test(sha)) throw new Error("GitHub did not return the pull request's merge base");
+  return readRepositoryTree({ token, context, request, ref: sha });
 }
 
 function definitionBatches(files, tree) {
@@ -38251,8 +39250,9 @@ async function readDefinitions({ token, context, request, files, tree }) {
   return read;
 }
 
-// The skills a pull request changes, from its two trees, however many files it touches. Past GitHub's file-list
-// pages this is the whole answer; it has no line counts or rename pairs, which only the file list carries.
+// The skills a pull request changes, from the tree it branched from and its head, however many files it touches.
+// Past GitHub's file-list pages this is the whole answer; it has no line counts or rename pairs, which only the
+// file list carries.
 function treeChanges(baseTree, headTree, config) {
   const affected = new Map();
   for (const file of new Set([...baseTree.keys(), ...headTree.keys()])) {
@@ -38271,6 +39271,11 @@ function treeChanges(baseTree, headTree, config) {
     ...entry,
     status: !baseTree.has(entry.filename) ? "added" : !headTree.has(entry.filename) ? "removed" : "modified"
   }));
+}
+
+// Symbolic links and submodules, the entries a skill bundle must not hold.
+function linkedPaths(tree) {
+  return [...tree.values()].filter(entry => entry.mode === "120000" || entry.mode === "160000").map(entry => entry.path);
 }
 
 function entriesForSkill(tree, directory) {
@@ -38350,8 +39355,7 @@ function validateRemoteSkill(item, workspace) {
   }
   return {
     id: item.id, name: item.name, workspaceId: workspace, sourceDigest: item.source_digest,
-    sourceId: remoteSourcePath(item), repoId: item.repo_id, versionOrdinal: item.version_ordinal,
-    sourceUri: typeof item.source_uri === "string" ? item.source_uri : undefined, released: item.is_released !== false
+    sourceId: remoteSourcePath(item), repoId: item.repo_id, versionOrdinal: item.version_ordinal
   };
 }
 
@@ -38504,14 +39508,7 @@ function eligibleChanges(files, config) {
   return { eligible, excluded };
 }
 
-async function buildPreflightReport({ token, context, request, registryToken, registry = registryRequest, inputs, environment }) {
-  const fromInput = Boolean(inputs);
-  // Without the artifacts input, the base commit's CONFIG_FILE says what is checked; a pull request cannot change it.
-  const baseConfig = !fromInput && environment && context.baseSha
-    ? await readSyncConfig({ token, context, request, ref: context.baseSha, environment, source: "base" })
-    : undefined;
-  if (baseConfig?.inputs) inputs = baseConfig.inputs;
-  let configError = baseConfig?.error;
+async function buildPreflightReport({ token, context, request, registryToken, registry = registryRequest, inputs }) {
   let fileResult;
   try {
     fileResult = await listPullRequestFiles({ token, context, request });
@@ -38521,15 +39518,11 @@ async function buildPreflightReport({ token, context, request, registryToken, re
     fileResult = { files: [], limited: true };
   }
 
-  const touches = name => fileResult.files.some(file => file.filename === name || file.previousFilename === name);
-  const syncFile = !fromInput && (baseConfig !== undefined || touches(CONFIG_FILE));
   let config;
   let baseTree;
   let treeFiles;
   if (!context.baseSha || !context.headSha) {
     config = { valid: false, reason: "GitHub did not provide both pull request commit IDs" };
-  } else if (configError) {
-    config = { valid: false, reason: configError };
   } else if (inputs) {
     // Globs reach any depth, so the skill folders come from the trees, not from a path's shape.
     try {
@@ -38540,15 +39533,9 @@ async function buildPreflightReport({ token, context, request, registryToken, re
       baseTree = base;
       treeFiles = head;
       config = preflightConfig(inputs, [...base.keys(), ...head.keys()]);
-      if (fromInput && base.has(CONFIG_FILE)) {
-        configError = `${CONFIG_FILE} names the workspace and skills, so leave the workspace and artifacts inputs unset`;
-        config = { valid: false, reason: configError };
-      }
     } catch {
       config = { valid: false, reason: "GitHub could not provide the pull request's file trees" };
     }
-  } else if (syncFile) {
-    config = { valid: false, reason: `${CONFIG_FILE} is new in this pull request` };
   } else {
     try {
       config = parseSkillSyncConfig(await readRepositoryFile({ token, context, request, filename: ".atlan/package.json", ref: context.baseSha, maxBytes: MAX_CONFIG_BYTES }));
@@ -38557,35 +39544,26 @@ async function buildPreflightReport({ token, context, request, registryToken, re
     }
   }
 
-  const configChanged = !fromInput && touches(syncFile ? CONFIG_FILE : ".atlan/package.json");
+  const configChanged = !inputs && fileResult.files.some(file => file.filename === ".atlan/package.json" ||
+    file.previousFilename === ".atlan/package.json");
   let proposedConfig;
-  let proposedInputs;
-  if (configChanged && context.headSha && syncFile) {
-    const proposed = await readSyncConfig({ token, context, request, ref: context.headSha, environment, source: "proposed" });
-    proposedInputs = proposed?.inputs;
-    proposedConfig = proposed?.inputs
-      ? preflightConfig(proposed.inputs, [])
-      : { valid: false, reason: proposed?.error ?? `This pull request removes ${CONFIG_FILE}, which names the workspace and skills` };
-    if (!proposedConfig.valid) configError ??= proposedConfig.reason;
-  } else if (configChanged && context.headSha) {
+  if (configChanged && context.headSha) {
     try {
       proposedConfig = parseSkillSyncConfig(await readRepositoryFile({ token, context, request, filename: ".atlan/package.json", ref: context.headSha, maxBytes: MAX_CONFIG_BYTES }), "proposed");
     } catch {
       proposedConfig = { valid: false, reason: "the proposed .atlan/package.json could not be read" };
     }
   }
-  // A widened config covers skills the base does not. They are checked here too, so the pull request that widens it
-  // cannot merge a skill Atlan would refuse; what they are compared with still comes from the base.
-  if (syncFile && config.valid && proposedConfig?.valid && treeFiles) {
-    const widened = skillFolders([...treeFiles.keys()], proposedConfig.paths);
-    config = { ...config, folders: new Set([...config.folders, ...widened]) };
-  }
 
   let changes = eligibleChanges(fileResult.files, config);
   let limited = fileResult.limited;
   if (limited && baseTree && treeFiles && config.valid) {
-    changes = { eligible: treeChanges(baseTree, treeFiles, config), excluded: 0 };
-    limited = false;
+    try {
+      changes = { eligible: treeChanges(await forkPointTree({ token, context, request }), treeFiles, config), excluded: 0 };
+      limited = false;
+    } catch {
+      // Left limited: validation below fails the check rather than pass skills it cannot name.
+    }
   }
   const supportingOnly = changes.eligible.filter(file => !file.definitionChanged);
   let supportingAnalysisUnavailable = false;
@@ -38596,49 +39574,26 @@ async function buildPreflightReport({ token, context, request, registryToken, re
       supportingAnalysisUnavailable = supportingOnly.length > 0;
     }
   }
-  const proposedSkillCount = !proposedConfig?.valid || !treeFiles ? undefined
-    : syncFile ? skillFolders([...treeFiles.keys()], proposedConfig.paths).length
-      : declaredSkillCount(treeFiles.keys(), proposedConfig);
+  const proposedSkillCount = proposedConfig?.valid && treeFiles
+    ? declaredSkillCount(treeFiles.keys(), proposedConfig)
+    : undefined;
   const eligible = changes.eligible.filter(file => file.definitionChanged || treeFiles?.has(file.filename));
   const supporting = eligible.reduce((count, file) => count + file.supportingChanges, 0);
   // The Registry's front-matter contract, checked before merge. Independent of the Registry comparison: it needs
   // no token, and a skill that will be answered with HTTP 422 on publish is worth saying whatever else is known.
   // Validation is the gate before publishing: every changed skill is checked, and one that cannot be read makes the
   // run unchecked rather than passing it.
-  // Agents depend on skills, not the reverse. Every pull request re-resolves each agent's skills against its tree,
-  // locally, so deleting a skill an agent uses fails here rather than halfway through a publish. One that changes an
-  // agent also checks every skill that agent lists, then the agent itself in Atlan.
-  const agentConfig = syncFile && !configError ? proposedInputs ?? baseConfig?.inputs : undefined;
-  const agentsChanged = Boolean(proposedInputs) &&
-    JSON.stringify(proposedInputs.agents) !== JSON.stringify(baseConfig?.inputs?.agents ?? []);
-  let agents;
-  const dependent = [];
-  if (agentConfig?.agents.length > 0 && treeFiles) {
-    const resolved = resolveAgents({ agents: agentConfig.agents, tree: treeFiles.keys(), globs: agentConfig.artifacts.skill });
-    if (resolved.error) {
-      configError = resolved.error;
-    } else if (agentsChanged) {
-      agents = { rows: resolved.rows, changed: true };
-      const listed = new Set(eligible.map(file => file.directory));
-      for (const folder of new Set(resolved.rows.flatMap(row => row.folders))) {
-        if (listed.has(folder)) continue;
-        dependent.push({
-          filename: `${folder}/SKILL.md`, directory: folder, skill: folder.split("/").at(-1), status: "modified",
-          additions: 0, deletions: 0, definitionChanged: true, supportingChanges: 0
-        });
-      }
-    } else if (baseTree && baseConfig?.inputs) {
-      const before = resolveAgents({ agents: baseConfig.inputs.agents, tree: baseTree.keys(), globs: baseConfig.inputs.artifacts.skill });
-      const affected = before.error ? [] : pinChanges(resolved.rows, before.rows).filter(row => row.lost.length + row.gained.length > 0);
-      if (affected.length > 0) agents = { rows: affected, changed: false };
-    }
-  }
   const rejections = [];
-  const present = [...eligible.filter(file => file.status !== "removed"), ...dependent];
-  let unchecked = !configError && inputs && !config.valid ? config.reason : undefined;
+  const present = eligible.filter(file => file.status !== "removed");
+  let unchecked = inputs && !config.valid ? config.reason
+    : inputs && limited ? "GitHub could not say which skills this pull request changes" : undefined;
+  if (!unchecked && present.length > MAX_VALIDATED_SKILLS) {
+    unchecked = `This pull request changes ${present.length} skills, more than the ${MAX_VALIDATED_SKILLS} preflight validates; split it into smaller pull requests`;
+  }
   if (!unchecked && present.length > 0) {
     try {
       if (!context.headSha) throw new Error("GitHub did not provide the pull request's head commit");
+      const links = treeFiles ? linkedPaths(treeFiles) : [];
       const definitions = await readDefinitions({
         token, context, request: request.unbudgeted ?? request, files: present.map(file => file.filename), tree: treeFiles
       });
@@ -38647,9 +39602,10 @@ async function buildPreflightReport({ token, context, request, registryToken, re
         const problems = content === null
           ? [{ problem: `\`SKILL.md\` is over ${MAX_SKILL_BYTES / 1024 / 1024} MiB`, fix: "move reference material into files beside SKILL.md and link to them" }]
           : skillRejections(content);
+        if (links.some(link => link.startsWith(`${file.directory}/`))) {
+          problems.push({ problem: "the skill folder contains a symbolic link or submodule", fix: "replace it with a regular file" });
+        }
         if (problems.length > 0) rejections.push({ file, problems });
-        // A skill an agent lists that this pull request did not change is shown only when Atlan would refuse it.
-        if (problems.length > 0 && dependent.includes(file)) eligible.push(file);
       }
     } catch (error) {
       unchecked = error instanceof Error ? error.message : "the changed SKILL.md files could not be read";
@@ -38667,7 +39623,7 @@ async function buildPreflightReport({ token, context, request, registryToken, re
       registryState.reason = undefined;
     } else if (context.baseSha && context.headSha) {
       try {
-        const baseTree = await readRepositoryTree({ token, context, request, ref: context.baseSha });
+        const comparedBase = baseTree || await readRepositoryTree({ token, context, request, ref: context.baseSha });
         const headTree = treeFiles || await readRepositoryTree({ token, context, request, ref: context.headSha });
         const readBlob = boundedBlobReader({ token, context, request });
         const inventory = await loadRegistryInventory({
@@ -38678,7 +39634,7 @@ async function buildPreflightReport({ token, context, request, registryToken, re
         });
         for (const file of eligible.slice(0, MAX_ANALYZED_SKILLS)) {
           try {
-            const base = file.status === "added" ? undefined : await digestTreeSkill(baseTree, file.directory, readBlob);
+            const base = file.status === "added" ? undefined : await digestTreeSkill(comparedBase, file.directory, readBlob);
             const head = file.status === "removed" ? undefined : await digestTreeSkill(headTree, file.directory, readBlob);
             if ((!base && file.status !== "added") || (!head && file.status !== "removed")) {
               throw new Error("GitHub did not provide a complete skill bundle");
@@ -38709,27 +39665,11 @@ async function buildPreflightReport({ token, context, request, registryToken, re
       }
     }
   }
-  // An agent's skills are compared with Atlan only under a base config: the pull request that adds the config would
-  // otherwise choose what the token reads.
-  if (agents?.changed && !configError) {
-    const workspace = baseConfig?.inputs?.workspace;
-    const result = await compareAgents({
-      rows: agents.rows, workspace, repository: context.repository, registryToken: workspace ? registryToken : "", registry,
-      inventory: async () => (await loadRegistryInventory({ token: registryToken, request: registry, context, workspaces: [workspace] }))
-        .byWorkspace.get(workspace)
-    });
-    agents.compared = result.compared;
-    if (result.error) configError = result.error;
-  }
   const conflictCount = registryState.comparisons.reduce((count, comparison) =>
     count + comparison.results.filter(result => result.status === "conflict").length, 0);
   return {
     context,
     available: true,
-    configured: Boolean(inputs),
-    configError,
-    agents,
-    setup: syncFile && !baseConfig && !configError,
     config,
     configChanged,
     proposedConfig,
@@ -38818,7 +39758,7 @@ function notComparedSkills(report) {
 // useful report instead of being told to check a token it deliberately does not have.
 function unconfiguredFinding(file) {
   if (file.status === "added") return { status: "🆕 Added", reason: "Publishing will create it in Atlan" };
-  if (file.status === "removed") return { status: "🗑️ Removed", reason: "Publishing keeps it unless `prune` is enabled" };
+  if (file.status === "removed") return { status: "🗑️ Removed", reason: "Publishing leaves it in Atlan" };
   return { status: "🔄 Changed", reason: "Publishing will add a version in Atlan" };
 }
 
@@ -38836,16 +39776,13 @@ function commentState(report) {
 
 function configurationDifference(report) {
   if (!report.configChanged || !report.config?.valid || !report.proposedConfig?.valid) return [];
-  // Only what changed: an unchanged row reads as a change. A changed agent shows in the Agents table instead.
   const destinationsChanged = !sameSet(report.config.workspaces, report.proposedConfig.workspaces);
-  const [folders, proposedFolders] = [describePaths(report.config), describePaths(report.proposedConfig)];
-  const [agents, proposedAgents] = [report.config.agentCount ?? 0, report.proposedConfig.agentCount ?? 0];
-  const rows = [
-    ...(folders === proposedFolders ? [] : [`| Skill folders | ${folders} | ${proposedFolders} |`]),
-    ...(destinationsChanged ? [`| Destination workspaces | ${report.config.workspaceCount} | ${report.proposedConfig.workspaceCount} (changed) |`] : []),
-    ...(agents === proposedAgents ? [] : [`| Agents | ${agents} | ${proposedAgents} |`])
+  return [
+    "| Setting | Before | After merge |",
+    "| --- | --- | --- |",
+    `| Skill folders | ${describePaths(report.config)} | ${describePaths(report.proposedConfig)} |`,
+    `| Destination workspaces | ${report.config.workspaceCount} | ${report.proposedConfig.workspaceCount}${destinationsChanged ? " (changed)" : ""} |`
   ];
-  return rows.length === 0 ? [] : ["| Setting | Before | After merge |", "| --- | --- | --- |", ...rows];
 }
 
 function conflictRows(report) {
@@ -38859,8 +39796,8 @@ function buildResolutionPrompt(report) {
   const rejections = report.rejections || [];
   if (rows.length === 0 && rejections.length === 0) return "";
   const context = report.context || {};
-  const branch = context.headRef || "the existing pull-request branch";
-  const repository = context.headRepository || context.repository || "this repository";
+  const branch = (!context.crossRepository && context.headRef) || "the existing pull-request branch";
+  const repository = context.repository || "this repository";
   const pullRequestUrl = context.repository && context.pullNumber
     ? `https://github.com/${context.repository}/pull/${context.pullNumber}`
     : "the current pull request";
@@ -38876,9 +39813,9 @@ function buildResolutionPrompt(report) {
     "Stay on the existing branch. Do not create another branch or pull request."
   ];
   const rejectionEntries = rejections.flatMap(rejection => rejection.problems.map(({ problem, fix }) =>
-    `- ${pathForComment(rejection.file.filename)}: ${problem}; fix: ${fix}`));
+    `- ${pathForPrompt(rejection.file.filename)}: ${problem}; fix: ${fix}`));
   const conflictEntries = rows.slice(0, MAX_ANALYZED_SKILLS)
-    .map(({ comparison, result }) => `- ${pathForComment(comparison.file.filename)} in ${result.workspace}`);
+    .map(({ comparison, result }) => `- ${pathForPrompt(comparison.file.filename)} in ${result.workspace}`);
   const suffix = [
     "",
     "Open the pull-request link above and inspect the relevant changes before editing."
@@ -38935,17 +39872,18 @@ function codexHandoffUrl(prompt) {
   return `${CODEX_DEEPLINK_URL}?prompt=${encodeURIComponent(prompt)}`;
 }
 
+// Handoffs name only the base repository: a fork's branch would put its agent instructions in control.
 function claudeHandoffUrl(report, prompt) {
-  const repository = report.context?.headRepository || report.context?.repository;
+  const repository = report.context?.repository;
   return `${CLAUDE_CODE_HANDOFF_URL}?repo=${encodeURIComponent(repository || "")}&q=${encodeURIComponent(prompt)}`;
 }
 
 function claudeWebHandoffUrl(report, prompt) {
   const context = report.context || {};
-  const repository = context.headRepository || context.repository;
+  const repository = context.repository;
   const query = new URLSearchParams({ q: prompt });
   if (repository) query.set("repo", repository);
-  if (repository && context.headRef) query.set("branch", context.headRef);
+  if (repository && context.headRef && !context.crossRepository) query.set("branch", context.headRef);
   return `${CLAUDE_WEB_HANDOFF_URL}?${query}`;
 }
 
@@ -38961,9 +39899,7 @@ function formatPreflightComment(report, compact = false) {
   const notCompared = state === "unavailable" || state === "unconfigured"
     ? []
     : notComparedSkills(report).filter(file => !rejectionFor(report, file));
-  const verdict = report.configError ? `⛔ Fix \`${CONFIG_FILE}\``
-    : report.setup ? `✅ \`${CONFIG_FILE}\` is ready`
-    : rejected.length > 0
+  const verdict = rejected.length > 0
     ? `⛔ ${plural(rejected.length, "skill")} will be rejected by the Registry`
     : report.unchecked ? "⛔ Preflight could not check this pull request"
     : state === "conflict"
@@ -38973,16 +39909,14 @@ function formatPreflightComment(report, compact = false) {
           : state === "partial" && notCompared.length > 0 ? `ℹ️ ${plural(notCompared.length, "skill")} not compared` : "✅ Ready to merge";
   const eligible = report.eligible || [];
   const workspaceCount = report.config?.valid ? report.config.workspaceCount : 0;
-  const resolutionPrompt = state === "conflict" || rejected.length > 0 ? buildResolutionPrompt(report) : "";
+  // A fork pull request gets no handoff: its author, not the reviewer, controls the branch an agent would open.
+  const resolutionPrompt = (state === "conflict" || rejected.length > 0) && !report.context?.crossRepository
+    ? buildResolutionPrompt(report)
+    : "";
   const resolutionActions = resolutionPrompt
     ? `${actionBadge({ href: codexHandoffUrl(resolutionPrompt), light: CODEX_BADGE_URL, dark: CODEX_BADGE_DARK_URL, alt: "Fix in Codex" })} ${actionBadge({ href: claudeHandoffUrl(report, resolutionPrompt), light: CLAUDE_BADGE_URL, dark: CLAUDE_BADGE_DARK_URL, alt: "Fix in Claude Code" })} **[Fix in Claude.ai](${claudeWebHandoffUrl(report, resolutionPrompt)})**`
     : "";
   const lines = [PREFLIGHT_MARKER, `### ${verdict}`, ""];
-  if (report.configError) {
-    lines.push(`${tableCell(report.configError)}. The check fails until the config is fixed.`, "");
-  } else if (report.setup) {
-    lines.push(`Registry Sync checks and publishes the skills it lists once this merges${Number.isSafeInteger(report.proposedSkillCount) ? `: ${plural(report.proposedSkillCount, "skill")} today` : ""}.`, "");
-  }
   if (report.unchecked) {
     lines.push(`${tableCell(report.unchecked)}, so the check fails rather than let unchecked skills merge. Rerun it; if it fails again, check the workflow's access to this repository.`, "");
   }
@@ -38990,9 +39924,7 @@ function formatPreflightComment(report, compact = false) {
     lines.push("No Atlan API key is available in `ATLANAI_TOKEN`, so this pull request was not compared with Atlan and conflicts were not checked. Expose the existing secret as `ATLANAI_TOKEN` on the Registry Sync step to enable it.", "");
   }
 
-  const agentTable = report.configError ? [] : agentLines(report.agents);
-  // A config error is the whole story, and a pull request that changes only agents is told by their table.
-  if (state !== "unavailable" && report.config?.valid && !report.configError && (eligible.length > 0 || agentTable.length === 0)) {
+  if (state !== "unavailable" && report.config?.valid) {
     const summary = report.limited
       ? `${plural(report.changedFiles || 0, "file")} changed; skill count unavailable across ${plural(workspaceCount, "workspace")}.`
       : `${plural(eligible.length, "skill")} changed across ${plural(workspaceCount, "workspace")}.`;
@@ -39074,9 +40006,7 @@ function formatPreflightComment(report, compact = false) {
     );
   }
 
-  if (agentTable.length > 0) lines.push("#### Agents", "", ...agentTable, "");
-
-  if (state === "unavailable" && !report.unchecked && !report.configError && !report.setup) {
+  if (state === "unavailable" && !report.unchecked) {
     lines.push("We couldn't compare this PR with Atlan. Check the Registry token or workflow configuration, then retry.");
   } else if (state !== "conflict") {
     const tail = [];
@@ -39138,15 +40068,13 @@ async function runPreflight({ environment = process.env, request = githubRequest
     request: budgetedRequest,
     registryToken,
     registry,
-    inputs,
-    environment
+    inputs
   });
   report.failOnConflict = failOnConflict;
-  // A pull request that touches no listed folder and not the config gets no comment, unless an earlier run already
-  // left one. A run that could not read the trees says so rather than passing quietly.
-  const untouched = Boolean(report.configured) && report.available && report.config?.valid && report.eligible.length === 0 &&
-    !report.configChanged && !report.configError && !existing;
-  if (report.configured && !report.config?.valid) {
+  // A pull request that touches no listed folder gets no comment, unless an earlier run already left one.
+  // A run that could not read the trees says so rather than passing quietly.
+  const untouched = Boolean(inputs) && report.available && report.config?.valid && report.eligible.length === 0 && !existing;
+  if (inputs && !report.config?.valid) {
     process.stdout.write(`::warning title=Atlan Agent Registry preflight::${report.config?.reason || "the pull request could not be checked"}\n`);
   }
   if (commenting && !untouched) {
@@ -39167,7 +40095,6 @@ async function runPreflight({ environment = process.env, request = githubRequest
   if (shouldBlockConflicts(report.conflictCount, failOnConflict)) {
     throw new Error(`${plural(report.conflictCount, "Registry conflict")} must be resolved before this check can pass`);
   }
-  if (report.configError) throw new Error(report.configError);
   // Atlan would refuse these on main, so the pull request stops first.
   if (report.rejections?.length > 0) {
     throw new Error(`${plural(report.rejections.length, "skill")} the Registry would reject must be fixed before this check can pass`);
@@ -39175,674 +40102,189 @@ async function runPreflight({ environment = process.env, request = githubRequest
   if (report.unchecked) throw new Error(`preflight could not check every changed skill: ${report.unchecked}`);
 }
 
-;// CONCATENATED MODULE: ./src/publish-agents.js
+;// CONCATENATED MODULE: ./src/base-checkout.js
 
 
 
 
 
-// A repository skill folder as its Atlan skill: this repository's, at that path, and only one of them.
-function ownSkill(remote, folder, repository, agent) {
-  const found = ownSkills(remote, folder, repository);
-  if (found.length > 1) throw new Error(`${agentName(agent)}: \`${folder}\` is more than one skill in Atlan, so it cannot be pinned`);
-  if (found.length === 0) throw new Error(`${agentName(agent)}: \`${folder}\` is not in Atlan yet, so it cannot be pinned`);
-  return found[0];
+
+
+
+
+const FETCH_ENVIRONMENT_KEYS = [
+  "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "all_proxy", "no_proxy",
+  "SSL_CERT_FILE", "SSL_CERT_DIR"
+];
+const REPOSITORY = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/;
+const GIT_TIMEOUT_MS = 120_000;
+
+// Ignore runner Git configuration and hooks so checkout cannot execute repository-controlled helpers.
+function runGit(args, { cwd, env = {} }) {
+  return (0,external_node_child_process_namespaceObject.spawnSync)("git", ["-c", "core.hooksPath=/dev/null", ...args], {
+    cwd,
+    encoding: "utf8",
+    env: { ...GIT_ENVIRONMENT, GIT_TERMINAL_PROMPT: "0", GIT_LFS_SKIP_SMUDGE: "1", ...env },
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: GIT_TIMEOUT_MS,
+    maxBuffer: 1024 * 1024
+  });
 }
 
-const versionKey = value => String(value ?? "").replace(/^ver_/, "");
-
-const itemsOf = page => (Array.isArray(page?.items) ? page.items : []);
-const SETTLE_MS = 30_000;
-const POLL_MS = 2_000;
-const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
-
-// The version of a skill's current release, pinned by number. Atlan cuts a release with its version but marks it
-// released a moment later, and resolves an unversioned pin later still, so a release still settling is waited for,
-// up to the run's shared deadline. A newest version with no release (one awaiting review) is not waited for. A skill
-// with no current release cannot be pinned, and the gateway refuses it without saying which, so it is named here.
-async function currentRelease(skill, label, agent, read, settle) {
-  const id = encodeURIComponent(skill.id);
-  for (;;) {
-    const releases = itemsOf(await read(`/registry/v1/artifacts/skill/${id}/releases`)).filter(release => release?.channel === "latest");
-    const versions = itemsOf(await read(`/registry/v1/artifacts/skill/${id}/versions?limit=100`));
-    const current = releases.find(release => release.is_current === true && release.release_status === "released");
-    const newest = versions.reduce((top, version) => (version?.version_ordinal > (top?.version_ordinal ?? 0) ? version : top), undefined);
-    const pending = newest && releases.find(release => versionKey(release.version_id) === versionKey(newest.version_id) &&
-      release !== current && !["superseded", "withdrawn"].includes(release.release_status));
-    if (pending && settle.now() < settle.deadline) {
-      await settle.wait(POLL_MS);
-      continue;
-    }
-    if (!current) throw new Error(`${agentName(agent)}: \`${label}\` has no release in Atlan yet, so it cannot be pinned`);
-    const ordinal = versions.find(version => versionKey(version?.version_id) === versionKey(current.version_id))?.version_ordinal;
-    return { skill_id: skill.id, ...(Number.isSafeInteger(ordinal) ? { version_ordinal: ordinal } : {}) };
-  }
-}
-
-// A skill this run did not publish has a settled release, so the gateway pins its current one. It refuses a skill
-// with none without saying which; the workspace listing marks one, and its releases confirm it before it is named.
-async function settledRelease(skill, label, agent, read) {
-  if (skill.released === false) {
-    const releases = itemsOf(await read(`/registry/v1/artifacts/skill/${encodeURIComponent(skill.id)}/releases`));
-    if (!releases.some(release => release?.channel === "latest" && release.is_current === true && release.release_status === "released")) {
-      throw new Error(`${agentName(agent)}: \`${label}\` has no release in Atlan yet, so it cannot be pinned`);
-    }
-  }
-  return { skill_id: skill.id };
-}
-
-function answer(raw, agent) {
-  let parsed;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    throw new Error(`${agentName(agent)}: aireg returned an unreadable answer`);
-  }
-  const body = parsed?.data?.body;
-  if (parsed?.ok !== true || !body || typeof body !== "object") throw new Error(`${agentName(agent)}: aireg returned an unreadable answer`);
-  return body;
-}
-
-// After the skills publish, each agent with skills is pinned to exactly what the config lists, the repository
-// being the source of truth, each skill at its current release. The gateway keeps the agent's version when
-// nothing moved, so sending the whole list every run is safe. An agent with no skills listed keeps its pins,
-// since an empty list would archive every skill link it has. An agent defined by a Markdown file also gets that
-// file's description and instructions, sent only when they differ. CI never creates an agent or touches its key.
-async function syncAgents({ agents, folders, cwd, token, workspace, repository, registry, alias, aireg, fresh = [], now = Date.now, wait = pause }) {
-  const definitions = new Map(agents.map(agent => [agent.id, cwd ? agentDefinition(cwd, agent.path) : {}]));
-  const managed = agents.filter(agent => agent.skills.length > 0 || Object.keys(definitions.get(agent.id)).length > 0);
-  if (managed.length === 0) return [];
-  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository ?? "")) {
-    throw new Error("GITHUB_REPOSITORY is needed to find this repository's skills in Atlan");
-  }
-  const { byWorkspace } = await loadRegistryInventory({ token, request: registry, context: { repository }, workspaces: [workspace] });
-  const remote = byWorkspace.get(workspace) ?? [];
-  const read = requestPath => registry({ token, requestPath });
-  const settle = { now, wait, deadline: now() + SETTLE_MS };
-  const resolved = new Map();
-  const results = [];
-  for (const agent of managed) {
-    const { ids, folders: own } = agentSkills(agent, folders);
-    // Only a skill this run may have published can have a release still settling, so only it is pinned by version.
-    const skills = [
-      ...own.map(folder => [folder, ownSkill(remote, folder, repository, agent), fresh.includes(folder)]),
-      ...ids.map(id => [id, remote.find(skill => skill.id === id) ?? { id }, false])
-    ];
-    const pins = [];
-    for (const [label, skill, published] of skills) {
-      if (pins.some(pin => pin.skill_id === skill.id)) continue;
-      if (!resolved.has(skill.id)) {
-        resolved.set(skill.id, published ? await currentRelease(skill, label, agent, read, settle) : await settledRelease(skill, label, agent, read));
-      }
-      pins.push(resolved.get(skill.id));
-    }
-    const route = `/agent/v1/agents/${agent.id}`;
-    const call = (args, input) => aireg(args, input).catch(error => {
-      throw new Error(`${agentName(agent)}: ${error instanceof Error ? error.message : "aireg failed"}`);
-    });
-    const before = answer(await call(["atlan", "api", "get", route, "--registry", alias, "--json"]), agent);
-    if (before.workspace_id !== workspace) throw new Error(`${agentName(agent)} is in another workspace; list only agents in the workspace ${CONFIG_FILE} names`);
-    if (before.artifact_status === "archived") throw new Error(`${agentName(agent)} is archived in Atlan; take it out of ${CONFIG_FILE}, or link a new agent`);
-    const text = Object.fromEntries(Object.entries(definitions.get(agent.id)).filter(([field, value]) => before[field] !== value));
-    const body = { ...text, ...(agent.skills.length > 0 ? { skills: pins } : {}) };
-    if (Object.keys(body).length === 0) {
-      results.push({ id: agent.id, name: before.name ?? agent.id, pins: undefined, text: [], from: before.version_ordinal, to: before.version_ordinal });
-      continue;
-    }
-    const after = answer(await call(["atlan", "api", "patch", route, "--registry", alias, "--input", "-", "--json"], JSON.stringify(body)), agent);
-    results.push({
-      id: agent.id, name: after.name ?? agent.id, pins: agent.skills.length > 0 ? pins.length : undefined, text: Object.keys(text),
-      from: before.version_ordinal, to: after.version_ordinal
-    });
-  }
-  return results;
-}
-
-;// CONCATENATED MODULE: ./src/publish-baseline.js
-
-
-
-
-const RUN_PAGE_SIZE = 30;
-
-function isAncestor(cwd, sha) {
-  return (0,external_node_child_process_namespaceObject.spawnSync)("git", ["merge-base", "--is-ancestor", sha, "HEAD"], {
-    cwd, env: { PATH: "/usr/bin:/bin", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" }
-  }).status === 0;
-}
-
-// The commit a push publishes changes since: the last run that finished publishing, not the push's parent. GitHub
-// cancels a run still waiting in the concurrency group when a newer one arrives, so its changes would otherwise
-// never publish. A failed run is not retried here: its pull request is told, and a rerun publishes it.
-// Without `actions: read`, or with no earlier run, the push's parent stands in.
-async function publishBaseline({ environment, eventPayload, cwd, request = githubRequest, ancestor = isAncestor }) {
-  const before = eventPayload?.before;
-  const parent = typeof before === "string" && COMMIT_SHA.test(before) && !/^0+$/.test(before) ? before : undefined;
-  const token = common_getInput("github-token", environment);
+// Fetch the missing base only from GitHub, with origin-scoped authentication in the environment rather than arguments.
+function fetchCommit({ cwd, sha, environment, token, git }) {
   const repository = environment.GITHUB_REPOSITORY || "";
-  const branch = eventPayload?.repository?.default_branch;
-  if (!parent || !token || !/^\d{1,20}$/.test(environment.GITHUB_RUN_ID || "") ||
-      !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository) || typeof branch !== "string") return parent;
-  try {
-    const run = await request({ token, method: "GET", requestPath: `/repos/${repository}/actions/runs/${environment.GITHUB_RUN_ID}`, expectedStatus: 200 });
-    if (!Number.isSafeInteger(run?.workflow_id)) return parent;
-    const query = new URLSearchParams({ branch, status: "completed", per_page: String(RUN_PAGE_SIZE) });
-    const listed = await request({ token, method: "GET", requestPath: `/repos/${repository}/actions/workflows/${run.workflow_id}/runs?${query}`, expectedStatus: 200 });
-    const finished = (Array.isArray(listed?.workflow_runs) ? listed.workflow_runs : []).find(candidate =>
-      ["success", "failure"].includes(candidate?.conclusion) && ["push", "workflow_dispatch"].includes(candidate.event) &&
-      typeof candidate.head_sha === "string" && COMMIT_SHA.test(candidate.head_sha) && ancestor(cwd, candidate.head_sha));
-    return finished?.head_sha ?? parent;
-  } catch {
-    process.stdout.write("::notice title=Registry Sync::earlier runs could not be read, so this push publishes only its own changes; grant the job actions: read\n");
-    return parent;
+  if (!REPOSITORY.test(repository)) throw new Error("GITHUB_REPOSITORY must contain a valid owner and repository");
+  const server = githubServerUrl(environment);
+  const proxies = Object.fromEntries(FETCH_ENVIRONMENT_KEYS.filter(key => environment[key] !== undefined).map(key => [key, environment[key]]));
+  let auth = {};
+  if (token) {
+    const header = `AUTHORIZATION: basic ${Buffer.from(`x-access-token:${token}`).toString("base64")}`;
+    maskSecret(header, environment);
+    auth = { GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: `http.${server}/.extraheader`, GIT_CONFIG_VALUE_0: header };
   }
+  const shallow = git(["rev-parse", "--is-shallow-repository"], { cwd }).stdout?.trim() === "true";
+  const fetched = git(["-c", "protocol.version=2", "fetch", "--quiet", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head",
+    ...(shallow ? ["--depth=1"] : []), `${server}/${repository}`, sha], { cwd, env: { ...proxies, ...auth } });
+  if (fetched.status !== 0) throw new Error("could not fetch the pull request's base commit");
 }
 
-;// CONCATENATED MODULE: ./src/publish-updates.js
+const hasCommit = (git, cwd, sha) => git(["cat-file", "-e", `${sha}^{commit}`], { cwd }).status === 0;
 
-
-
-
-
-
-const SEMVER = /^(\d+)\.(\d+)\.(\d+)$/;
-const GIT_ENVIRONMENT = { PATH: "/usr/bin:/bin", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" };
-
-// aireg works out an update's next version by bumping the current one, and the Atlan adapter reports a version
-// whose release it cannot name as its bare number, which is not SemVer. Until it names versions by their release,
-// each update names its own: the newest release label, bumped, or the version number as a minor.
-function nextVersion(labels, ordinal) {
-  const parsed = labels.map(label => SEMVER.exec(label ?? "")).filter(Boolean).map(match => match.slice(1, 4).map(Number));
-  if (parsed.length === 0) return `0.${ordinal + 1}.0`;
-  const [major, minor, patch] = parsed.sort((a, b) => b[0] - a[0] || b[1] - a[1] || b[2] - a[2])[0];
-  return `${major}.${minor}.${patch + 1}`;
-}
-
-// A baseline git cannot diff against leaves every skill a candidate: only those that differ from Atlan publish.
-function changedFiles(cwd, baseline) {
-  const result = (0,external_node_child_process_namespaceObject.spawnSync)("git", ["diff", "--name-only", "-z", baseline, "HEAD"], { cwd, env: GIT_ENVIRONMENT });
-  return result.status === 0 ? result.stdout.toString().split("\0").filter(Boolean) : undefined;
-}
-
-// Regular files only, as preflight's digest: a symlink is never followed, and such a skill is left to the batch.
-function localSkill(cwd, files, folder) {
-  const prefix = `${folder}/`;
-  const members = files.filter(file => file.startsWith(prefix));
-  if (members.some(file => !external_node_fs_namespaceObject.lstatSync(external_node_path_namespaceObject.join(cwd, file)).isFile())) return undefined;
-  const entries = members.map(file => ({ path: file.slice(prefix.length), sha256: sha256(external_node_fs_namespaceObject.readFileSync(external_node_path_namespaceObject.join(cwd, file))) }));
-  return { name: canonicalSkillName(external_node_fs_namespaceObject.readFileSync(external_node_path_namespaceObject.join(cwd, folder, "SKILL.md"), "utf8")), digest: bundleDigest(entries) };
-}
-
-// The skill folders this run can publish: those changed since the baseline, as `--changed-since` chooses, or all.
-function changedSkills(cwd, skills, baseline) {
-  const changed = baseline ? changedFiles(cwd, baseline) : undefined;
-  return changed ? skills.filter(folder => changed.some(file => file.startsWith(`${folder}/`))) : skills;
-}
-
-const warn = message => process.stdout.write(`::warning title=Registry Sync::${message}\n`);
-
-// The skills this run updates in Atlan, each with the version to publish it as: aireg knows a skill by its name in
-// the workspace, so one there under the same name whose content differs. A new or unchanged skill stays with the
-// batch publish, as does every skill when Atlan cannot list the workspace in full: that is no worse than before.
-async function plannedUpdates({ cwd, files, candidates, token, workspace, repository, registry }) {
-  if (candidates.length === 0) return [];
-  let remote;
-  try {
-    const { byWorkspace } = await loadRegistryInventory({ token, request: registry, context: { repository }, workspaces: [workspace] });
-    remote = byWorkspace.get(workspace) ?? [];
-  } catch (error) {
-    warn(`skill updates publish without a named version: ${error instanceof Error ? error.message : "Atlan could not list the workspace"}`);
-    return [];
+async function checkoutBase({ cwd, sha, environment, token, git = runGit }) {
+  if (typeof sha !== "string" || !COMMIT_SHA.test(sha)) throw new Error("the pull request names no base commit");
+  const top = git(["rev-parse", "--show-toplevel"], { cwd });
+  if (top.status !== 0) throw new Error("could not find the repository of the working directory");
+  const root = external_node_fs_namespaceObject.realpathSync(top.stdout.trim());
+  if (!isWithin(root, cwd)) throw new Error("the working directory is outside its repository");
+  if (!hasCommit(git, cwd, sha)) {
+    fetchCommit({ cwd, sha, environment, token, git });
+    if (!hasCommit(git, cwd, sha)) throw new Error("could not fetch the pull request's base commit");
   }
-  const updates = [];
-  for (const folder of candidates) {
-    const local = localSkill(cwd, files, folder);
-    const current = local && remote.find(skill => skill.name === local.name);
-    if (!current || current.sourceDigest === local.digest) continue;
-    // Without its labels, the version number still names an update.
-    const releases = await registry({ token, requestPath: `/registry/v1/artifacts/skill/${encodeURIComponent(current.id)}/releases` }).catch(() => undefined);
-    const labels = (Array.isArray(releases?.items) ? releases.items : []).map(release => release?.version_label);
-    updates.push({ folder, name: local.name, version: nextVersion(labels, current.versionOrdinal) });
-  }
-  return updates;
-}
-
-;// CONCATENATED MODULE: ./src/cli.js
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-const INSTALL_ENVIRONMENT_KEYS = [
-  "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL",
-  "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY",
-  "https_proxy", "http_proxy", "all_proxy", "no_proxy",
-  "SSL_CERT_FILE", "SSL_CERT_DIR", "RUNNER_OS", "RUNNER_ARCH"
-];
-
-const PUBLISH_ENVIRONMENT_KEYS = [
-  "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL",
-  "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY",
-  "https_proxy", "http_proxy", "all_proxy", "no_proxy",
-  "RUNNER_OS", "RUNNER_ARCH", "CI", "GITHUB_ACTIONS", "GITHUB_ACTOR", "GITHUB_JOB",
-  "GITHUB_REF", "GITHUB_REF_NAME", "GITHUB_REF_TYPE", "GITHUB_REPOSITORY",
-  "GITHUB_RUN_ATTEMPT", "GITHUB_RUN_ID", "GITHUB_SHA", "GITHUB_WORKFLOW"
-];
-
-const SYSTEM_PATH = "/usr/bin:/bin";
-const SELF_UPDATE_ARGUMENTS = Object.freeze(["self", "update", "--json"]);
-// Without a terminal, aireg installs an adapter it does not trust only when told to.
-const ADAPTER_ARGUMENTS = Object.freeze(["adapter", "install", ADAPTER, "--yes"]);
-const PUBLISH_ALIAS = "atlan";
-// Declared in the Action-owned user scope, so the token's only destination is the fixed gateway
-// and nothing is written into the repository.
-const REGISTRY_ARGUMENTS = Object.freeze(["registry", "add", PUBLISH_GATEWAY, "--as", PUBLISH_ALIAS, "--adapter", ADAPTER, "-g"]);
-const MAX_CLI_OUTPUT_BYTES = 64 * 1024;
-const MAX_CLI_STDERR_CHARS = 8 * 1024;
-
-const CLI_OS = { linux: "linux", darwin: "darwin" };
-const CLI_ARCH = { x64: "amd64", arm64: "arm64" };
-
-function assertSupportedPublishPlatform(platform = process.platform) {
-  if (!Object.hasOwn(CLI_OS, platform)) {
-    throw new Error("publish mode supports Linux and macOS runners; use ubuntu-latest or macos-latest");
-  }
-}
-
-// Maps the Node runtime platform onto the pinned CLI artifact name.
-function resolveCliPlatform(platform = process.platform, arch = process.arch) {
-  assertSupportedPublishPlatform(platform);
-  if (!Object.hasOwn(CLI_ARCH, arch)) {
-    throw new Error("publish mode supports amd64 and arm64 runners only");
-  }
-  const target = `${CLI_OS[platform]}-${CLI_ARCH[arch]}`;
-  if (!Object.hasOwn(CLI_SHA256, target)) {
-    throw new Error(`the Action does not pin aireg for ${target}`);
-  }
-  return target;
-}
-
-function assertNoSymlinks(root, candidate) {
-  const relative = external_node_path_namespaceObject.relative(root, candidate);
-  let current = root;
-  for (const part of relative ? relative.split(external_node_path_namespaceObject.sep) : []) {
-    current = external_node_path_namespaceObject.join(current, part);
-    if (external_node_fs_namespaceObject.lstatSync(current).isSymbolicLink()) throw new Error("working-directory cannot contain symbolic links");
-  }
-}
-
-function resolveWorkingDirectory(environment = process.env) {
-  const workspaceInput = external_node_path_namespaceObject.resolve(environment.GITHUB_WORKSPACE || process.cwd());
-  const workspace = external_node_fs_namespaceObject.realpathSync(workspaceInput);
-  const requested = external_node_path_namespaceObject.resolve(common_getInput("working-directory", environment) || workspaceInput);
-  const lexicalRoot = isWithin(workspaceInput, requested) ? workspaceInput : workspace;
-  if (!isWithin(lexicalRoot, requested) || !external_node_fs_namespaceObject.existsSync(requested)) {
-    throw new Error("working-directory must be an existing directory inside GITHUB_WORKSPACE");
-  }
-  assertNoSymlinks(lexicalRoot, requested);
-  const resolved = external_node_fs_namespaceObject.realpathSync(requested);
-  if (!isWithin(workspace, resolved)) {
-    throw new Error("working-directory must be an existing directory inside GITHUB_WORKSPACE");
-  }
-  if (!external_node_fs_namespaceObject.statSync(resolved).isDirectory()) {
-    throw new Error("working-directory must be an existing directory inside GITHUB_WORKSPACE");
-  }
-  return resolved;
-}
-
-function writeBoundedCli(response, destination, createDestination = external_node_fs_namespaceObject.createWriteStream) {
-  let received = 0;
-  const limiter = new external_node_stream_.Transform({
-    transform(chunk, _encoding, callback) {
-      received += chunk.length;
-      callback(received > MAX_CLI_BYTES
-        ? new Error("aireg download exceeds the size limit")
-        : null, chunk);
-    }
-  });
-  return (0,external_node_stream_promises_namespaceObject.pipeline)(response, limiter, createDestination(destination, { mode: 0o700 }));
-}
-
-async function verifyCliDigest(binary, expectedDigest) {
-  if (typeof expectedDigest !== "string" || !SHA256.test(expectedDigest)) {
-    throw new Error("Action-pinned CLI digest is invalid");
-  }
-  const metadata = await promises_namespaceObject.lstat(binary);
-  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > MAX_CLI_BYTES) {
-    throw new Error("aireg is not a bounded regular file");
-  }
-  const hash = (0,external_node_crypto_.createHash)("sha256");
-  for await (const chunk of external_node_fs_namespaceObject.createReadStream(binary)) hash.update(chunk);
-  if (!(0,external_node_crypto_.timingSafeEqual)(hash.digest(), Buffer.from(expectedDigest, "hex"))) {
-    throw new Error("aireg digest does not match the Action-pinned digest");
-  }
-}
-
-function cliArtifactURL(target, version = CLI_VERSION) {
-  if (!Object.hasOwn(CLI_SHA256, target)) throw new Error("aireg platform is not pinned");
-  if (!RELEASE_VERSION.test(version)) throw new Error("Action-pinned CLI version is invalid");
-  return `${CLI_ORIGIN}${CLI_ARTIFACT_PATH}${version}/aireg-${target}`;
-}
-
-const CLI_URL_PATHNAME = new RegExp(
-  `^${CLI_ARTIFACT_PATH}(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)/aireg-(?:darwin|linux)-(?:amd64|arm64)$`
-);
-
-function validateCliURL(cliURL) {
-  let url;
-  try {
-    url = new URL(cliURL);
-  } catch {
-    throw new Error("aireg URL must be valid HTTPS");
-  }
-  if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash || !CLI_URL_PATHNAME.test(url.pathname)) {
-    throw new Error("aireg URL must be a clean HTTPS version-addressed artifact URL");
-  }
-  if (url.origin !== CLI_ORIGIN) {
-    throw new Error("aireg host is not approved");
-  }
-}
-
-function downloadCli(url, destination) {
-  validateCliURL(url);
-  return new Promise((resolve, reject) => {
-    const request = external_node_https_namespaceObject.get(url, {
-      timeout: 60_000,
-      headers: { "User-Agent": "atlan-agent-registry-action" }
-    }, response => {
-      if (response.statusCode >= 300 && response.statusCode < 400) {
-        response.resume();
-        reject(new Error("aireg download redirected; refusing an unapproved source"));
-        return;
-      }
-      if (response.statusCode !== 200) {
-        response.resume();
-        reject(new Error(`aireg download failed with HTTP ${response.statusCode}`));
-        return;
-      }
-      const declaredSize = Number(response.headers["content-length"] || 0);
-      if (declaredSize > MAX_CLI_BYTES) {
-        response.resume();
-        reject(new Error("aireg download exceeds the size limit"));
-        return;
-      }
-      void writeBoundedCli(response, destination).then(resolve, reject);
-    });
-    request.on("timeout", () => request.destroy(new Error("aireg download timed out")));
-    request.on("error", reject);
-  });
-}
-
-function runtimeEnvironment(environment, keys, runtimeDirectory) {
-  if (!external_node_path_namespaceObject.isAbsolute(runtimeDirectory)) throw new Error("Action-owned CLI home must be an absolute path");
-  const allowed = Object.fromEntries(keys
-    .filter(key => environment[key] !== undefined)
-    .map(key => [key, environment[key]]));
-  return {
-    ...allowed,
-    HOME: runtimeDirectory,
-    AIREG_HOME: external_node_path_namespaceObject.join(runtimeDirectory, ".aireg"),
-    AIREG_USER_SCOPE: external_node_path_namespaceObject.join(runtimeDirectory, "registry"),
-    PATH: SYSTEM_PATH
-  };
-}
-
-function installEnvironment(environment, runtimeDirectory) {
-  return runtimeEnvironment(environment, INSTALL_ENVIRONMENT_KEYS, runtimeDirectory);
-}
-
-// Mirrors aireg's own per-registry variable name, so the token reaches that registry alone.
-function tokenVariable(alias) {
-  return `AIREG_TOKEN_${alias.toUpperCase().replaceAll(/[^A-Z0-9]/g, "_")}`;
-}
-
-function publisherEnvironment(environment, token, runtimeDirectory, aliases = []) {
-  return {
-    ...runtimeEnvironment(environment, PUBLISH_ENVIRONMENT_KEYS, runtimeDirectory),
-    GIT_CONFIG_NOSYSTEM: "1",
-    GIT_CONFIG_GLOBAL: "/dev/null",
-    ...Object.fromEntries(aliases.map(alias => [tokenVariable(alias), token]))
-  };
-}
-
-// Only what the repository tracks can be an artifact, so a build output never publishes.
-function trackedFiles(cwd) {
-  const listed = (0,external_node_child_process_namespaceObject.spawnSync)("git", ["ls-files", "-z"], {
-    cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024,
-    env: { PATH: SYSTEM_PATH, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" }
-  });
-  if (listed.status !== 0) throw new Error("could not list the repository's files; check it out before this step");
-  return listed.stdout.split("\0").filter(Boolean);
-}
-
-// The repository's CONFIG_FILE when it tracks one: a regular file only, so a link cannot pull in another.
-function syncConfig(cwd, files) {
-  if (!files.includes(CONFIG_FILE)) return undefined;
-  const found = external_node_fs_namespaceObject.lstatSync(external_node_path_namespaceObject.join(cwd, CONFIG_FILE), { throwIfNoEntry: false });
-  if (!found?.isFile() || found.size > MAX_CONFIG_BYTES) {
-    throw new Error(`${CONFIG_FILE} must be a regular file of at most ${MAX_CONFIG_BYTES} bytes`);
-  }
-  return external_node_fs_namespaceObject.readFileSync(external_node_path_namespaceObject.join(cwd, CONFIG_FILE), "utf8");
-}
-
-// A changed config can cover skills whose files did not change. git exits 1 for a difference alone.
-function configChanged(cwd, sha) {
-  return (0,external_node_child_process_namespaceObject.spawnSync)("git", ["diff", "--quiet", sha, "HEAD", "--", CONFIG_FILE], {
-    cwd, env: { PATH: SYSTEM_PATH, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" }
-  }).status === 1;
-}
-
-// An agent is a tracked Markdown file with `name` and `description` front matter, so a README is skipped.
-// A SKILL.md never is: the CLI would publish its whole folder, and at the root that is the checkout.
-function agentFiles(cwd, files, globs = []) {
-  const patterns = globs.map(globPattern);
-  return files.filter(file => file.endsWith(".md") && external_node_path_namespaceObject.posix.basename(file) !== "SKILL.md" &&
-    patterns.some(pattern => pattern.test(file)) && hasFrontMatter(external_node_path_namespaceObject.join(cwd, file))).sort();
-}
-
-function hasFrontMatter(file) {
-  if (!external_node_fs_namespaceObject.existsSync(file) || !external_node_fs_namespaceObject.lstatSync(file).isFile() || external_node_fs_namespaceObject.statSync(file).size > MAX_SKILL_BYTES) return false;
-  const head = /^---\r?\n([\s\S]*?)\r?\n---/.exec(external_node_fs_namespaceObject.readFileSync(file, "utf8"));
-  return Boolean(head && /^name:\s*\S/m.test(head[1]) && /^description:\s*\S/m.test(head[1]));
-}
-
-// The CLI compares with the Registry by workspace name, so the ID the workflow names is looked up once.
-async function workspaceName(token, workspace, registry = registryRequest) {
-  const found = await registry({ token, requestPath: `/registry/v1/workspaces/${encodeURIComponent(workspace)}` });
-  if (typeof found?.name !== "string" || !/^[A-Za-z0-9_.-]{1,128}$/.test(found.name)) {
-    throw new Error(`workspace ${workspace} was not found, or its name cannot be read`);
-  }
-  return found.name;
-}
-
-// A push publishes only what changed since its baseline. A manual run or a new branch has none,
-// so it publishes everything. Every aireg release takes the flag.
-function changedSinceArguments(baseline) {
-  return typeof baseline === "string" && COMMIT_SHA.test(baseline) ? ["--changed-since", baseline] : [];
-}
-
-function parseCliVersion(raw) {
-  const match = /^v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\s*$/.exec(raw.split("\n")[0] ?? "");
-  if (!match) throw new Error("installed aireg did not return a valid version");
-  return match[1];
-}
-
-// `self update` names the newest release it installed, which must sit in the Action-owned home, or keeps this one.
-function updatedCli(raw, binary, directory) {
-  let data;
-  try {
-    data = JSON.parse(raw)?.data;
-  } catch {
-    data = undefined;
-  }
-  if (data?.action === "already-latest") return binary;
-  if (data?.action !== "updated" || typeof data.bin !== "string" || !external_node_path_namespaceObject.isAbsolute(data.bin) || !isWithin(directory, data.bin)) {
-    throw new Error("aireg returned an unreadable self update result");
-  }
-  return data.bin;
-}
-
-// Runs the verified CLI directly, without a shell; captures bounded stdout when asked.
-// `input`, when given, is the child's whole stdin, such as a request body.
-// aireg's own explanation of a failure, its `error:` line and the `hint:` after it, with the checkout's path left
-// out, so a failed publish can say why rather than only that it exited.
-function cliFailure(stderr, cwd) {
-  const lines = stderr.split(/\r?\n/);
-  const at = lines.findLastIndex(line => line.startsWith("error: "));
-  if (at < 0) return undefined;
-  const hint = lines.slice(at + 1).find(line => line.startsWith("hint: "));
-  const text = [lines[at].slice(7), hint && `Hint: ${hint.slice(6)}`].filter(Boolean).join(" ");
-  return cwd ? text.replaceAll(`${cwd}/`, "") : text;
-}
-
-function runCli(binary, args, cwd, environment, capture = false, input) {
-  return new Promise((resolve, reject) => {
-    const child = (0,external_node_child_process_namespaceObject.spawn)(binary, [...args], {
-      cwd,
-      env: environment,
-      shell: false,
-      stdio: [input === undefined ? (capture ? "ignore" : "inherit") : "pipe", capture ? "pipe" : "inherit", "pipe"]
-    });
-    if (input !== undefined) child.stdin.end(input);
-    // stderr still reaches the job log as it arrives; only its tail is kept, for the failure's reason.
-    let stderr = "";
-    child.stderr.on("data", chunk => {
-      process.stderr.write(chunk);
-      stderr = (stderr + chunk.toString("utf8")).slice(-MAX_CLI_STDERR_CHARS);
-    });
-    const chunks = [];
-    let size = 0;
-    child.stdout?.on("data", chunk => {
-      size += chunk.length;
-      if (size <= MAX_CLI_OUTPUT_BYTES) chunks.push(chunk);
-      else child.kill();
-    });
-    child.on("error", reject);
-    // "close" waits for stdout to drain; "exit" can fire first and lose the tail of it.
-    child.on("close", code => {
-      if (size > MAX_CLI_OUTPUT_BYTES) return reject(new Error("aireg output exceeds the size limit"));
-      if (code !== 0) {
-        const reason = cliFailure(stderr, cwd);
-        return reject(new Error(`aireg ${args[0]} exited with status ${code}${reason ? `: ${reason}` : ""}`));
-      }
-      resolve(Buffer.concat(chunks).toString("utf8"));
-    });
-  });
-}
-
-async function installCli({
-  environment = process.env,
-  download = downloadCli,
-  verifyCli = verifyCliDigest,
-  execute = runCli
-} = {}) {
-  const target = resolveCliPlatform();
-  // Real, so the binary `self update` reports (macOS resolves /var to /private/var) is recognised as inside it.
-  const directory = await promises_namespaceObject.realpath(await promises_namespaceObject.mkdtemp(external_node_path_namespaceObject.join(external_node_os_namespaceObject.tmpdir(), "registry-skill-sync-")));
-  const binary = external_node_path_namespaceObject.join(directory, "aireg");
-  try {
-    await download(cliArtifactURL(target), binary);
-    await verifyCli(binary, CLI_SHA256[target]);
-    await promises_namespaceObject.chmod(binary, 0o700);
-    const safeEnvironment = installEnvironment(environment, directory);
-    const updated = await execute(binary, SELF_UPDATE_ARGUMENTS, directory, safeEnvironment, true);
-    const newest = updatedCli(updated, binary, directory);
-    const version = parseCliVersion(await execute(newest, ["--version"], directory, safeEnvironment, true));
-    await execute(newest, ADAPTER_ARGUMENTS, directory, safeEnvironment);
-    return { binary: newest, directory, version };
-  } catch (error) {
+  const directory = await promises_namespaceObject.realpath(await promises_namespaceObject.mkdtemp(external_node_path_namespaceObject.join(external_node_os_namespaceObject.tmpdir(), "registry-sync-base-")));
+  const worktree = external_node_path_namespaceObject.join(directory, "base");
+  const remove = async () => {
+    git(["worktree", "remove", "--force", worktree], { cwd });
     await promises_namespaceObject.rm(directory, { recursive: true, force: true });
+    git(["worktree", "prune"], { cwd });
+  };
+  try {
+    const added = git(["-c", "advice.detachedHead=false", "worktree", "add", "--detach", "--quiet", worktree, sha], { cwd });
+    if (added.status !== 0) throw new Error("could not check out the pull request's base commit");
+    const baseCwd = external_node_path_namespaceObject.join(worktree, external_node_path_namespaceObject.relative(root, cwd));
+    const folder = external_node_fs_namespaceObject.lstatSync(baseCwd, { throwIfNoEntry: false });
+    if (!folder) return { cwd: baseCwd, manifest: false, remove };
+    assertNoSymlinks(worktree, baseCwd);
+    if (!folder.isDirectory()) return { cwd: baseCwd, manifest: false, remove };
+    return { cwd: baseCwd, manifest: trackedManifest(baseCwd), remove };
+  } catch (error) {
+    await remove();
     throw error;
   }
 }
 
-async function runPublishAction({
-  environment = process.env,
-  install = installCli,
-  execute = runCli,
-  registry = registryRequest,
-  request,
-  ancestor,
-  eventPayload
-} = {}) {
-  const token = environment.ATLANAI_TOKEN;
-  if (!token) throw new Error("ATLANAI_TOKEN must be supplied as a workflow secret");
-  maskSecret(token, environment);
+;// CONCATENATED MODULE: ./src/preview.js
+
+
+
+
+
+
+
+async function previewDryRun({ environment, install, execute, checkout, baseSha, githubToken }) {
+  const supplied = suppliedTokens(environment);
   const cwd = resolveWorkingDirectory(environment);
-  if (parseBoolean("prune", common_getInput("prune", environment) || "false")) {
-    throw new Error("prune is not supported with aireg yet; set prune to false");
-  }
-  const files = trackedFiles(cwd);
-  const config = syncConfig(cwd, files);
-  const inputs = parseRegistryInputs(environment, config);
-  // A tracked file can be missing from the checkout, as in a sparse checkout; it cannot publish.
-  const skills = skillFolders(files, inputs.artifacts.skill).filter(folder => external_node_fs_namespaceObject.existsSync(external_node_path_namespaceObject.join(cwd, folder, "SKILL.md")));
-  const paths = [...skills, ...agentFiles(cwd, files, inputs.artifacts.agent)];
-  // The CLI expands a path it is given, so one that reads as a glob is refused rather than widened.
-  const unsafe = paths.find(item => /[*?[\]{}\\]|[+@!]\(/.test(item));
-  if (unsafe) throw new Error(`${unsafe} contains glob characters, so it cannot be published as an exact path`);
-  // An agent's path and skills are checked before anything installs, so a stale config fails fast.
-  for (const agent of inputs.agents) {
-    if (!files.some(file => file === agent.path || file.startsWith(`${agent.path}/`))) {
-      throw new Error(`${agentName(agent)} is not in the repository; update its \`path\` in ${CONFIG_FILE}`);
-    }
-    agentSkills(agent, skills);
-  }
-  if (paths.length === 0 && inputs.agents.length === 0) {
-    process.stdout.write("::notice title=Registry Sync::no tracked file matches the skill globs, so nothing was published\n");
-    common_setOutput("status", "success", environment);
-    return;
-  }
-  const namespace = await workspaceName(token, inputs.workspace, registry);
-  const since = await publishBaseline({ environment, eventPayload, cwd, request, ancestor });
-  // With no baseline, everything the config covers that differs from Atlan publishes.
-  const baseline = since && config !== undefined && configChanged(cwd, since) ? undefined : since;
-  const candidates = changedSkills(cwd, skills, baseline);
-  const updates = await plannedUpdates({
-    cwd, files, candidates, token, workspace: inputs.workspace, repository: environment.GITHUB_REPOSITORY, registry
-  });
-  const batched = paths.filter(item => !updates.some(update => update.folder === item));
-  const { binary, directory, version } = await install({ environment });
+  assertManifest(cwd, environment);
+  let base;
   try {
-    const publisher = publisherEnvironment(environment, token, directory, [PUBLISH_ALIAS]);
-    // Run where no project manifest is found, so the registry is declared in the user scope alone.
-    await execute(binary, REGISTRY_ARGUMENTS, directory, publisher);
-    // A skill Atlan refuses does not hold back the others, in the batch or among the updates naming their version.
-    const failed = [];
-    if (batched.length > 0) {
-      const args = ["publish", ...batched.map(item => `./${item}`), "--to", `${PUBLISH_ALIAS}/${namespace}`, "--yes", "-g", ...changedSinceArguments(baseline)];
-      await execute(binary, args, cwd, publisher).catch(error => failed.push(error));
+    base = await checkout({ cwd, sha: baseSha, environment, token: githubToken });
+  } catch (error) {
+    base = { error: error instanceof Error ? error.message : "the base commit could not be read" };
+  }
+  try {
+    const installed = await install({ environment, cwd, ...(base.manifest ? { baseCwd: base.cwd } : {}) });
+    try {
+      const { version, registries } = installed;
+      const baseError = base.error ?? installed.base?.error;
+      const baseRegistries = baseError ? undefined : base.manifest ? installed.base.registries : [];
+      const scoped = tokens => unchangedRegistryTokens(tokens, registries, baseRegistries);
+      const target = supplied.legacy === undefined ? undefined
+        : await legacyRegistry(registries, () => dryRun(installed, cwd, environment, scoped(supplied.tokens).tokens, execute));
+      const { tokens, withheld } = scoped(publishTokens(supplied, target));
+      const run = {
+        version,
+        credentialed: Object.keys(tokens).length > 0,
+        withheld,
+        ...(baseError ? { baseError } : { baseManifest: base.manifest, registryChanges: registryChanges(registries, baseRegistries) })
+      };
+      let result;
+      try {
+        result = await dryRun(installed, cwd, environment, tokens, execute);
+      } catch (error) {
+        if (!error?.aireg) throw error;
+        return { ...run, failure: error };
+      }
+      if (baseError || !base.manifest) return { ...run, result };
+      try {
+        return { ...run, result, baseResult: await dryRun(installed, base.cwd, environment, tokens, execute) };
+      } catch (error) {
+        return { ...run, result, baseFailure: error?.aireg?.message ?? (error instanceof Error ? error.message : "the base commit's dry run failed") };
+      }
+    } finally {
+      await promises_namespaceObject.rm(installed.directory, { recursive: true, force: true });
     }
-    for (const update of updates) {
-      const target = `${PUBLISH_ALIAS}/${namespace}/${update.name}@${update.version}`;
-      await execute(binary, ["publish", `./${update.folder}`, "--to", target, "--yes", "-g"], cwd, publisher).catch(error => failed.push(error));
-    }
-    if (failed.length === 1) throw failed[0];
-    if (failed.length > 1) throw Object.assign(new Error(`${failed.length} publishes failed`), { failures: failed.map(error => error.message) });
-    const synced = await syncAgents({
-      agents: inputs.agents, folders: skills, cwd, token, workspace: inputs.workspace, repository: environment.GITHUB_REPOSITORY,
-      registry, alias: PUBLISH_ALIAS, aireg: (args, input) => execute(binary, args, directory, publisher, true, input), fresh: candidates
-    });
-    for (const agent of synced) {
-      const moved = agent.to === agent.from ? "unchanged" : `version ${agent.from} → ${agent.to}`;
-      const done = [...(agent.pins === undefined ? [] : [`${agent.pins} skills pinned`]), ...agent.text.map(field => `${field} updated`)];
-      process.stdout.write(`::notice title=Registry Sync::agent ${agent.name}: ${[...done, moved].join(", ")}\n`);
-    }
-    common_setOutput("status", "success", environment);
-    common_setOutput("cli-version", version, environment);
   } finally {
-    await promises_namespaceObject.rm(directory, { recursive: true, force: true });
+    await base.remove?.();
+  }
+}
+
+async function runPreview({
+  environment = process.env, request = githubRequest, eventPayload, install = installCli, execute = runCli, checkout = checkoutBase
+} = {}) {
+  const token = common_getInput("github-token", environment);
+  const commenting = parseBoolean("allow-pr-commenting", common_getInput("allow-pr-commenting", environment) || "true");
+  const failOnConflict = parseBoolean("fail-on-conflict", common_getInput("fail-on-conflict", environment) || "true");
+  const context = parsePullRequestContext(environment, eventPayload, { allowedEvents: ["pull_request"] });
+  const comment = commenting && !context.crossRepository;
+  if (comment && (!token || /[\r\n]/.test(token))) throw new Error("github-token is required to comment on the pull request");
+  if (token) maskSecret(token, environment);
+  let run;
+  try {
+    run = await previewDryRun({ environment, install, execute, checkout, baseSha: context.baseSha, githubToken: token });
+  } catch (error) {
+    run = { failure: error };
+  }
+  const reason = run.failure && (run.failure.aireg ?? { message: run.failure instanceof Error ? run.failure.message : "the preview failed" });
+  const compared = Boolean(run.result && run.baseResult);
+  const conflicts = compared ? conflictsOf(run.result, run.baseResult) : [];
+  const overwrites = compared ? overwritesOf(run.result, run.baseResult) : [];
+  const preview = {
+    ...run,
+    unauthorized: reason?.code === "unauthorized" && (run.credentialed === false || run.withheld?.length > 0),
+    ...(reason ? { reason: { message: redact(reason.message, environment), ...(reason.hint ? { hint: redact(reason.hint, environment) } : {}) } } : {}),
+    ...(run.baseFailure ? { baseFailure: redact(run.baseFailure, environment) } : {}),
+    conflicts,
+    overwrites,
+    failOnConflict
+  };
+  writeStepSummary(environment, formatPreviewSummary(preview, environment));
+  if (comment) {
+    const existing = await findMarkerComment({
+      token, request, owner: context.owner, repo: context.repo, issueNumber: context.pullNumber, marker: PREVIEW_MARKER
+    });
+    const written = await writeMarkerComment({
+      token, request, owner: context.owner, repo: context.repo, issueNumber: context.pullNumber, existing, body: formatPreviewComment(preview, undefined, environment)
+    });
+    common_setOutput("comment-id", written.id, environment);
+  }
+  setPublishOutputs(environment, run.result);
+  common_setOutput("conflict-count", conflicts.length, environment);
+  const failed = Boolean(run.failure) && !preview.unauthorized;
+  common_setOutput("status", failed ? "failed" : conflicts.length > 0 ? "conflict" : "success", environment);
+  if (run.version) common_setOutput("cli-version", run.version, environment);
+  if (failed) throw run.failure;
+  if (conflicts.length > 0 && failOnConflict) {
+    throw new Error(`${conflicts.length === 1 ? "1 artifact this pull request changes was" : `${conflicts.length} artifacts this pull request changes were`} changed in the registry since its base; see the preview, or set fail-on-conflict to false`);
   }
 }
 
@@ -39851,30 +40293,22 @@ async function runPublishAction({
 
 
 function runLink(environment) {
-  const server = /^https:\/\/[A-Za-z0-9.-]+$/.test(environment.GITHUB_SERVER_URL || "") ? environment.GITHUB_SERVER_URL : "https://github.com";
   const runId = /^\d{1,20}$/.test(environment.GITHUB_RUN_ID || "") ? environment.GITHUB_RUN_ID : undefined;
-  return runId ? `[The run log](${server}/${environment.GITHUB_REPOSITORY}/actions/runs/${runId})` : "The run log";
+  return runId ? `[The run log](${githubServerUrl(environment)}/${environment.GITHUB_REPOSITORY}/actions/runs/${runId})` : "The run log";
 }
 
-// GitHub masks secrets in logs, not in comment text, so the token is blanked here too, whatever said it.
 function clean(text, environment) {
-  const token = environment.ATLANAI_TOKEN;
-  const plain = String(text).replace(/[\r\n]/g, " ").replaceAll("`", "'");
-  return (token && token.length >= 8 ? plain.replaceAll(token, "***") : plain).slice(0, 500);
+  return redact(String(text).replace(/[\r\n]/g, " ").replaceAll("`", "'"), environment).slice(0, 500);
 }
 
 function publishFailureComment(environment, sha, error) {
-  const failures = Array.isArray(error?.failures) ? error.failures.slice(0, 10) : undefined;
-  const summary = failures
-    ? [`Publishing \`${sha.slice(0, 7)}\` to Atlan failed for ${error.failures.length} items:`, "", ...failures.map(item => `- \`${clean(item, environment)}\``)]
-    : [`Publishing \`${sha.slice(0, 7)}\` to Atlan failed: \`${clean(error instanceof Error ? error.message : "publishing failed", environment)}\`.`];
   return [
     PUBLISH_FAILURE_MARKER,
     "### Registry Sync could not publish this merge",
     "",
-    ...summary,
+    `Publishing \`${sha.slice(0, 7)}\` failed: \`${clean(error instanceof Error ? error.message : "publishing failed", environment)}\`.`,
     "",
-    `${runLink(environment)} has Atlan's response. Fix what it names in a new pull request, where preflight checks it before it merges. If Atlan refused nothing, or a skill an agent needs has since been released, rerun the workflow.`
+    `${runLink(environment)} has aireg's full output. Fix what it names in a new pull request, where the publish preview checks it before it merges. If the registry refused nothing, rerun this run; if newer changes have merged since, run Registry Sync manually from the default branch instead.`
   ].join("\n");
 }
 
@@ -39906,12 +40340,39 @@ async function reportPublishFailure({ environment, payload, error, request = git
   }
 }
 
+;// CONCATENATED MODULE: ./src/publish-baseline.js
+
+
+
+// Reject stale reruns so older artifacts cannot overwrite a newer default-branch publish.
+async function assertCurrentRerun({ environment, eventPayload, request = githubRequest }) {
+  if (!(Number(environment.GITHUB_RUN_ATTEMPT) > 1)) return;
+  const instead = "run Registry Sync manually from the default branch instead";
+  const token = common_getInput("github-token", environment);
+  const repository = environment.GITHUB_REPOSITORY || "";
+  const branch = eventPayload?.repository?.default_branch;
+  let tip;
+  if (token && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository) && typeof branch === "string") {
+    const ref = branch.split("/").map(encodeURIComponent).join("/");
+    tip = await request({ token, method: "GET", requestPath: `/repos/${repository}/git/ref/heads/${ref}`, expectedStatus: 200 })
+      .then(found => found?.object?.sha, () => undefined);
+  }
+  if (typeof tip !== "string" || !COMMIT_SHA.test(tip)) {
+    throw new Error(`this rerun could not confirm the default branch's latest commit, so it did not publish; ${instead}`);
+  }
+  const sha = environment.GITHUB_SHA || "";
+  if (tip.toLowerCase() !== sha.toLowerCase()) {
+    throw new Error(`this rerun is for ${sha.slice(0, 7)}, but ${branch} has moved on to ${tip.slice(0, 7)}, so publishing it would put older artifacts over newer ones; ${instead}`);
+  }
+}
+
 ;// CONCATENATED MODULE: ./src/eval-comment.js
+
 
 
 // Pure render functions for the eval PR comment and step summary. Nothing here performs I/O; every input is a
 // plain report object built by eval.js. Per-case detail is limited to dataset_record_id + score: never input,
-// output, expected, or trace text (AGENT-2037; PRs can be public).
+// output, expected, or trace text, because pull requests can be public.
 
 function formatPercent(value) {
   if (typeof value !== "number" || Number.isNaN(value)) return "-";
@@ -39941,37 +40402,6 @@ function formatTokens(count) {
 function formatCost(usd) {
   if (typeof usd !== "number" || Number.isNaN(usd)) return "-";
   return `$${usd.toFixed(2)}`;
-}
-
-// GitHub links @mentions, #refs and bare URLs after Markdown rendering, so escaping cannot stop them; an
-// invisible word joiner (U+2060) after the trigger breaks each pattern and leaves the text unchanged to a reader.
-function breakGithubLinks(text) {
-  return text.replace(/[@#]|:\/\/|\bwww(?=\.)/gi, match => `${match}\u2060`);
-}
-
-// Names, models, branches, record IDs and reasons come from the eval command and from Atlan, so they may hold
-// Markdown or HTML. As text, the characters that open inline syntax (links, emphasis, code, HTML, entities,
-// table cells) are backslash-escaped, GitHub's own links are broken, and newlines collapse so the value cannot
-// start a new block.
-function escapeText(value) {
-  return breakGithubLinks(String(value).replace(/[\r\n]+/g, " ").replace(/[\\`*_[\]<>!&|~]/g, "\\$&"));
-}
-
-// Inside <details>, the line is raw HTML: Markdown escapes do not apply there, so HTML entities are used instead.
-function escapeHtml(value) {
-  // Links are broken before encoding: the # of an entity such as &#60; must stay intact.
-  return breakGithubLinks(String(value).replace(/[\r\n]+/g, " ")).replace(/[&<>"']/g, char => `&#${char.charCodeAt(0)};`);
-}
-
-// As a code span, nothing inside is parsed, so only the fence can break out: it is made longer than any run of
-// backticks in the value. In a table, a pipe still ends the cell even inside code, so it is escaped as GFM allows.
-function codeSpan(value, { table = false } = {}) {
-  let text = String(value).replace(/[\r\n]+/g, " ");
-  if (table) text = text.replaceAll("|", "\\|");
-  const longest = Math.max(0, ...(text.match(/`+/g) || []).map(run => run.length));
-  const fence = "`".repeat(longest + 1);
-  const pad = text.startsWith("`") || text.endsWith("`") ? " " : "";
-  return `${fence}${pad}${text}${pad}${fence}`;
 }
 
 function scorerRow(scorer) {
@@ -40168,10 +40598,10 @@ function footer(report) {
   const parts = [];
   if (report.runUrl) parts.push(`Run [#${report.runNumber}](${report.runUrl})`);
   if (report.headSha) parts.push(`head \`${report.headSha.slice(0, 7)}\``);
-  if (report.datasetVersion) parts.push(`dataset ${report.datasetVersion}`);
+  if (report.datasetVersion) parts.push(`dataset ${escapeHtml(report.datasetVersion)}`);
   const plain = report.experiments.length > 0 && report.experiments.every(experiment => experiment.status === "report");
   if (plain) parts.push(`plain run (no baseline) · errors >${(report.maxErrorRate * 100).toFixed(0)}% fail`);
-  else parts.push(`fail on: ${report.failOn || "regression"} · thresholds: default ${(report.regressionThreshold * 100).toFixed(1)}pp${report.scorerThresholds?.length ? `, ${report.scorerThresholds.map(t => `${t.name} ${t.off ? "off" : `${(t.threshold * 100).toFixed(1)}pp`}`).join(", ")}` : ""}, ≥${report.minRegressedCases} cases, errors >${(report.maxErrorRate * 100).toFixed(0)}%`);
+  else parts.push(`fail on: ${report.failOn || "regression"} · thresholds: default ${(report.regressionThreshold * 100).toFixed(1)}pp${report.scorerThresholds?.length ? `, ${report.scorerThresholds.map(t => `${escapeHtml(t.name)} ${t.off ? "off" : `${(t.threshold * 100).toFixed(1)}pp`}`).join(", ")}` : ""}, ≥${report.minRegressedCases} cases, errors >${(report.maxErrorRate * 100).toFixed(0)}%`);
   if (report.updatedAt) parts.push(`updated ${report.updatedAt}`);
   if (report.howItWorksUrl) parts.push(`[How this works](${report.howItWorksUrl})`);
   return `<sub>${parts.join(" · ")}</sub>`;
@@ -40445,7 +40875,7 @@ async function fetchAllResults({ registry, token, workspaceId, id, cap = MAX_RES
 
 const STATS_WINDOW_PAD_SECONDS = 3600;
 
-// The OTel stats vocabulary (agent-gateway extensions/otel/crates/model/src/stats_read_api.rs), scoped to one
+// The Atlan eval API's stats vocabulary, scoped to one
 // experiment by the eval facade. The window must be explicit, so it spans the experiment's own lifetime plus a
 // pad for clock skew. Any error or missing value is "metrics unavailable": metrics never gate the check.
 function statsWindow(experiment, now = Date.now()) {
@@ -40761,13 +41191,13 @@ async function runEval({
   const workingDirectory = common_getInput("working-directory", environment) || ".";
 
   // One way in: inputs only. They keep the gateway credential out of the eval command's environment, and a repo
-  // may already use ATLAN_API_KEY for another credential (wisdom's is a tenant key).
+  // may already use ATLAN_API_KEY for another credential, such as a tenant key.
   const atlanToken = common_getInput("api-key", environment);
   if (!atlanToken || /[\r\n]/.test(atlanToken)) throw new Error("api-key is required and must not contain control characters");
   maskSecret(atlanToken, environment);
   const workspaceId = common_getInput("workspace-id", environment);
   if (!workspaceId || /[\r\n]/.test(workspaceId)) throw new Error("workspace-id is required and must not contain control characters");
-  // ponytail: org-slug is an input until the gateway returns org_slug from /auth/whoami; then derive it and drop this.
+  // org-slug only builds experiment links in the comment.
   const orgSlugInput = common_getInput("org-slug", environment);
   const orgSlug = orgSlugInput && /^[A-Za-z0-9_-]+$/.test(orgSlugInput) ? orgSlugInput : undefined;
 
@@ -41094,33 +41524,51 @@ async function runEval({
 
 
 
+
+
+
 async function runAction({
   environment = process.env,
   request = githubRequest,
   registry = registryRequest,
   eventPayload,
-  publish = runPublishAction
+  publish = runPublishAction,
+  preview = runPreview
 } = {}) {
   // The eval entry point still names its mode; Registry Sync lets the event decide.
   if ((environment.INPUT_MODE || "").trim() === "eval") return runEval({ environment, request, registry, eventPayload });
   const preflight = parseBoolean("preflight", common_getInput("preflight", environment) || "true");
   const event = environment.GITHUB_EVENT_NAME;
-  if (event === "pull_request_target") {
-    if (preflight) return runPreflight({ environment, request, registry, eventPayload });
-    process.stdout.write("::notice title=Registry Sync::preflight is off, so pull requests are not checked\n");
-    return;
+  assertCurrentInputs(environment, event);
+  const publishing = parseBoolean("publish", common_getInput("publish", environment) || String(event === "push" || event === "workflow_dispatch"));
+  if (event === "pull_request" || event === "pull_request_target") {
+    if (publishing) {
+      throw new Error("a pull request never publishes; remove publish: true from this step so it checks the pull request, and publish on push or workflow_dispatch");
+    }
+    if (!preflight) {
+      process.stdout.write("::notice title=Registry Sync::preflight is off, so pull requests are not checked\n");
+      return;
+    }
+    return event === "pull_request"
+      ? preview({ environment, request, eventPayload })
+      : runPreflight({ environment, request, registry, eventPayload });
   }
-  if (event === "push" || event === "workflow_dispatch") {
+  if (event === "push" || event === "workflow_dispatch" || event === "schedule") {
+    if (!publishing) return publish({ environment, dryRun: true });
+    if (event === "schedule") {
+      throw new Error("a scheduled run never publishes; remove publish: true from this step so it dry-runs, and publish on push or workflow_dispatch");
+    }
     const payload = eventPayload ?? readEventPayload(environment);
     assertDefaultBranch(environment, payload);
+    await assertCurrentRerun({ environment, eventPayload: payload, request });
     try {
-      return await publish({ environment, eventPayload: payload, request });
+      return await publish({ environment });
     } catch (error) {
       if (event === "push") await reportPublishFailure({ environment, payload, error, request });
       throw error;
     }
   }
-  throw new Error(`Registry Sync runs on pull_request_target, push and workflow_dispatch, not ${event || "an unknown event"}`);
+  throw new Error(`Registry Sync runs on pull_request, push, workflow_dispatch and schedule, and on pull_request_target for legacy preflight, not ${event || "an unknown event"}`);
 }
 
 
@@ -41129,13 +41577,13 @@ if (process.argv[1] && external_node_path_namespaceObject.resolve(process.argv[1
   runAction().catch(actionError);
 }
 
-var __webpack_exports__ADAPTER = __webpack_exports__.K8;
 var __webpack_exports__CLI_SHA256 = __webpack_exports__.Hj;
 var __webpack_exports__CLI_VERSION = __webpack_exports__.EQ;
 var __webpack_exports__EVAL_MARKER = __webpack_exports__.MC;
 var __webpack_exports__GitHubRequestError = __webpack_exports__.vK;
 var __webpack_exports__PREFLIGHT_COMMENT = __webpack_exports__.KJ;
 var __webpack_exports__PREFLIGHT_MARKER = __webpack_exports__.Ts;
+var __webpack_exports__PREVIEW_MARKER = __webpack_exports__.yf;
 var __webpack_exports__PUBLISH_GATEWAY = __webpack_exports__.nL;
 var __webpack_exports__cliArtifactURL = __webpack_exports__.Af;
 var __webpack_exports__githubRequest = __webpack_exports__.H6;
@@ -41148,5 +41596,6 @@ var __webpack_exports__resolveCliPlatform = __webpack_exports__.OG;
 var __webpack_exports__runAction = __webpack_exports__.Cs;
 var __webpack_exports__runEval = __webpack_exports__.wX;
 var __webpack_exports__runPreflight = __webpack_exports__.hg;
+var __webpack_exports__runPreview = __webpack_exports__.UE;
 var __webpack_exports__validateCliURL = __webpack_exports__.aC;
-export { __webpack_exports__ADAPTER as ADAPTER, __webpack_exports__CLI_SHA256 as CLI_SHA256, __webpack_exports__CLI_VERSION as CLI_VERSION, __webpack_exports__EVAL_MARKER as EVAL_MARKER, __webpack_exports__GitHubRequestError as GitHubRequestError, __webpack_exports__PREFLIGHT_COMMENT as PREFLIGHT_COMMENT, __webpack_exports__PREFLIGHT_MARKER as PREFLIGHT_MARKER, __webpack_exports__PUBLISH_GATEWAY as PUBLISH_GATEWAY, __webpack_exports__cliArtifactURL as cliArtifactURL, __webpack_exports__githubRequest as githubRequest, __webpack_exports__isWithin as isWithin, __webpack_exports__parseBoolean as parseBoolean, __webpack_exports__parsePullRequestContext as parsePullRequestContext, __webpack_exports__readEventPayload as readEventPayload, __webpack_exports__registryRequest as registryRequest, __webpack_exports__resolveCliPlatform as resolveCliPlatform, __webpack_exports__runAction as runAction, __webpack_exports__runEval as runEval, __webpack_exports__runPreflight as runPreflight, __webpack_exports__validateCliURL as validateCliURL };
+export { __webpack_exports__CLI_SHA256 as CLI_SHA256, __webpack_exports__CLI_VERSION as CLI_VERSION, __webpack_exports__EVAL_MARKER as EVAL_MARKER, __webpack_exports__GitHubRequestError as GitHubRequestError, __webpack_exports__PREFLIGHT_COMMENT as PREFLIGHT_COMMENT, __webpack_exports__PREFLIGHT_MARKER as PREFLIGHT_MARKER, __webpack_exports__PREVIEW_MARKER as PREVIEW_MARKER, __webpack_exports__PUBLISH_GATEWAY as PUBLISH_GATEWAY, __webpack_exports__cliArtifactURL as cliArtifactURL, __webpack_exports__githubRequest as githubRequest, __webpack_exports__isWithin as isWithin, __webpack_exports__parseBoolean as parseBoolean, __webpack_exports__parsePullRequestContext as parsePullRequestContext, __webpack_exports__readEventPayload as readEventPayload, __webpack_exports__registryRequest as registryRequest, __webpack_exports__resolveCliPlatform as resolveCliPlatform, __webpack_exports__runAction as runAction, __webpack_exports__runEval as runEval, __webpack_exports__runPreflight as runPreflight, __webpack_exports__runPreview as runPreview, __webpack_exports__validateCliURL as validateCliURL };

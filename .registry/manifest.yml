@@ -1,0 +1,11 @@
+# Registry Sync e2e, 2026-10-23: only what is under e2e1023/ publishes.
+registries:
+  atlan: { source: https://api.atlan.com, adapter: atlan }
+exports:
+  - e2e1023/skills/*
+  - path: e2e1023/agents/e2e1023-reviewer
+    depends_on: [./e2e1023/skills/e2e1023-review, ./e2e1023/skills/e2e1023-lint]
+  - path: e2e1023/agents/e2e1023-helper.md
+    depends_on: [./e2e1023/skills/e2e1023-lint]
+publish:
+  to: atlan/registry-cli-test
