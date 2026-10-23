@@ -35,13 +35,7 @@ jobs:
           npm install --global --force corepack@0.34.6 && corepack enable pnpm
           pnpm install --frozen-lockfile
           pnpm run build
-      - name: "C: someone edits e2e1023-review in the registry"
+      - name: "Probe: repository registration and link"
         env:
           AIREG_TOKEN_ATLAN: ${{ secrets.REGISTRY_TOKEN }}
-        run: |
-          export AIREG_MAIN="$PWD/.aireg-src/cli/dist/main.mjs" LOGGER="$PWD/e2e1023/debug/fetch-log.mjs" ADAPTER="$PWD/e2e1023/debug/adapter.mjs"
-          git fetch -q --depth 1 origin main && git checkout -q FETCH_HEAD
-          printf '\nAlso check the tests. (edited in the registry)\n' >> e2e1023/skills/e2e1023-review/SKILL.md
-          git -c user.name=e2e -c user.email=e2e@example.com commit -qam "registry-side edit"
-          git checkout -q ${{ github.sha }} -- e2e1023/debug
-          e2e1023/debug/run.sh C .
+        run: e2e1023/debug/probe.sh
