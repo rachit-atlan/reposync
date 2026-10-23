@@ -27,13 +27,14 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 24
+          node-version-file: .aireg-src/cli/.node-version
+          package-manager-cache: false
       - name: Build aireg 0.1.7
-        working-directory: .aireg-src
+        working-directory: .aireg-src/cli
         run: |
-          corepack enable
+          npm install --global --force corepack@0.34.6 && corepack enable pnpm
           pnpm install --frozen-lockfile
-          pnpm -C cli run build
+          pnpm run build
       - name: "A: existing skills, new agents"
         env:
           AIREG_TOKEN_ATLAN: ${{ secrets.REGISTRY_TOKEN }}
