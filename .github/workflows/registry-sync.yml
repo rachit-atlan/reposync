@@ -1,7 +1,7 @@
 name: Registry Sync
 
-# Test harness: the Action is vendored at .github/actions/registry-sync from
-# atlanai/agent-registry-action#44. A consumer uses atlanai/agent-registry-action@<version>.
+# Test harness: the Action is vendored at .github/actions/registry-sync from the
+# v1.0.0 release (4d4a219). A consumer uses atlanai/agent-registry-action@v1.
 on:
   pull_request:
   push:
