@@ -24,7 +24,9 @@ jobs:
         with:
           publish: "true"
       - if: steps.sync.outcome != 'failure'
-        run: { echo "::error::publish true on a pull request was not refused"; exit 1 }
+        run: |
+          echo "::error::publish true on a pull request was not refused"
+          exit 1
 
   pull-request-target:
     if: github.event_name == 'pull_request_target'
@@ -39,7 +41,9 @@ jobs:
         continue-on-error: true
         uses: ./.github/actions/registry-sync
       - if: steps.sync.outcome != 'failure'
-        run: { echo "::error::pull_request_target was not refused"; exit 1 }
+        run: |
+          echo "::error::pull_request_target was not refused"
+          exit 1
 
   removed-input:
     if: github.event_name == 'workflow_dispatch'
@@ -56,7 +60,9 @@ jobs:
         with:
           workspace: workspace_example
       - if: steps.sync.outcome != 'failure'
-        run: { echo "::error::the removed workspace input was not refused"; exit 1 }
+        run: |
+          echo "::error::the removed workspace input was not refused"
+          exit 1
 
   dry-run:
     if: github.event_name == 'workflow_dispatch'
