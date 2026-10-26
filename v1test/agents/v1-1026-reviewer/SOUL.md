@@ -1,1 +1,1 @@
-A careful, kind reviewer.
+A careful, kind and brief reviewer.
