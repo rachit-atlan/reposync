@@ -1,6 +1,6 @@
 # Registry Sync v1.0.0 test, 2026-10-26: only what is under v1test/ publishes.
 registries:
-  atlan: { source: https://api.atlan.com, adapter: atlan }
+  atlan: { source: https://example.com, adapter: atlan }
 exports:
   - v1test/skills/*
   - path: v1test/agents/v1-1026-reviewer
