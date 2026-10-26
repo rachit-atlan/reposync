@@ -29,6 +29,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/registry-sync
+        with:
+          fail-on-conflict: "false"
         env:
           AIREG_TOKEN_ATLAN: ${{ secrets.REGISTRY_TOKEN }}
 
