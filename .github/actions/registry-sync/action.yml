@@ -12,7 +12,7 @@ inputs:
     required: false
     default: .
   github-token:
-    description: GitHub token that writes the preview comment, fetches the pull request's base commit for the preview, confirms a rerun's commit, reports a failed publish on the merged pull request, and reads pull requests and writes the comment for legacy preflight.
+    description: GitHub token that writes the preview comment, fetches the pull request's base commit for the preview, confirms a rerun's commit, and reports a failed publish on the merged pull request.
     required: false
     default: ${{ github.token }}
   publish:
@@ -20,27 +20,21 @@ inputs:
     required: false
     default: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
   preflight:
-    description: Check pull requests before they merge, with the `pull_request` preview or legacy preflight.
+    description: Preview pull requests before they merge.
     required: false
     default: "true"
   allow-pr-commenting:
     description: Post the pull-request check as one comment. A pull request from a fork never gets one; its job summary has the preview.
     required: false
     default: "true"
-  workspace:
-    description: Legacy `pull_request_target` preflight only; use the `pull_request` preview instead. The Atlan workspace ID it compares skills with. Publishing takes its target from `.registry/manifest.yml` and fails when this is set.
-    required: false
-  artifacts:
-    description: "Legacy `pull_request_target` preflight only; use the `pull_request` preview instead. Skill globs, one line per kind, such as `skill: [\"skills/**\"]`. Publishing takes its exports from `.registry/manifest.yml` and fails when this is set."
-    required: false
   fail-on-conflict:
-    description: Fail the preview, after commenting, when an artifact the pull request changes was changed in the registry since its base; legacy preflight fails the same way on a confirmed Registry conflict.
+    description: Fail the preview, after commenting, when an artifact the pull request changes was changed in the registry since its base.
     required: false
     default: "true"
 
 outputs:
   status:
-    description: "`success`; `failed` when aireg refused the publish, its preview or its dry run; `conflict` when the preview or legacy preflight finds one."
+    description: "`success`; `failed` when aireg refused the publish, its preview or its dry run; `conflict` when the preview finds one."
   cli-version:
     description: The aireg version this Action installed and ran.
   published:
@@ -50,11 +44,9 @@ outputs:
   skipped:
     description: "JSON array of the exports the target does not take, such as a kind its adapter does not publish, each `{name, kind, path, reason}`."
   comment-id:
-    description: Pull-request comment created or updated by the preview or legacy preflight.
+    description: Pull-request comment created or updated by the preview.
   conflict-count:
-    description: The artifacts the pull request changes that the registry changed since its base, on a preview; legacy preflight's confirmed workspace-level Registry conflicts.
-  rejected-count:
-    description: Changed skills legacy preflight found the Registry would reject on publish (HTTP 422).
+    description: The artifacts the pull request changes that the registry changed since its base, on a preview.
 
 runs:
   using: node24
