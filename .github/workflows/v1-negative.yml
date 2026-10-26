@@ -1,0 +1,88 @@
+name: Registry Sync v1 refusals (temporary)
+
+# Each job runs the vendored v1.0.0 Action where it must refuse or only dry-run, then checks the outcome.
+on:
+  pull_request:
+  pull_request_target:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  pull-request-publish:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: sync
+        continue-on-error: true
+        uses: ./.github/actions/registry-sync
+        with:
+          publish: "true"
+      - if: steps.sync.outcome != 'failure'
+        run: |
+          echo "::error::publish true on a pull request was not refused"
+          exit 1
+
+  pull-request-target:
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: sync
+        continue-on-error: true
+        uses: ./.github/actions/registry-sync
+      - if: steps.sync.outcome != 'failure'
+        run: |
+          echo "::error::pull_request_target was not refused"
+          exit 1
+
+  removed-input:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: sync
+        continue-on-error: true
+        uses: ./.github/actions/registry-sync
+        with:
+          workspace: workspace_example
+      - if: steps.sync.outcome != 'failure'
+        run: |
+          echo "::error::the removed workspace input was not refused"
+          exit 1
+
+  dry-run:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: registry
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: sync
+        uses: ./.github/actions/registry-sync
+        with:
+          publish: "false"
+        env:
+          AIREG_TOKEN_ATLAN: ${{ secrets.REGISTRY_TOKEN }}
+      - env:
+          PUBLISHED: ${{ steps.sync.outputs.published }}
+          UNCHANGED: ${{ steps.sync.outputs.unchanged }}
+        run: |
+          echo "published=$PUBLISHED"
+          echo "unchanged=$UNCHANGED"
