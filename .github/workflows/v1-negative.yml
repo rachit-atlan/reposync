@@ -20,7 +20,7 @@ jobs:
           persist-credentials: false
       - id: sync
         continue-on-error: true
-        uses: ./.github/actions/registry-sync
+        uses: atlanai/ai-registry-action@v1
         with:
           publish: "true"
       - if: steps.sync.outcome != 'failure'
@@ -39,7 +39,7 @@ jobs:
           persist-credentials: false
       - id: sync
         continue-on-error: true
-        uses: ./.github/actions/registry-sync
+        uses: atlanai/ai-registry-action@v1
       - if: steps.sync.outcome != 'failure'
         run: |
           echo "::error::pull_request_target was not refused"
@@ -56,7 +56,7 @@ jobs:
           persist-credentials: false
       - id: sync
         continue-on-error: true
-        uses: ./.github/actions/registry-sync
+        uses: atlanai/ai-registry-action@v1
         with:
           workspace: workspace_example
       - env:
@@ -74,7 +74,7 @@ jobs:
         with:
           persist-credentials: false
       - id: sync
-        uses: ./.github/actions/registry-sync
+        uses: atlanai/ai-registry-action@v1
         with:
           publish: "false"
         env:
