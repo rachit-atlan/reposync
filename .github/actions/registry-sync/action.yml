@@ -1,6 +1,6 @@
-name: Registry Sync
-description: Preview on each pull request, and publish on merge, the skills, agents and other artifacts your aireg manifest exports.
-author: Atlan
+name: aireg Publish
+description: Preview skill and agent changes on every pull request, and publish them to your agent registry on merge, with aireg.
+author: ai-registry
 
 branding:
   icon: upload-cloud
@@ -8,45 +8,41 @@ branding:
 
 inputs:
   working-directory:
-    description: Directory inside the checkout that holds `.registry/manifest.yml`; aireg runs there.
+    description: Folder that holds `.registry/manifest.yml`.
     required: false
     default: .
   github-token:
-    description: GitHub token that writes the preview comment, fetches the pull request's base commit for the preview, confirms a rerun's commit, and reports a failed publish on the merged pull request.
+    description: Token used to comment on pull requests. The default works.
     required: false
     default: ${{ github.token }}
   publish:
-    description: Publish for real. Defaults to true on push and workflow_dispatch, and false on pull requests, where the step previews with a dry run.
+    description: "`auto` publishes on push and workflow_dispatch and previews pull requests. `true` always publishes, `false` always previews. Publishing only ever happens on the default branch."
     required: false
-    default: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
-  preflight:
-    description: Preview pull requests before they merge.
-    required: false
-    default: "true"
-  allow-pr-commenting:
-    description: Post the pull-request check as one comment. A pull request from a fork never gets one; its job summary has the preview.
+    default: auto
+  comment-on-pr:
+    description: Post the preview as a pull-request comment. Pull requests from forks only get the job summary.
     required: false
     default: "true"
   fail-on-conflict:
-    description: Fail the preview, after commenting, when an artifact the pull request changes was changed in the registry since its base.
+    description: Fail the preview when it finds a conflict.
     required: false
     default: "true"
 
 outputs:
   status:
-    description: "`success`; `failed` when aireg refused the publish, its preview or its dry run; `conflict` when the preview finds one."
-  cli-version:
-    description: The aireg version this Action installed and ran.
+    description: "`success`, `failed` or `conflict`."
+  aireg-version:
+    description: Version of aireg that ran.
   published:
-    description: "JSON array of the artifacts published, or on a preview or dry run those that would be, each `{registry, namespace, kind, name, version}`."
+    description: "JSON array of what was published, or what a preview would publish: `{registry, namespace, kind, name, version}`."
   unchanged:
-    description: JSON array of the exports already published at their current content, in the same shape.
+    description: JSON array of exports already published at their current content, in the same shape.
   skipped:
-    description: "JSON array of the exports the target does not take, such as a kind its adapter does not publish, each `{name, kind, path, reason}`."
+    description: "JSON array of exports the target does not accept: `{name, kind, path, reason}`."
   comment-id:
-    description: Pull-request comment created or updated by the preview.
+    description: ID of the preview comment.
   conflict-count:
-    description: The artifacts the pull request changes that the registry changed since its base, on a preview.
+    description: Number of conflicts the preview found.
 
 runs:
   using: node24
