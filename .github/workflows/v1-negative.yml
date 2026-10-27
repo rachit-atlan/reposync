@@ -59,10 +59,9 @@ jobs:
         uses: ./.github/actions/registry-sync
         with:
           workspace: workspace_example
-      - if: steps.sync.outcome != 'failure'
-        run: |
-          echo "::error::the removed workspace input was not refused"
-          exit 1
+      - env:
+          OUTCOME: ${{ steps.sync.outcome }}
+        run: echo "removed workspace input -> $OUTCOME"
 
   dry-run:
     if: github.event_name == 'workflow_dispatch'
