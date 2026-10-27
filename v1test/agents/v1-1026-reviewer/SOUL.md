@@ -1,1 +1,1 @@
-A careful reviewer who explains why, briefly.
+A careful reviewer who explains why, once.
