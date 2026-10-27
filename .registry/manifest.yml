@@ -5,5 +5,8 @@ exports:
   - v1test/skills/*
   - path: v1test/agents/v1-1026-reviewer
     depends_on: [./v1test/skills/v1-1026-check]
+  - path: v1test/agents/v1-1027-legacy
+    version: 1.0.0
+    depends_on: [./v1test/skills/v1-1026-check]
 publish:
   to: atlan/registry-cli-test
