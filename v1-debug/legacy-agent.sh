@@ -34,3 +34,8 @@ fi
 echo "agents named $name in $ws_name:"
 api get "/registry/v1/artifacts/agent?filter%5Bworkspace_id%5D%5Beq%5D=$ws&filter%5Bname%5D%5Beq%5D=$name&limit=10" \
   | jq -c '.items[] | {id, name, source_type, source_id, version_label, is_latest}'
+if [ "$mode" = verify ]; then
+  agent=$(api get "/registry/v1/artifacts/agent?filter%5Bworkspace_id%5D%5Beq%5D=$ws&filter%5Bname%5D%5Beq%5D=$name&limit=1" | jq -r '.items[0].id')
+  echo "relationships of $agent:"
+  api get "/registry/v1/artifacts/agent/$agent/relationships" | jq -c '(.items // .)[] | {rel_type, to_id, to_kind, attributes, status: (.status // .relationship_status)}'
+fi
