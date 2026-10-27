@@ -39,3 +39,8 @@ if [ "$mode" = verify ]; then
   echo "relationships of $agent:"
   api get "/registry/v1/artifacts/agent/$agent/relationships" | jq -c '(.items // .)[] | {rel_type, to_id, to_kind, attributes, status: (.status // .relationship_status)}'
 fi
+if [ "$mode" = skills ]; then
+  echo "skills in $ws_name whose version is not SemVer:"
+  api get "/registry/v1/artifacts/skill?filter%5Bworkspace_id%5D%5Beq%5D=$ws&limit=200" \
+    | jq -c '.items[] | select((.version_label // "") | test("^[0-9]+\\.[0-9]+\\.[0-9]+$") | not) | {id, name, version_label, source_type, source_id, artifact_status}'
+fi
