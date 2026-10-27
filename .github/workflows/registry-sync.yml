@@ -1,7 +1,6 @@
 name: Registry Sync
 
-# Test harness: the Action is vendored at .github/actions/registry-sync from the
-# v1.1.1 release (bde5988). A consumer uses atlanai/agent-registry-action@v1.
+# Test harness for the public atlanai/ai-registry-action@v1.
 on:
   pull_request:
   push:
@@ -28,7 +27,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/registry-sync
+      - uses: atlanai/ai-registry-action@v1
         env:
           AIREG_TOKEN_ATLAN: ${{ secrets.REGISTRY_TOKEN }}
 
@@ -45,6 +44,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/registry-sync
+      - uses: atlanai/ai-registry-action@v1
         env:
           AIREG_TOKEN_ATLAN: ${{ secrets.REGISTRY_TOKEN }}
