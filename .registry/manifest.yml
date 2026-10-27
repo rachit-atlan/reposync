@@ -3,7 +3,6 @@ registries:
   atlan: { source: https://api.atlan.com, adapter: atlan }
 exports:
   - v1test/skills/*
-  - e2e1023/skills/e2e1023-review
   - team-b/skills/wide-0930
   - path: v1test/agents/v1-1026-reviewer
     depends_on: [./v1test/skills/v1-1026-check]
