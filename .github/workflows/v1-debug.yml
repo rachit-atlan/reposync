@@ -4,7 +4,7 @@ name: Registry Sync v1 debug (temporary)
 # (method, host, path, status). Writes only to registry-cli-test; removed after.
 on:
   push:
-    branches: [v1/debug]
+    branches: [v1/drift-3]
 
 permissions: {}
 
