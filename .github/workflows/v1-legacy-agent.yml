@@ -1,0 +1,26 @@
+name: Registry Sync v1 legacy agent (temporary)
+
+# Creates an agent through the API as atlan-link-agent does, then lists agents by its name, to check that
+# exporting it in the manifest updates the same agent. Writes only to registry-cli-test; removed after.
+on:
+  push:
+    branches: [v1/legacy-agent]
+
+permissions: {}
+
+jobs:
+  legacy-agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: registry
+    permissions:
+      contents: read
+    env:
+      MODE: create
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - env:
+          AIREG_TOKEN_ATLAN: ${{ secrets.REGISTRY_TOKEN }}
+        run: v1-debug/legacy-agent.sh "$MODE"
